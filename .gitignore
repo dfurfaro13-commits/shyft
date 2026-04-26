@@ -1,0 +1,22 @@
+# macOS junk
+.DS_Store
+
+# Office temporary lock files (created when a .docx/.xlsx is open)
+~$*
+
+# Claude Code per-project session state
+.claude/
+
+# Editor / OS swap files
+*.swp
+*~
+
+# Logs
+*.log
+
+# Defensive — not used today, future-proofing
+node_modules/
+
+# Test credentials. Remove this line if you decide to share them publicly,
+# but DO review the file first to make sure no real passwords are in it.
+Test logins.xlsx

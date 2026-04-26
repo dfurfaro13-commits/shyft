@@ -1,0 +1,2166 @@
+import React, { useState, useEffect, useMemo } from "react";
+
+const DAYS_SHORT = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+const DAYS_LONG = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const COLORS = ["#3B82F6","#8B5CF6","#EC4899","#10B981","#F59E0B","#EF4444","#06B6D4","#84CC16","#F97316","#A855F7"];
+const UNAVAIL_REASONS = ["Working","Vacation","Conference","Personal Conflict"];
+
+const DEFAULT_CONFIG = {
+  // Multi-block model: `blocks` is an ordered list of scheduling windows.
+  // Each block: { id, name, start, end, signupOpen }. `currentBlockId` picks the active one.
+  // Data (shifts, preferences, unavailability) is stored keyed by date, so old blocks stay readable.
+  blocks: [], currentBlockId: null,
+  // Legacy single-block fields — retained only for pre-multi-block migration on load.
+  blockStart: "", blockEnd: "", signupOpen: false,
+  shiftSlots: [
+    { id: 1, name: "Primary", credit: 1.0, color: "#F59E0B" },
+    { id: 2, name: "Backup", credit: 1.0, color: "#8B5CF6" },
+  ],
+  pointValues: { weekday: 1, fri: 2, sat: 3, sun: 2, holiday: 4 },
+  pointValuesLocked: true, // admin must unlock before editing day-of-week point values
+  holidays: {},
+  seniorityLevels: [
+    { id: 1, name: "Senior", minShifts: 2 },
+    { id: 2, name: "Junior", minShifts: 3 },
+  ],
+  minAvailableDays: 6, minAvailableWeekendDays: 2,
+  involuntaryBonus: 1, nonPreferredBonus: 1, penaltyPerMissingDay: 1,
+  conflictPenalty: 1,
+};
+
+async function sha256(s) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+const dk = (y, m, d) => `${y}-${String(m+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+const parseDk = k => { const [y,m,d] = k.split("-").map(Number); return new Date(y,m-1,d); };
+const dim = (y, m) => new Date(y, m+1, 0).getDate();
+const fdow = (y, m) => new Date(y, m, 1).getDay();
+const initials = n => n.split(" ").map(s=>s[0]).join("").slice(0,2).toUpperCase();
+const isWeekend = k => { const d = parseDk(k).getDay(); return d===0||d===6; };
+const getUid = e => (typeof e==="object"&&e!==null)?(e.uid??null):e;
+const isAuto = e => typeof e==="object"&&e!==null&&!!e.auto;
+const getPool = e => {
+  if(e&&Array.isArray(e.pool)) return e.pool;
+  const u=getUid(e); return u?[u]:[];
+};
+const inPool = (e,uid) => getPool(e).includes(uid);
+const poolSize = e => getPool(e).length;
+
+const dayPts = (date, cfg) => {
+  const k = dk(date.getFullYear(), date.getMonth(), date.getDate());
+  if (cfg.holidays[k]) return cfg.pointValues.holiday;
+  const dow = date.getDay();
+  if (dow===5) return cfg.pointValues.fri;
+  if (dow===6) return cfg.pointValues.sat;
+  if (dow===0) return cfg.pointValues.sun;
+  return cfg.pointValues.weekday;
+};
+
+// Reads current block bounds from cfg.blocks[currentBlockId] (new model) or top-level
+// cfg.blockStart/blockEnd (legacy fallback for pre-migration configs).
+const currentBlockOf = cfg => {
+  if(cfg.currentBlockId && Array.isArray(cfg.blocks)){
+    const b = cfg.blocks.find(x => x.id === cfg.currentBlockId);
+    if(b) return b;
+  }
+  if(cfg.blockStart && cfg.blockEnd) return { id:"legacy", name:"Block", start:cfg.blockStart, end:cfg.blockEnd, signupOpen:!!cfg.signupOpen };
+  return null;
+};
+const inBlock = (k, cfg) => { const b = currentBlockOf(cfg); return !!(b && k >= b.start && k <= b.end); };
+
+const SUPER_BOOTSTRAP = "Shyft-Kai-Dave"; // bootstrap code required to create any new owner account
+const gKey = (gid, k) => `g${gid}_${k}`;
+const genCode = (len=6) => { const c="ABCDEFGHJKMNPQRSTUVWXYZ23456789"; let s=""; for(let i=0;i<len;i++) s+=c[Math.floor(Math.random()*c.length)]; return s; };
+
+export default function ShiftApp() {
+  const [loading, setLoading] = useState(true);
+  const [groups, setGroups] = useState([]);
+  const [supers, setSupers] = useState([]);
+  const [groupId, setGroupId] = useState(null);
+  const [users, setUsers] = useState([]);
+  const [config, setConfig] = useState(DEFAULT_CONFIG);
+  const [shifts, setShifts] = useState({});
+  const [unavailability, setUnavailability] = useState({});
+  const [preferences, setPreferences] = useState({});
+  const [session, setSession] = useState(null);
+  const [authMode, setAuthMode] = useState("signin");
+  const [authForm, setAuthForm] = useState({ username:"", password:"", name:"", groupCode:"", adminCode:"", superBootstrap:"" });
+  const [authError, setAuthError] = useState("");
+  const [groupForm, setGroupForm] = useState({ name:"" });
+  const [toast, setToast] = useState("");
+  const [page, setPage] = useState("home");
+  const [calY, setCalY] = useState(new Date().getFullYear());
+  const [calM, setCalM] = useState(new Date().getMonth());
+  const [editingDay, setEditingDay] = useState(null);
+  const [shiftsView, setShiftsView] = useState("list");
+  const [availView, setAvailView] = useState("list");
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [autoPreview, setAutoPreview] = useState(null);
+  const [reconcilePreview, setReconcilePreview] = useState(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [filterUid, setFilterUid] = useState(null);
+  const [copied, setCopied] = useState(""); // SuperDashboard copy-to-clipboard feedback (hook must run on every render — Rules of Hooks)
+  const [addUserOpen, setAddUserOpen] = useState(false);
+  const [addUserForm, setAddUserForm] = useState({ name:"", username:"", email:"", role:"provider", seniorityId:"" });
+  const [newUserResult, setNewUserResult] = useState(null); // { name, username, tempPassword, email } — shown after admin creates a user
+
+  useEffect(() => {
+    (async () => {
+      // Root-level (cross-group): groups list + super-admin accounts
+      try { const r = await window.storage.get("groups",true).catch(()=>null); if(r) setGroups(JSON.parse(r.value)); } catch{}
+      try { const r = await window.storage.get("supers",true).catch(()=>null); if(r) setSupers(JSON.parse(r.value)); } catch{}
+      // Restore session
+      let sess = null;
+      try { const s = sessionStorage.getItem("shift_session"); if(s) sess = JSON.parse(s); } catch{}
+      if(sess) setSession(sess);
+      if(sess?.groupId){ await loadGroup(sess.groupId); }
+      setLoading(false);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const loadGroup = async (gid) => {
+    setGroupId(gid);
+    try { const r = await window.storage.get(gKey(gid,"users"),true).catch(()=>null); setUsers(r?JSON.parse(r.value):[]); } catch{ setUsers([]); }
+    try {
+      const r = await window.storage.get(gKey(gid,"config"),true).catch(()=>null);
+      if(r){
+        const stored = JSON.parse(r.value);
+        // Migrate: groups saved before pointValuesLocked existed get the new defaults + locked flag.
+        if(stored.pointValuesLocked===undefined){
+          stored.pointValues = {...DEFAULT_CONFIG.pointValues};
+          stored.pointValuesLocked = true;
+        }
+        // Migrate legacy single-block (blockStart/blockEnd/signupOpen) → blocks[] with currentBlockId.
+        if(!Array.isArray(stored.blocks) || stored.blocks.length===0){
+          const blocks = [];
+          if(stored.blockStart && stored.blockEnd){
+            blocks.push({
+              id: Date.now(),
+              name: "Block 1",
+              start: stored.blockStart,
+              end: stored.blockEnd,
+              signupOpen: !!stored.signupOpen,
+            });
+          }
+          stored.blocks = blocks;
+          stored.currentBlockId = blocks.length ? blocks[0].id : null;
+        }
+        setConfig({...DEFAULT_CONFIG, ...stored});
+      } else setConfig(DEFAULT_CONFIG);
+    } catch{ setConfig(DEFAULT_CONFIG); }
+    try { const r = await window.storage.get(gKey(gid,"shifts"),true).catch(()=>null); setShifts(r?JSON.parse(r.value):{}); } catch{ setShifts({}); }
+    try {
+      const r = await window.storage.get(gKey(gid,"unavail"),true).catch(()=>null);
+      if(r){
+        const raw=JSON.parse(r.value), mig={};
+        Object.entries(raw).forEach(([uid,v])=>{ mig[uid]=Array.isArray(v)?Object.fromEntries(v.map(k=>[k,null])):(v||{}); });
+        setUnavailability(mig);
+      } else setUnavailability({});
+    } catch{ setUnavailability({}); }
+    try { const r = await window.storage.get(gKey(gid,"prefs"),true).catch(()=>null); setPreferences(r?JSON.parse(r.value):{}); } catch{ setPreferences({}); }
+  };
+
+  // Group-scoped persistence: writes under shyft_g{gid}_{key}. Root-level writes use persistRoot.
+  const persist = async (key, val) => {
+    if(!groupId){ /* called before a group is active — ignore to avoid leaking into root keys */ return; }
+    try { await window.storage.set(gKey(groupId,key), JSON.stringify(val), true); } catch { flash("⚠️ Save failed"); }
+  };
+  const persistRoot = async (key, val) => {
+    try { await window.storage.set(key, JSON.stringify(val), true); } catch { flash("⚠️ Save failed"); }
+  };
+
+  const flash = msg => { setToast(msg); setTimeout(()=>setToast(""),2800); };
+  const me = useMemo(() => {
+    if(!session) return null;
+    if(session.superId){ const s = supers.find(x=>x.id===session.superId); return s?{...s, role:"super"}:null; }
+    if(session.userId){ return users.find(u=>u.id===session.userId) || null; }
+    return null;
+  }, [session, users, supers]);
+  const currentGroup = useMemo(() => groupId?groups.find(g=>g.id===groupId):null, [groupId, groups]);
+  const mySeniority = useMemo(() => me?.seniorityId ? config.seniorityLevels.find(l=>l.id===me.seniorityId) : null, [me, config]);
+
+  // Active block: drives which dates the UI treats as "in-block" (signup, calendar highlighting, counters).
+  const currentBlock = useMemo(() => currentBlockOf(config), [config]);
+
+  const blockDays = useMemo(() => {
+    if (!currentBlock) return [];
+    const out = [];
+    for (let d=parseDk(currentBlock.start); d<=parseDk(currentBlock.end); d.setDate(d.getDate()+1))
+      out.push(dk(d.getFullYear(),d.getMonth(),d.getDate()));
+    return out;
+  }, [currentBlock]);
+
+  const blockWeekendDays = useMemo(() => blockDays.filter(isWeekend), [blockDays]);
+
+  // Auto-raise a provider's personal minimum to the floor set by their seniority.
+  // Runs whenever the seniority floor changes; providers can't set min below this.
+  useEffect(() => {
+    if(!me||me.role!=="provider") return;
+    const floor = mySeniority?.minShifts||0;
+    if(floor<=0) return;
+    const t = me.targets||{min:0,ideal:0,max:0};
+    if((t.min||0)<floor){
+      updateUser(me.id, { targets: {...t, min: floor} });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me?.id, mySeniority?.minShifts]);
+
+  /* ── Auth ── */
+  const handleAuth = async () => {
+    setAuthError("");
+    const username = authForm.username.trim().toLowerCase();
+    const pw = authForm.password;
+    if (!username||!pw) { setAuthError("Username and password required"); return; }
+    const pwHash = await sha256(pw);
+
+    if (authMode==="signin") {
+      // Search: first all groups' user rosters, then the super pool.
+      for(const g of groups){
+        try {
+          const r = await window.storage.get(gKey(g.id,"users"),true).catch(()=>null);
+          const list = r?JSON.parse(r.value):[];
+          const u = list.find(x=>x.username===username);
+          if(u){
+            if(u.passwordHash!==pwHash){ setAuthError("Wrong password"); return; }
+            await loadGroup(g.id);
+            const sess = {groupId:g.id, userId:u.id}; setSession(sess); sessionStorage.setItem("shift_session",JSON.stringify(sess));
+            setAuthForm({username:"",password:"",name:"",groupCode:"",adminCode:"",superBootstrap:""}); setPage("home");
+            return;
+          }
+        } catch{}
+      }
+      const sup = supers.find(s=>s.username===username);
+      if(sup){
+        if(sup.passwordHash!==pwHash){ setAuthError("Wrong password"); return; }
+        const sess = {superId:sup.id}; setSession(sess); sessionStorage.setItem("shift_session",JSON.stringify(sess));
+        setAuthForm({username:"",password:"",name:"",groupCode:"",adminCode:"",superBootstrap:""}); setPage("home");
+        return;
+      }
+      setAuthError("No account found with that username"); return;
+    }
+
+    if (authMode==="signup") {
+      const gCode = authForm.groupCode.trim().toUpperCase();
+      if(!gCode){ setAuthError("Group code required"); return; }
+      const group = groups.find(g=>g.groupCode===gCode);
+      if(!group){ setAuthError("Invalid group code"); return; }
+      if(!authForm.name.trim()){ setAuthError("Name required"); return; }
+      if(pw.length<4){ setAuthError("Password must be 4+ chars"); return; }
+      // Optional admin code: if present, validate; if invalid, error.
+      const adminCode = authForm.adminCode.trim().toUpperCase();
+      let role = "provider";
+      if(adminCode){
+        if(adminCode!==group.adminCode){ setAuthError("Invalid admin code"); return; }
+        role = "admin";
+      }
+      // Load group's users to validate uniqueness
+      let gUsers = [];
+      try { const r = await window.storage.get(gKey(group.id,"users"),true).catch(()=>null); gUsers = r?JSON.parse(r.value):[]; } catch{}
+      if(gUsers.find(u=>u.username===username)){ setAuthError("Username taken in this group"); return; }
+      const nu = { id:Date.now(), username, passwordHash:pwHash,
+        name:authForm.name.trim(), role, seniorityId:null, points:0,
+        targets:{min:0,ideal:0,max:0}, createdAt:Date.now() };
+      const next = [...gUsers,nu];
+      await window.storage.set(gKey(group.id,"users"), JSON.stringify(next), true).catch(()=>{});
+      await loadGroup(group.id);
+      setUsers(next); // ensure in-memory reflects the just-added user even if loadGroup hasn't finished
+      const sess = {groupId:group.id, userId:nu.id}; setSession(sess); sessionStorage.setItem("shift_session",JSON.stringify(sess));
+      setAuthForm({username:"",password:"",name:"",groupCode:"",adminCode:"",superBootstrap:""}); setPage("home");
+      if(role==="provider") setShowOnboarding(true);
+      flash(role==="admin"?`👑 Admin of ${group.name}`:`✅ Joined ${group.name}`);
+      return;
+    }
+
+    if (authMode==="super") {
+      if(!authForm.name.trim()){ setAuthError("Name required"); return; }
+      if(pw.length<4){ setAuthError("Password must be 4+ chars"); return; }
+      const bs = authForm.superBootstrap.trim();
+      if(bs!==SUPER_BOOTSTRAP){ setAuthError("Invalid owner bootstrap code"); return; }
+      if(supers.find(s=>s.username===username)){ setAuthError("Username already registered as owner"); return; }
+      const ns = { id:Date.now(), username, passwordHash:pwHash, name:authForm.name.trim(), createdAt:Date.now() };
+      const next = [...supers,ns]; setSupers(next); await persistRoot("supers",next);
+      const sess = {superId:ns.id}; setSession(sess); sessionStorage.setItem("shift_session",JSON.stringify(sess));
+      setAuthForm({username:"",password:"",name:"",groupCode:"",adminCode:"",superBootstrap:""}); setPage("home");
+      flash(`🛠 Owner account created`);
+      return;
+    }
+  };
+
+  const signOut = () => {
+    setSession(null); sessionStorage.removeItem("shift_session");
+    setGroupId(null); setUsers([]); setConfig(DEFAULT_CONFIG); setShifts({}); setUnavailability({}); setPreferences({});
+    setPage("home");
+  };
+
+  /* ── Super-admin helpers ── */
+  const createGroup = async (name) => {
+    const existingCodes = new Set(groups.flatMap(g=>[g.groupCode, g.adminCode]));
+    let gc, ac;
+    do { gc = genCode(6); } while(existingCodes.has(gc));
+    do { ac = genCode(6); } while(existingCodes.has(ac) || ac===gc);
+    const ng = { id:Date.now(), name:name.trim()||"Untitled group", groupCode:gc, adminCode:ac, createdAt:Date.now() };
+    const next = [...groups, ng]; setGroups(next); await persistRoot("groups", next);
+    flash(`✅ Group "${ng.name}" created`);
+    return ng;
+  };
+  const deleteGroup = async (gid) => {
+    const g = groups.find(x=>x.id===gid); if(!g) return;
+    if(!confirm(`Delete group "${g.name}" and all of its data? This cannot be undone.`)) return;
+    // Purge per-group keys
+    for(const k of ["users","config","shifts","unavail","prefs"]){
+      try { localStorage.removeItem("shyft_"+gKey(gid,k)); } catch{}
+    }
+    const next = groups.filter(x=>x.id!==gid); setGroups(next); await persistRoot("groups", next);
+    flash(`🗑 Group "${g.name}" deleted`);
+  };
+
+  /* ── Points ── */
+  // All per-user counters scope to the current block's dates. Historical block data lives in
+  // the same shifts dict but is ignored here — carryover into user.points is the admin's job.
+  const getPtsEarned = uid => {
+    let t=0;
+    Object.entries(shifts).forEach(([k,day])=>{
+      if(!inBlock(k,config)) return;
+      const base=dayPts(parseDk(k),config);
+      const wasPref=(preferences[uid]||[]).includes(k);
+      Object.entries(day).forEach(([sid,entry])=>{
+        if(getUid(entry)===uid){
+          const slot=config.shiftSlots.find(s=>s.id===parseInt(sid));
+          t += base*(slot?.credit||1);
+          if(isAuto(entry)){
+            t += (config.involuntaryBonus||0);
+            if(!wasPref) t += (config.nonPreferredBonus||0);
+          }
+        }
+      });
+    });
+    return t;
+  };
+
+  const getShiftCount = uid => { let n=0; Object.entries(shifts).forEach(([k,d])=>{if(!inBlock(k,config))return;Object.values(d).forEach(e=>{if(getUid(e)===uid)n++;});}); return n; };
+  const getAutoCount = uid => { let n=0; Object.entries(shifts).forEach(([k,d])=>{if(!inBlock(k,config))return;Object.values(d).forEach(e=>{if(getUid(e)===uid&&isAuto(e))n++;});}); return n; };
+  // Auto-assigned shifts on dates the user didn't mark as preferred (they also didn't block — never auto-assigned to blocked).
+  const getAutoNonPrefCount = uid => { let n=0; Object.entries(shifts).forEach(([k,d])=>{if(!inBlock(k,config))return;const pref=(preferences[uid]||[]).includes(k);Object.values(d).forEach(e=>{if(getUid(e)===uid&&isAuto(e)&&!pref)n++;});}); return n; };
+
+  const getAvailInfo = uid => {
+    const blocked = Object.keys(unavailability[uid]||{}).filter(d=>inBlock(d,config));
+    const blockedWk = blocked.filter(isWeekend);
+    const availD = blockDays.length - blocked.length;
+    const availW = blockWeekendDays.length - blockedWk.length;
+    const dayShort = Math.max(0, config.minAvailableDays - availD);
+    const wkShort = Math.max(0, config.minAvailableWeekendDays - availW);
+    const totalShort = dayShort + wkShort;
+    const penalty = totalShort * (config.penaltyPerMissingDay||1);
+    return { blocked:blocked.length, availD, availW, dayShort, wkShort, penalty, meets:totalShort===0 };
+  };
+
+  const totalPts = uid => {
+    const u = users.find(x=>x.id===uid);
+    return (u?.points||0) + getPtsEarned(uid) - getAvailInfo(uid).penalty;
+  };
+
+  /* ── Shift actions ── */
+  const isUnavail = (uid,k) => !!(unavailability[uid] && k in unavailability[uid]);
+  const unavailReason = (uid,k) => (unavailability[uid]||{})[k] || null;
+  const isWanted = (uid,k) => (preferences[uid]||[]).includes(k);
+  const wantedCount = uid => (preferences[uid]||[]).filter(d=>inBlock(d,config)).length;
+
+  // Post-reconcile admin insight: flag days that were hard to cover.
+  //   hasAuto     — at least one slot was auto-assigned (nobody volunteered for it)
+  //   challenging — ALL filled slots auto AND nobody preferred AND ≥50% of providers blocked it.
+  //                 These are the dates the admin had to fight for coverage on, and are worth
+  //                 spot-checking when planning the next block.
+  const dayInsights = k => {
+    if(me?.role!=="admin") return null;
+    const day = shifts[k]||{};
+    const entries = Object.values(day);
+    const filled = entries.filter(e=>getUid(e));
+    if(filled.length===0) return null;
+    const autoFilled = filled.filter(isAuto).length;
+    const hasAuto = autoFilled>0;
+    const allAuto = autoFilled===filled.length;
+    const provs = users.filter(u=>u.role==="provider");
+    let blockedCount=0, preferredCount=0;
+    for(const p of provs){
+      if(isUnavail(p.id,k)) blockedCount++;
+      if(isWanted(p.id,k)) preferredCount++;
+    }
+    const blockRate = provs.length ? blockedCount/provs.length : 0;
+    const challenging = allAuto && preferredCount===0 && blockRate>=0.5;
+    return { hasAuto, allAuto, challenging, blockedCount, preferredCount, totalProvs:provs.length, blockRate };
+  };
+
+  const joinPool = async (dateKey, slotId) => {
+    if (!me||me.role!=="provider") return;
+    if (!currentBlock?.signupOpen) { flash("⚠️ Signup closed"); return; }
+    if (!inBlock(dateKey,config)) { flash("⚠️ Outside block"); return; }
+    if (!me.seniorityId) { flash("⚠️ Seniority not assigned yet"); return; }
+    if (isUnavail(me.id,dateKey)) { flash("⚠️ You marked this day unavailable"); return; }
+    const next={...shifts};
+    if(!next[dateKey]) next[dateKey]={};
+    const entry = next[dateKey][slotId] || {pool:[],uid:null,auto:false};
+    if(entry.uid){ flash("⚠️ Slot already finalized"); return; }
+    const pool = getPool(entry);
+    const already = pool.includes(me.id);
+    if(already){
+      const np = pool.filter(u=>u!==me.id);
+      if(np.length===0) delete next[dateKey][slotId];
+      else next[dateKey][slotId] = {...entry, pool:np};
+      flash("Removed from pool");
+    } else {
+      const other = Object.entries(next[dateKey]).find(([sid,e])=>parseInt(sid)!==slotId&&inPool(e,me.id)&&!e.uid);
+      if(other){ flash("⚠️ Leave the other slot pool for this day first"); return; }
+      next[dateKey][slotId] = {...entry, pool:[...pool, me.id]};
+      flash(`✅ You're in the pool (${pool.length+1} total)`);
+    }
+    if(!Object.keys(next[dateKey]).length) delete next[dateKey];
+    setShifts(next); await persist("shifts",next);
+  };
+
+  const toggleUnavail = async k => {
+    if(!me||me.role!=="provider") return;
+    const cur=unavailability[me.id]||{};
+    const blocked=k in cur;
+    if(!blocked){
+      const hasWin=Object.values(shifts[k]||{}).some(e=>getUid(e)===me.id);
+      if(hasWin){flash("⚠️ You're already awarded a shift this day");return;}
+      const inAny=Object.values(shifts[k]||{}).some(e=>inPool(e,me.id)&&!getUid(e));
+      if(inAny){flash("⚠️ Leave the pool for this day first");return;}
+    }
+    const nextCur={...cur};
+    if(blocked) delete nextCur[k]; else nextCur[k]=null;
+    const next={...unavailability,[me.id]:nextCur};
+    setUnavailability(next); await persist("unavail",next);
+    if(!blocked){
+      const pcur=preferences[me.id]||[];
+      if(pcur.includes(k)){ const pnext={...preferences,[me.id]:pcur.filter(d=>d!==k)}; setPreferences(pnext); await persist("prefs",pnext); }
+    }
+  };
+
+  const setUnavailReason = async (k, reason) => {
+    if(!me||me.role!=="provider") return;
+    const cur=unavailability[me.id]||{};
+    if(!(k in cur)) return;
+    const next={...unavailability,[me.id]:{...cur,[k]:reason||null}};
+    setUnavailability(next); await persist("unavail",next);
+  };
+
+  const togglePreference = async k => {
+    if(!me||me.role!=="provider") return;
+    if(isUnavail(me.id,k)){ flash("⚠️ You've blocked this day"); return; }
+    if(!inBlock(k,config)){ flash("⚠️ Outside block"); return; }
+    const cur=preferences[me.id]||[];
+    const wanted=cur.includes(k);
+    const next={...preferences,[me.id]:wanted?cur.filter(d=>d!==k):[...cur,k]};
+    setPreferences(next); await persist("prefs",next);
+  };
+
+  const setTargets = async (uid, targets) => await updateUser(uid, { targets });
+
+  /* ── Auto-assign ── */
+  const computeAutoAssign = () => {
+    const result=JSON.parse(JSON.stringify(shifts));
+    const provs=users.filter(u=>u.role==="provider"&&u.seniorityId);
+    const liveCount={}, liveDates={};
+    provs.forEach(p=>{liveCount[p.id]=0; liveDates[p.id]=new Set();});
+    Object.entries(result).forEach(([k,day])=>Object.values(day).forEach(e=>{
+      const uid=getUid(e);
+      if(liveCount[uid]!==undefined){ liveCount[uid]++; liveDates[uid].add(k); }
+    }));
+    const MS_DAY = 86400000;
+    // Soft score: how well does assigning `dateKey` to `p` fit their back-to-back preference?
+    // Lower is better. Negative = bonus (extends a desired run). Positive = violation.
+    const spacingScore = (p, dateKey) => {
+      const pref = p.spacingPref;
+      if(!pref || pref.mode==="none" || !liveDates[p.id] || liveDates[p.id].size===0) return 0;
+      const target = parseDk(dateKey).getTime();
+      const existing = [...liveDates[p.id]].map(k=>parseDk(k).getTime());
+      if(pref.mode==="spread"){
+        let minGap = Infinity;
+        for(const t of existing){
+          const g = Math.abs(Math.round((t-target)/MS_DAY));
+          if(g<minGap) minGap = g;
+        }
+        const desired = pref.minGap || 2;
+        return minGap < desired ? (desired - minGap) * 5 : 0;
+      }
+      if(pref.mode==="consecutive"){
+        const all = [...existing, target].sort((a,b)=>a-b);
+        const idx = all.indexOf(target);
+        let runLen = 1;
+        for(let i=idx-1; i>=0; i--){ if(Math.round((all[i+1]-all[i])/MS_DAY)===1) runLen++; else break; }
+        for(let i=idx+1; i<all.length; i++){ if(Math.round((all[i]-all[i-1])/MS_DAY)===1) runLen++; else break; }
+        const cap = pref.maxConsecutive || 3;
+        if(runLen > cap) return (runLen - cap) * 10; // hard penalty for exceeding cap
+        if(runLen > 1) return -1; // small bonus for extending a run under the cap
+        return 0;
+      }
+      return 0;
+    };
+    const newA=[], unfilled=[];
+    for(const dateKey of blockDays){
+      for(const slot of config.shiftSlots){
+        if(getUid(result[dateKey]?.[slot.id])) continue;
+        const elig=provs.filter(p=>{
+          if(isUnavail(p.id,dateKey)) return false;
+          return !Object.values(result[dateKey]||{}).some(e=>getUid(e)===p.id);
+        });
+        if(!elig.length){unfilled.push({dateKey,slot});continue;}
+        elig.sort((a,b)=>{
+          // 1) Everyone must clear their admin-set minimum first.
+          const aMin=config.seniorityLevels.find(l=>l.id===a.seniorityId)?.minShifts||0;
+          const bMin=config.seniorityLevels.find(l=>l.id===b.seniorityId)?.minShifts||0;
+          const aB=Math.max(0,aMin-liveCount[a.id]), bB=Math.max(0,bMin-liveCount[b.id]);
+          if(aB!==bB) return bB-aB;
+          // 2) Never go past a user's max.
+          const aMx=a.targets?.max||0, bMx=b.targets?.max||0;
+          const aAt=aMx>0&&liveCount[a.id]>=aMx, bAt=bMx>0&&liveCount[b.id]>=bMx;
+          if(aAt!==bAt) return aAt?1:-1;
+          // 3) Honor the user's preferred-date stars.
+          const aW=isWanted(a.id,dateKey), bW=isWanted(b.id,dateKey);
+          if(aW!==bW) return aW?-1:1;
+          // 4) Respect each user's back-to-back spacing preference (lower score = better fit).
+          const aS=spacingScore(a,dateKey), bS=spacingScore(b,dateKey);
+          if(aS!==bS) return aS-bS;
+          // 5) Prefer users still below their own ideal.
+          const aId=a.targets?.ideal||0, bId=b.targets?.ideal||0;
+          const aBi=aId>0&&liveCount[a.id]<aId, bBi=bId>0&&liveCount[b.id]<bId;
+          if(aBi!==bBi) return aBi?-1:1;
+          // 6) Fairness fallback.
+          if(liveCount[a.id]!==liveCount[b.id]) return liveCount[a.id]-liveCount[b.id];
+          return totalPts(a.id)-totalPts(b.id);
+        });
+        const winner=elig[0];
+        if(!result[dateKey]) result[dateKey]={};
+        const prev=result[dateKey][slot.id];
+        result[dateKey][slot.id]={...(prev||{}),uid:winner.id,auto:true};
+        liveCount[winner.id]++;
+        liveDates[winner.id].add(dateKey);
+        newA.push({dateKey,slot,user:winner});
+      }
+    }
+    return {result,newAssignments:newA,unfilled};
+  };
+
+  const applyAutoAssign = async () => {
+    if(!autoPreview) return;
+    setShifts(autoPreview.result); await persist("shifts",autoPreview.result);
+    flash(`✅ ${autoPreview.newAssignments.length} shifts auto-assigned`);
+    setAutoPreview(null);
+  };
+
+  /* ── Reconciliation (pool → winners) ── */
+  const computeReconcile = () => {
+    const result = JSON.parse(JSON.stringify(shifts));
+    const awarded = [];
+    const deltas = {};
+    const baseCache = {};
+    const effPts = uid => {
+      if(baseCache[uid]===undefined) baseCache[uid] = totalPts(uid);
+      return baseCache[uid] + (deltas[uid]||0);
+    };
+    const perUserShifts = {};
+    Object.values(result).forEach(day=>Object.values(day).forEach(e=>{const u=getUid(e); if(u) perUserShifts[u]=(perUserShifts[u]||0)+1;}));
+    for(const dateKey of blockDays){
+      const day = result[dateKey];
+      if(!day) continue;
+      for(const slot of config.shiftSlots){
+        const entry = day[slot.id];
+        if(!entry) continue;
+        if(getUid(entry)) continue;
+        const pool = getPool(entry).filter(uid=>!isUnavail(uid,dateKey)&&!Object.entries(day).some(([sid,e])=>parseInt(sid)!==slot.id&&getUid(e)===uid));
+        if(pool.length===0){ delete day[slot.id]; continue; }
+        if(pool.length===1){
+          day[slot.id] = {...entry, uid:pool[0], auto:false};
+          perUserShifts[pool[0]] = (perUserShifts[pool[0]]||0)+1;
+          awarded.push({dateKey,slot,winner:pool[0],contested:false,pool});
+          continue;
+        }
+        let best = pool[0], bestP = effPts(best);
+        for(let i=1;i<pool.length;i++){
+          const p = effPts(pool[i]);
+          if(p>bestP){ best=pool[i]; bestP=p; }
+        }
+        day[slot.id] = {...entry, uid:best, auto:false};
+        deltas[best] = (deltas[best]||0) - 1;
+        perUserShifts[best] = (perUserShifts[best]||0)+1;
+        awarded.push({dateKey,slot,winner:best,contested:true,pool,winningPts:bestP+1});
+        // Cascade: each loser, by descending pts, gets shifted to an empty slot on the same day if one exists
+        const losers = pool.filter(u=>u!==best).sort((a,b)=>effPts(b)-effPts(a));
+        for(const loser of losers){
+          if(Object.entries(day).some(([sid,e])=>parseInt(sid)!==slot.id&&(getUid(e)===loser||inPool(e,loser)))) continue;
+          const emptySlot = config.shiftSlots.find(os=>os.id!==slot.id&&!day[os.id]);
+          if(!emptySlot) break;
+          day[emptySlot.id] = {pool:[loser],uid:loser,auto:false};
+          perUserShifts[loser] = (perUserShifts[loser]||0)+1;
+          awarded.push({dateKey,slot:emptySlot,winner:loser,contested:false,pool:[loser],cascaded:true,fromSlot:slot});
+        }
+      }
+      if(!Object.keys(day).length) delete result[dateKey];
+    }
+    return { result, awarded, deltas };
+  };
+
+  const applyReconcile = async () => {
+    if(!reconcilePreview) return;
+    const { result, awarded, deltas } = reconcilePreview;
+    setShifts(result); await persist("shifts",result);
+    if(Object.keys(deltas).length){
+      const nu = users.map(u=>deltas[u.id]?{...u,points:Math.max(0,(u.points||0)+deltas[u.id])}:u);
+      setUsers(nu); await persist("users",nu);
+    }
+    // Stash the deltas on the current block so "Reset block" can reverse them.
+    await updateCurrentBlock({signupOpen:false, lastReconcileDeltas:deltas});
+    flash(`✅ ${awarded.length} shifts awarded · signup closed`);
+    setReconcilePreview(null);
+  };
+
+  const resetBlock = async () => {
+    // Clear all shifts within the current block, reopen signup, and
+    // reverse the last reconcile's tie-break point penalties.
+    const nextShifts = {...shifts};
+    let cleared = 0;
+    for(const k of blockDays){ if(nextShifts[k]){ cleared += Object.keys(nextShifts[k]).length; delete nextShifts[k]; } }
+    setShifts(nextShifts); await persist("shifts",nextShifts);
+    const restored = currentBlock?.lastReconcileDeltas || {};
+    if(Object.keys(restored).length){
+      const nu = users.map(u=>restored[u.id]?{...u,points:Math.max(0,(u.points||0)-restored[u.id])}:u);
+      setUsers(nu); await persist("users",nu);
+    }
+    await updateCurrentBlock({signupOpen:true, lastReconcileDeltas:{}});
+    setConfirmReset(false);
+    flash(`↺ Block reset · ${cleared} slot${cleared===1?"":"s"} cleared · signup reopened`);
+  };
+
+  /* ── Admin helpers ── */
+  const updateConfig = async patch => { const next={...config,...patch}; setConfig(next); await persist("config",next); };
+  // Patch the currently-active block in-place. No-op if no block is active.
+  const updateCurrentBlock = async patch => {
+    if(!config.currentBlockId || !Array.isArray(config.blocks)) return;
+    const blocks = config.blocks.map(b => b.id===config.currentBlockId ? {...b, ...patch} : b);
+    await updateConfig({blocks});
+  };
+  const adminAssign = async (dk,sid,uid) => {
+    const next={...shifts}; if(!next[dk]) next[dk]={};
+    if(uid===null){
+      const prev=next[dk][sid]; const pool=prev?getPool(prev).filter(u=>u!==prev.uid):[];
+      if(pool.length) next[dk][sid]={pool,uid:null,auto:false};
+      else delete next[dk][sid];
+    } else {
+      const prev=next[dk][sid]||{}; const pool=Array.from(new Set([...getPool(prev),uid]));
+      next[dk][sid]={pool,uid,auto:false};
+    }
+    if(!Object.keys(next[dk]).length) delete next[dk];
+    setShifts(next); await persist("shifts",next); flash("Updated");
+  };
+  const updateUser = async (uid,patch) => { const next=users.map(u=>u.id===uid?{...u,...patch}:u); setUsers(next); await persist("users",next); };
+  const adjustPoints = async (uid,delta) => { const u=users.find(x=>x.id===uid); await updateUser(uid,{points:Math.max(0,(u?.points||0)+delta)}); };
+  const deleteUser = async uid => {
+    if(!confirm("Delete this account?")) return;
+    const nu=users.filter(u=>u.id!==uid);
+    const ns={}; Object.entries(shifts).forEach(([k,day])=>{const c={};Object.entries(day).forEach(([sid,e])=>{if(getUid(e)!==uid)c[sid]=e;});if(Object.keys(c).length)ns[k]=c;});
+    const nun={...unavailability}; delete nun[uid];
+    const npr={...preferences}; delete npr[uid];
+    setUsers(nu);setShifts(ns);setUnavailability(nun);setPreferences(npr);
+    await persist("users",nu);await persist("shifts",ns);await persist("unavail",nun);await persist("prefs",npr);
+    flash("Removed");
+  };
+
+  // Admin-initiated user creation. Generates a readable temp password the admin
+  // shares with the new user. The password is hashed before storage — same scheme as self-signup.
+  const adminAddUser = async (form) => {
+    const name = (form.name||"").trim();
+    const username = (form.username||"").trim().toLowerCase();
+    if(!name){ return { error: "Name required" }; }
+    if(!username){ return { error: "Username required" }; }
+    if(users.find(u=>u.username===username)){ return { error: "Username already taken in this group" }; }
+    const tempPassword = genCode(8); // readable 8-char alphanumeric (no ambiguous chars)
+    const pwHash = await sha256(tempPassword);
+    const nu = {
+      id: Date.now(),
+      username,
+      passwordHash: pwHash,
+      name,
+      role: form.role==="admin" ? "admin" : "provider",
+      seniorityId: form.seniorityId ? parseInt(form.seniorityId) : null,
+      points: 0,
+      targets: { min:0, ideal:0, max:0 },
+      email: (form.email||"").trim() || null,
+      createdAt: Date.now(),
+    };
+    const next = [...users, nu]; setUsers(next); await persist("users", next);
+    return { user: nu, tempPassword };
+  };
+
+  if(loading) return <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500">Loading…</div>;
+
+  /* ══ AUTH SCREEN ══ */
+  if(!session||!me){
+    const noGroupsYet = groups.length===0;
+    return(
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 w-full max-w-sm p-7">
+          <div className="flex items-center gap-3 mb-1">
+            <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold text-lg">S</div>
+            <h1 className="text-2xl font-semibold text-slate-900">Shyft</h1>
+          </div>
+          <p className="text-sm text-slate-500 mb-5">
+            {authMode==="super"?"Create a new owner account. Existing owners sign in via the Sign in tab.":(noGroupsYet?"No groups yet — an owner must create one first.":"Sign in or join your group.")}
+          </p>
+          <div className="flex bg-slate-100 rounded-lg p-1 mb-5">
+            {[["signin","Sign in"],["signup","Sign up"],["super","Owner"]].map(([m,l])=>(
+              <button key={m} onClick={()=>{setAuthMode(m);setAuthError("");}}
+                className={`flex-1 py-2 text-xs font-medium rounded-md transition ${authMode===m?"bg-white shadow text-slate-900":"text-slate-500"}`}>
+                {l}
+              </button>
+            ))}
+          </div>
+          {authMode==="signup"&&(<>
+            <Field label="Group code"><input type="text" value={authForm.groupCode} autoCapitalize="characters"
+              onChange={e=>setAuthForm({...authForm,groupCode:e.target.value.toUpperCase()})}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base font-mono tracking-wider focus:outline-none focus:border-blue-500" placeholder="ABCD12"/></Field>
+            <Field label="Admin code (optional — leave blank to join as provider)"><input type="text" value={authForm.adminCode} autoCapitalize="characters"
+              onChange={e=>setAuthForm({...authForm,adminCode:e.target.value.toUpperCase()})}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base font-mono tracking-wider focus:outline-none focus:border-blue-500" placeholder=""/></Field>
+            <Field label="Full name"><input type="text" value={authForm.name} onChange={e=>setAuthForm({...authForm,name:e.target.value})}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500" placeholder="Jane Smith"/></Field>
+          </>)}
+          {authMode==="super"&&(<>
+            <Field label="Full name"><input type="text" value={authForm.name} onChange={e=>setAuthForm({...authForm,name:e.target.value})}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500" placeholder="Jane Smith"/></Field>
+            <Field label="Owner bootstrap code"><input type="text" value={authForm.superBootstrap}
+              onChange={e=>setAuthForm({...authForm,superBootstrap:e.target.value})}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base font-mono focus:outline-none focus:border-blue-500" placeholder="Shyft-Kai-Dave"/></Field>
+          </>)}
+          <Field label="Username"><input type="text" value={authForm.username} autoComplete="username" autoCapitalize="none"
+            onChange={e=>setAuthForm({...authForm,username:e.target.value})}
+            className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"/></Field>
+          <Field label="Password"><input type="password" value={authForm.password}
+            autoComplete={authMode==="signin"?"current-password":"new-password"}
+            onChange={e=>setAuthForm({...authForm,password:e.target.value})}
+            onKeyDown={e=>e.key==="Enter"&&handleAuth()}
+            className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"/></Field>
+          {authError&&<div className="text-xs text-red-600 mb-3">{authError}</div>}
+          <button onClick={handleAuth} className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium text-base transition">
+            {authMode==="signin"?"Sign in":authMode==="super"?"Create owner account":"Create account"}
+          </button>
+          {authMode==="signup"&&<p className="text-xs text-slate-400 mt-4 text-center">Group and admin codes come from your group's owner.</p>}
+          {authMode==="super"&&<p className="text-xs text-slate-400 mt-4 text-center">An owner bootstrap code is required to create an owner account.</p>}
+        </div>
+        {toast&&<Toast msg={toast}/>}
+      </div>
+    );
+  }
+
+  /* ══ DAY SHEET ══ */
+  const DaySheet = () => {
+    if(!editingDay) return null;
+    const date=parseDk(editingDay), dayShifts=shifts[editingDay]||{}, base=dayPts(date,config);
+    const meUnavail=me.role==="provider"&&isUnavail(me.id,editingDay);
+    const meHasShift=me.role==="provider"&&Object.values(dayShifts).some(e=>getUid(e)===me.id||inPool(e,me.id));
+    return(
+      <div className="fixed inset-0 bg-black/40 z-50 flex sm:items-center sm:justify-center items-end" onClick={()=>setEditingDay(null)}>
+        <div className="bg-white w-full sm:max-w-md sm:rounded-2xl rounded-t-2xl max-h-[90vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
+          <div className="sticky top-0 bg-white border-b border-slate-100 p-4 flex items-center justify-between">
+            <div>
+              <div className="font-semibold text-lg">{DAYS_LONG[date.getDay()]}</div>
+              <div className="text-sm text-slate-500">
+                {MONTHS[date.getMonth()]} {date.getDate()}, {date.getFullYear()} · +{base} pts
+                {config.holidays[editingDay]&&<span className="text-red-600"> · {config.holidays[editingDay]}</span>}
+              </div>
+            </div>
+            <button onClick={()=>setEditingDay(null)} className="w-9 h-9 flex items-center justify-center text-slate-400 hover:bg-slate-100 rounded-full text-xl">×</button>
+          </div>
+
+          {me.role==="provider"&&(
+            <div className="px-4 pt-4 space-y-2">
+              <div className="flex gap-2">
+                <button onClick={()=>togglePreference(editingDay)} disabled={meUnavail}
+                  className={`flex-1 py-2.5 px-3 text-sm font-medium rounded-lg ${isWanted(me.id,editingDay)?"bg-emerald-500 text-white hover:bg-emerald-600":"bg-slate-100 text-slate-700 hover:bg-slate-200"} ${meUnavail?"opacity-50 cursor-not-allowed":""}`}>
+                  {isWanted(me.id,editingDay)?"⭐ Preferred date":"Prefer this date"}
+                </button>
+                <button onClick={()=>toggleUnavail(editingDay)} disabled={meHasShift&&!meUnavail}
+                  className={`flex-1 py-2.5 px-3 text-sm font-medium rounded-lg ${meUnavail?"bg-red-500 text-white hover:bg-red-600":"bg-slate-100 text-slate-700 hover:bg-slate-200"} ${meHasShift&&!meUnavail?"opacity-50 cursor-not-allowed":""}`}>
+                  {meUnavail?"🚫 Blocked":"Block this day"}
+                </button>
+              </div>
+              {meUnavail&&(
+                <select value={unavailReason(me.id,editingDay)||""} onChange={e=>setUnavailReason(editingDay,e.target.value)}
+                  className="w-full px-3 py-2 border border-red-200 bg-red-50 rounded-lg text-sm">
+                  <option value="">— Reason (optional) —</option>
+                  {UNAVAIL_REASONS.map(r=><option key={r} value={r}>{r}</option>)}
+                </select>
+              )}
+            </div>
+          )}
+
+          <div className="p-4 space-y-3">
+            {config.shiftSlots.map(slot=>{
+              const entry=dayShifts[slot.id];
+              const winnerUid=getUid(entry), winner=winnerUid?users.find(u=>u.id===winnerUid):null;
+              const auto=isAuto(entry), isMineWinner=winnerUid===me.id, earned=base*slot.credit;
+              const pool=getPool(entry), pSize=pool.length;
+              const meInPool=me.role==="provider"&&!winnerUid&&pool.includes(me.id);
+              const othersInPool=winnerUid?0:(meInPool?pSize-1:pSize);
+              return(
+                <div key={slot.id} className="border-2 rounded-xl p-3" style={{borderColor:winner?slot.color:(pSize>0?"#CBD5E1":"#E2E8F0")}}>
+                  <div className="flex items-center justify-between mb-2">
+                    <div>
+                      <div className="font-semibold flex items-center gap-2" style={{color:slot.color}}>
+                        {slot.name}
+                        {auto&&<span className="bg-blue-100 text-blue-700 text-[10px] font-medium px-1.5 py-0.5 rounded">Auto</span>}
+                      </div>
+                      <div className="text-xs text-slate-500">
+                        {slot.credit}× · {earned.toFixed(earned%1?2:0)} pts
+                        {auto&&(()=>{ const wasPref=winnerUid&&(preferences[winnerUid]||[]).includes(editingDay); const b1=config.involuntaryBonus||0, b2=wasPref?0:(config.nonPreferredBonus||0); return (b1+b2)>0?<span className="text-blue-600"> + {b1+b2} bonus{b2>0?<span className="text-[10px]"> ({b1}+{b2} non-pref)</span>:null}</span>:null; })()}
+                      </div>
+                    </div>
+                    {winner?(
+                      <div className="flex items-center gap-2">
+                        <span className="w-7 h-7 rounded-full text-white flex items-center justify-center text-xs font-semibold" style={{background:COLORS[winner.id%COLORS.length]}}>{initials(winner.name)}</span>
+                        <span className="text-sm font-medium">{winner.name}{isMineWinner?" (you)":""}</span>
+                      </div>
+                    ):pSize>0?(
+                      <span className="text-xs font-medium bg-slate-100 text-slate-700 px-2 py-1 rounded-full">{pSize} in pool</span>
+                    ):<span className="text-sm text-slate-400">No pool yet</span>}
+                  </div>
+
+                  {me.role==="provider"&&meInPool&&!winner&&(
+                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-2.5 mb-2 text-xs text-blue-900">
+                      You're in the pool for this shift.{othersInPool>0?` ${othersInPool} other ${othersInPool===1?"person is":"people are"} too.`:" You're the only one so far."}
+                    </div>
+                  )}
+                  {me.role==="provider"&&!meInPool&&!winner&&pSize>0&&(
+                    <div className="bg-slate-50 rounded-lg p-2.5 mb-2 text-xs text-slate-600">
+                      {pSize} {pSize===1?"person is":"people are"} in the pool for this shift.
+                    </div>
+                  )}
+
+                  {me.role==="provider"&&(
+                    winner?(
+                      <div className={`w-full py-2.5 text-sm rounded-lg font-medium text-center ${isMineWinner?"bg-green-100 text-green-800":"bg-slate-100 text-slate-500"}`}>
+                        {isMineWinner?"✓ Awarded to you":"Awarded"}
+                      </div>
+                    ):(()=>{
+                      const outOfBlock=!inBlock(editingDay,config);
+                      const disabledReason =
+                        outOfBlock ? "This date isn't in the current signup block." :
+                        !currentBlock?.signupOpen ? "Signup is closed — wait for the admin to open it." :
+                        !me.seniorityId ? "Your seniority hasn't been assigned yet — ask an admin." :
+                        meUnavail ? "You marked this day as blocked — unblock it to join." :
+                        null;
+                      return(<>
+                        <button onClick={()=>joinPool(editingDay,slot.id)}
+                          disabled={!!disabledReason}
+                          className={`w-full py-2.5 text-sm rounded-lg font-medium transition ${
+                            meInPool?"bg-slate-100 text-slate-700 hover:bg-slate-200":
+                            "bg-blue-600 text-white hover:bg-blue-700"
+                          } ${disabledReason?"opacity-50 cursor-not-allowed":""}`}>
+                          {meUnavail?"Unavailable":meInPool?"Leave pool":"Join pool for this shift"}
+                        </button>
+                        {disabledReason&&<div className="mt-1.5 text-[11px] text-slate-500 italic">{disabledReason}</div>}
+                      </>);
+                    })()
+                  )}
+                  {me.role==="admin"&&(
+                    <div className="space-y-1.5">
+                      <select value={winnerUid||""} onChange={e=>adminAssign(editingDay,slot.id,e.target.value?parseInt(e.target.value):null)}
+                        className="w-full text-sm border border-slate-300 rounded-lg px-2 py-2 bg-white">
+                        <option value="">— Open / pool-only —</option>
+                        {users.filter(u=>u.role==="provider"&&u.seniorityId).map(u=>{
+                          const un=isUnavail(u.id,editingDay);
+                          return <option key={u.id} value={u.id} disabled={un}>{u.name}{un?" (unavailable)":""}{pool.includes(u.id)?" · in pool":""}</option>;
+                        })}
+                      </select>
+                      {pSize>0&&!winner&&<div className="text-[11px] text-slate-500">Pool: {pool.map(uid=>users.find(u=>u.id===uid)?.name.split(" ")[0]||"?").join(", ")}</div>}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  /* ══ MODALS ══ */
+  const ReconcileModal = () => {
+    if(!reconcilePreview) return null;
+    const {awarded,deltas} = reconcilePreview;
+    const contested = awarded.filter(a=>a.contested);
+    const cascaded = awarded.filter(a=>!a.contested&&a.cascaded);
+    const auto = awarded.filter(a=>!a.contested&&!a.cascaded);
+    return(
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setReconcilePreview(null)}>
+        <div className="bg-white rounded-2xl max-w-lg w-full max-h-[85vh] overflow-hidden flex flex-col" onClick={e=>e.stopPropagation()}>
+          <div className="p-5 border-b border-slate-100">
+            <div className="font-semibold text-xl">Close & reconcile</div>
+            <p className="text-sm text-slate-500 mt-1">{awarded.length} slots awarded · {contested.length} contested · {cascaded.length} cascaded · {Object.keys(deltas).length} tie-break penalties</p>
+          </div>
+          <div className="overflow-y-auto p-5 flex-1 space-y-4">
+            {contested.length>0&&(
+              <div>
+                <div className="text-sm font-medium text-slate-700 mb-2">Contested (pool {`>`} 1)</div>
+                <div className="space-y-1.5">{contested.map((a,i)=>{
+                  const d=parseDk(a.dateKey), w=users.find(u=>u.id===a.winner);
+                  return(
+                    <div key={i} className="flex items-center gap-2 text-sm py-1">
+                      <span className="text-slate-500 w-20 flex-shrink-0">{MONTHS_SHORT[d.getMonth()]} {d.getDate()} {DAYS_SHORT[d.getDay()]}</span>
+                      <span className="font-medium text-xs px-2 py-0.5 rounded" style={{background:a.slot.color+"20",color:a.slot.color}}>{a.slot.name}</span>
+                      <span className="text-xs text-slate-500">pool {a.pool.length}</span>
+                      <span className="font-medium ml-auto">→ {w?.name} <span className="text-amber-600 text-xs">−1 pt</span></span>
+                    </div>
+                  );
+                })}</div>
+              </div>
+            )}
+            {cascaded.length>0&&(
+              <div>
+                <div className="text-sm font-medium text-slate-700 mb-2">Cascaded (tie-break loser shifted to open slot)</div>
+                <div className="space-y-1.5">{cascaded.map((a,i)=>{
+                  const d=parseDk(a.dateKey), w=users.find(u=>u.id===a.winner);
+                  return(
+                    <div key={i} className="flex items-center gap-2 text-sm py-1">
+                      <span className="text-slate-500 w-20 flex-shrink-0">{MONTHS_SHORT[d.getMonth()]} {d.getDate()} {DAYS_SHORT[d.getDay()]}</span>
+                      <span className="font-medium text-xs px-2 py-0.5 rounded" style={{background:a.slot.color+"20",color:a.slot.color}}>{a.slot.name}</span>
+                      {a.fromSlot&&<span className="text-xs text-slate-500">from {a.fromSlot.name}</span>}
+                      <span className="font-medium ml-auto">→ {w?.name}</span>
+                    </div>
+                  );
+                })}</div>
+              </div>
+            )}
+            {auto.length>0&&(
+              <div>
+                <div className="text-sm font-medium text-slate-700 mb-2">Auto-awarded (single claimant)</div>
+                <div className="space-y-1.5">{auto.map((a,i)=>{
+                  const d=parseDk(a.dateKey), w=users.find(u=>u.id===a.winner);
+                  return(
+                    <div key={i} className="flex items-center gap-2 text-sm py-1">
+                      <span className="text-slate-500 w-20 flex-shrink-0">{MONTHS_SHORT[d.getMonth()]} {d.getDate()} {DAYS_SHORT[d.getDay()]}</span>
+                      <span className="font-medium text-xs px-2 py-0.5 rounded" style={{background:a.slot.color+"20",color:a.slot.color}}>{a.slot.name}</span>
+                      <span className="font-medium ml-auto">→ {w?.name}</span>
+                    </div>
+                  );
+                })}</div>
+              </div>
+            )}
+            {awarded.length===0&&<p className="text-sm text-slate-500 text-center py-4">No pool entries to reconcile.</p>}
+          </div>
+          <div className="p-4 border-t border-slate-100 flex gap-2">
+            <button onClick={()=>setReconcilePreview(null)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
+            <button onClick={applyReconcile} className="flex-1 py-2.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium">Close signup & apply</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const ConfirmResetModal = () => {
+    if(!confirmReset) return null;
+    let slotCount = 0, poolCount = 0;
+    for(const k of blockDays){
+      const day = shifts[k]; if(!day) continue;
+      for(const s of config.shiftSlots){
+        const e = day[s.id]; if(!e) continue;
+        if(getUid(e)) slotCount++;
+        else if(poolSize(e)>0) poolCount++;
+      }
+    }
+    const deltaCount = Object.keys(config.lastReconcileDeltas||{}).length;
+    return(
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setConfirmReset(false)}>
+        <div className="bg-white rounded-2xl max-w-md w-full p-5" onClick={e=>e.stopPropagation()}>
+          <div className="text-2xl mb-2">↺</div>
+          <div className="font-semibold text-xl mb-2">Reset block?</div>
+          <p className="text-sm text-slate-600 mb-3">This will clear everything on the calendar for the current block and reopen signup so you can run assignments again.</p>
+          <ul className="text-sm text-slate-700 space-y-1 mb-4 list-disc list-inside">
+            <li><span className="font-medium">{slotCount}</span> awarded slot{slotCount===1?"":"s"} will be cleared.</li>
+            <li><span className="font-medium">{poolCount}</span> pending pool{poolCount===1?"":"s"} will be cleared.</li>
+            <li>{deltaCount>0?<><span className="font-medium">{deltaCount}</span> user{deltaCount===1?"":"s"} will have tie-break point penalties reversed.</>:"No tie-break point penalties to reverse."}</li>
+            <li>Availability, preferences, and targets are <span className="font-medium">kept</span>.</li>
+          </ul>
+          <div className="flex gap-2">
+            <button onClick={()=>setConfirmReset(false)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
+            <button onClick={resetBlock} className="flex-1 py-2.5 text-sm bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium">Reset block</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Admin-only: form for adding a new user to the current group with a generated temp password.
+  const AddUserModal = () => {
+    if(!addUserOpen) return null;
+    return(
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setAddUserOpen(false)}>
+        <div className="bg-white rounded-2xl max-w-md w-full p-5" onClick={e=>e.stopPropagation()}>
+          <div className="flex items-center justify-between mb-3">
+            <div className="font-semibold text-xl">Add user</div>
+            <button onClick={()=>setAddUserOpen(false)} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:bg-slate-100 rounded-full text-xl leading-none">×</button>
+          </div>
+          <p className="text-sm text-slate-500 mb-4">We'll generate a temporary password you can share. They can sign in with their username and the temp password right away.</p>
+          <Field label="Full name"><input type="text" value={addUserForm.name}
+            onChange={e=>setAddUserForm({...addUserForm,name:e.target.value})}
+            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="Jane Smith"/></Field>
+          <Field label="Username"><input type="text" value={addUserForm.username} autoCapitalize="none"
+            onChange={e=>setAddUserForm({...addUserForm,username:e.target.value})}
+            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="jsmith"/></Field>
+          <Field label="Email (optional — used to prefill the email share)"><input type="email" value={addUserForm.email}
+            onChange={e=>setAddUserForm({...addUserForm,email:e.target.value})}
+            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="jane@example.com"/></Field>
+          <div className="grid grid-cols-2 gap-2 mb-3">
+            <Field label="Role">
+              <select value={addUserForm.role} onChange={e=>setAddUserForm({...addUserForm,role:e.target.value})}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white">
+                <option value="provider">Provider</option>
+                <option value="admin">Admin</option>
+              </select>
+            </Field>
+            {addUserForm.role==="provider"&&(
+              <Field label="Seniority (optional)">
+                <select value={addUserForm.seniorityId} onChange={e=>setAddUserForm({...addUserForm,seniorityId:e.target.value})}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white">
+                  <option value="">— Unassigned —</option>
+                  {config.seniorityLevels.map(l=><option key={l.id} value={l.id}>{l.name} (min {l.minShifts||0})</option>)}
+                </select>
+              </Field>
+            )}
+          </div>
+          <button onClick={async()=>{
+              const result = await adminAddUser(addUserForm);
+              if(result.error){ flash("⚠️ " + result.error); return; }
+              setNewUserResult({
+                name: result.user.name,
+                username: result.user.username,
+                tempPassword: result.tempPassword,
+                email: result.user.email,
+                role: result.user.role,
+              });
+              setAddUserOpen(false);
+              setAddUserForm({ name:"", username:"", email:"", role:"provider", seniorityId:"" });
+            }}
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2.5 rounded-lg text-sm font-medium">
+            Generate account
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // Shown after adminAddUser succeeds. Displays username + temp password with copy / email share helpers.
+  const NewUserInfoModal = () => {
+    if(!newUserResult) return null;
+    const { name, username, tempPassword, email, role } = newUserResult;
+    const gc = currentGroup?.groupCode || "";
+    const body = [
+      `Hi ${name.split(" ")[0]},`,
+      ``,
+      `You've been added to our shift scheduling app as a ${role}.`,
+      ``,
+      `Username: ${username}`,
+      `Temporary password: ${tempPassword}`,
+      gc?`Group code (only needed if signing up fresh): ${gc}`:"",
+      ``,
+      `Open the app and sign in with your username + the temporary password above.`,
+    ].filter(Boolean).join("\n");
+    const mailto = `mailto:${email||""}?subject=${encodeURIComponent("Your Shyft login")}&body=${encodeURIComponent(body)}`;
+    const copyInfo = () => { try { navigator.clipboard?.writeText(body); flash("Login info copied"); } catch { flash("⚠️ Copy failed"); } };
+    return(
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setNewUserResult(null)}>
+        <div className="bg-white rounded-2xl max-w-md w-full p-5" onClick={e=>e.stopPropagation()}>
+          <div className="text-2xl mb-1">✅</div>
+          <div className="font-semibold text-xl mb-1">Account created</div>
+          <p className="text-sm text-slate-500 mb-4">Share these credentials with <span className="font-medium">{name}</span>. They can sign in immediately.</p>
+          <div className="bg-slate-50 rounded-lg p-3 mb-3 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Username</div>
+                <div className="font-mono text-sm font-semibold text-slate-800">{username}</div>
+              </div>
+              <button onClick={()=>{try{navigator.clipboard?.writeText(username);flash("Username copied");}catch{}}}
+                className="text-[11px] text-blue-600 hover:text-blue-800 font-medium">Copy</button>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Temporary password</div>
+                <div className="font-mono text-base font-bold tracking-wider text-slate-900">{tempPassword}</div>
+              </div>
+              <button onClick={()=>{try{navigator.clipboard?.writeText(tempPassword);flash("Password copied");}catch{}}}
+                className="text-[11px] text-blue-600 hover:text-blue-800 font-medium">Copy</button>
+            </div>
+          </div>
+          <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2 mb-3">This password is shown only once. Copy it now — after you close this dialog there's no way to retrieve it (you'd have to delete and re-add the user).</p>
+          <div className="flex gap-2">
+            <button onClick={copyInfo} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">📋 Copy login info</button>
+            <a href={mailto} className="flex-1 py-2.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium text-center">
+              ✉️ Email it
+            </a>
+          </div>
+          <button onClick={()=>setNewUserResult(null)} className="w-full mt-2 py-2 text-sm text-slate-500 hover:text-slate-700">Done</button>
+        </div>
+      </div>
+    );
+  };
+
+  const Onboarding = () => {
+    if(!showOnboarding) return null;
+    return(
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+        <div className="bg-white rounded-2xl p-6 max-w-md w-full">
+          <div className="text-3xl mb-3">⭐</div>
+          <div className="font-semibold text-xl mb-3">Quick guide</div>
+          <div className="space-y-3 text-sm text-slate-600 mb-5">
+            <p><span className="font-semibold text-slate-900">1. Set your targets.</span> Tell us the minimum, ideal, and maximum shifts you want this block.</p>
+            <p><span className="font-semibold text-slate-900">2. Mark preferred dates to work.</span> On the Availability page, star any days you'd prefer. Auto-assign uses this to fill leftover slots.</p>
+            <p><span className="font-semibold text-slate-900">3. Join pools for specific shifts.</span> On the Calendar / Shifts page, tap a day and join the pool for any slot you want. You'll see how many others are in the pool too.</p>
+            <p><span className="font-semibold text-slate-900">4. Block what you can't.</span> Optionally classify (Working, Vacation, Conference, Personal Conflict). Stay available at least {config.minAvailableDays} days ({config.minAvailableWeekendDays} weekend) or lose points.</p>
+            <p><span className="font-semibold text-slate-900">5. Settled at close.</span> When the admin closes the window, contested slots go to the highest-points person (who loses a tie-break point). One-claimant slots are auto-awarded.</p>
+          </div>
+          <button onClick={()=>setShowOnboarding(false)} className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium">Got it</button>
+        </div>
+      </div>
+    );
+  };
+
+  const AutoAssignModal = () => {
+    if(!autoPreview) return null;
+    const {newAssignments,unfilled}=autoPreview;
+    return(
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setAutoPreview(null)}>
+        <div className="bg-white rounded-2xl max-w-lg w-full max-h-[80vh] overflow-hidden flex flex-col" onClick={e=>e.stopPropagation()}>
+          <div className="p-5 border-b border-slate-100">
+            <div className="font-semibold text-xl">Auto-assign preview</div>
+            <p className="text-sm text-slate-500 mt-1">{newAssignments.length} new · {unfilled.length} unfillable</p>
+          </div>
+          <div className="overflow-y-auto p-5 flex-1">
+            {newAssignments.length===0?<p className="text-sm text-slate-500 text-center py-4">Nothing to fill.</p>:(
+              <div className="space-y-1.5">{newAssignments.map((a,i)=>{
+                const date=parseDk(a.dateKey);
+                return(
+                  <div key={i} className="flex items-center gap-2 text-sm py-1">
+                    <span className="text-slate-500 w-20 flex-shrink-0">{MONTHS_SHORT[date.getMonth()]} {date.getDate()} {DAYS_SHORT[date.getDay()]}</span>
+                    <span className="font-medium text-xs px-2 py-0.5 rounded" style={{background:a.slot.color+"20",color:a.slot.color}}>{a.slot.name}</span>
+                    <span className="font-medium ml-auto">→ {a.user.name}</span>
+                  </div>
+                );
+              })}</div>
+            )}
+            {unfilled.length>0&&(
+              <div className="mt-4 p-3 bg-red-50 rounded-lg">
+                <div className="text-sm font-medium text-red-900 mb-1">⚠️ {unfilled.length} slot(s) unfillable</div>
+                <p className="text-xs text-red-700">Everyone is unavailable. Manual assignment needed.</p>
+              </div>
+            )}
+          </div>
+          <div className="p-4 border-t border-slate-100 flex gap-2">
+            <button onClick={()=>setAutoPreview(null)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
+            <button onClick={applyAutoAssign} disabled={newAssignments.length===0}
+              className="flex-1 py-2.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium disabled:opacity-50">Apply all</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  /* ══ CALENDAR ══ */
+  const CalendarView = () => {
+    const md=dim(calY,calM), off=fdow(calY,calM);
+    const cells=[...Array(off).fill(null),...Array.from({length:md},(_,i)=>i+1)];
+    return(
+      <div>
+        <div className="flex items-center justify-between mb-4">
+          <button onClick={()=>{if(calM===0){setCalM(11);setCalY(calY-1);}else setCalM(calM-1);}} className="px-3 py-1.5 border border-slate-300 rounded-lg hover:bg-slate-50 text-lg">‹</button>
+          <span className="font-semibold text-base sm:text-lg">{MONTHS[calM]} {calY}</span>
+          <button onClick={()=>{if(calM===11){setCalM(0);setCalY(calY+1);}else setCalM(calM+1);}} className="px-3 py-1.5 border border-slate-300 rounded-lg hover:bg-slate-50 text-lg">›</button>
+        </div>
+        <div className="grid grid-cols-7 gap-1 mb-1">
+          {DAYS_SHORT.map(d=><div key={d} className="text-[10px] sm:text-xs font-medium text-slate-500 text-center py-1">{d}</div>)}
+        </div>
+        <div className="grid grid-cols-7 gap-1">
+          {cells.map((d,i)=>{
+            if(d===null) return <div key={`e${i}`} className="aspect-square"/>;
+            const key=dk(calY,calM,d), date=parseDk(key), inB=inBlock(key,config), pts=dayPts(date,config);
+            const dayS=shifts[key]||{}, hol=config.holidays[key];
+            const awarded=config.shiftSlots.map(s=>({s,uid:getUid(dayS[s.id]),auto:isAuto(dayS[s.id])})).filter(x=>x.uid);
+            const filled=awarded.length, total=config.shiftSlots.length;
+            const poolN=Object.values(dayS).reduce((a,e)=>a+(getUid(e)?0:poolSize(e)),0);
+            const myUn=me.role==="provider"&&isUnavail(me.id,key);
+            const myWant=me.role==="provider"&&isWanted(me.id,key);
+            const myShift=me.role==="provider"&&awarded.some(x=>x.uid===me.id);
+            const myPool=me.role==="provider"&&!myShift&&Object.values(dayS).some(e=>!getUid(e)&&inPool(e,me.id));
+            // When filter is on, check if the selected user is on this day.
+            const filterHit=filterUid?awarded.some(x=>x.uid===filterUid)||Object.values(dayS).some(e=>!getUid(e)&&inPool(e,filterUid)):false;
+            const dimmed=filterUid&&inB&&!filterHit;
+            // Calendar cell background gradient: low → high point value. Red is reserved
+            // for blocked days only (strong "don't schedule here" signal); deeper amber
+            // carries the "more points" intuition for live days.
+            const bg=!inB?"bg-slate-50":myUn?"bg-red-100":hol?"bg-green-100":pts===0?"bg-blue-50":pts===1?"bg-blue-100":pts===2?"bg-amber-100":pts===3?"bg-amber-200":"bg-amber-300";
+            // Admin-only post-reconcile overlays. Challenging (hard-to-fill) days get the strongest
+            // ring; auto-only-ish days get a subtler gear marker. Provider rings (award/pool) still win.
+            const insights = dayInsights(key);
+            const adminChallenging = !!insights?.challenging;
+            const adminHasAuto = !!insights?.hasAuto;
+            // Ring: highlight filter match in purple, else show your own award/pool rings, else admin challenge ring.
+            const ring=filterUid?(filterHit?"ring-2 ring-purple-500":""):(myShift?"ring-2 ring-green-500":myPool?"ring-2 ring-blue-400":adminChallenging?"ring-2 ring-orange-500":"");
+            return(
+              <button key={key} disabled={!inB}
+                className={`aspect-square rounded-lg p-1 sm:p-1.5 flex flex-col text-[10px] ${bg} ${inB?"active:scale-95 hover:ring-2 hover:ring-blue-400":"opacity-40"} ${ring} ${dimmed?"opacity-30":""}`}
+                onClick={()=>inB&&setEditingDay(key)}>
+                <div className="flex items-center justify-between leading-none">
+                  <span className="font-semibold text-slate-700 text-xs">
+                    {adminChallenging&&<span className="text-orange-600 mr-0.5" title="Hard to fill — nobody preferred, most blocked, all slots auto-assigned">⚠</span>}
+                    {d}
+                    {myWant&&<span className="text-emerald-500 ml-0.5">⭐</span>}
+                  </span>
+                  <span className="flex items-center gap-0.5">
+                    {adminHasAuto&&!adminChallenging&&<span className="text-[9px] text-amber-600" title="Contains auto-assigned slots">⚙</span>}
+                    {pts>0&&<span className="text-[9px] text-slate-500">+{pts}</span>}
+                  </span>
+                </div>
+                {hol&&<div className="text-[8px] text-green-800 truncate leading-tight mt-0.5">{hol}</div>}
+                {!inB?null:myUn?(
+                  <div className="flex-1 flex items-center justify-center">
+                    <span className="text-[10px] sm:text-[11px] font-bold text-red-700">✕ BLOCKED</span>
+                  </div>
+                ):(
+                  // Centered, per-slot chips — open slots use an outlined chip in the slot's color
+                  // so they read as "prominent / claimable"; awarded slots stay solid-colored with the assignee's name.
+                  <div className="flex-1 flex flex-col justify-center w-full gap-0.5 overflow-hidden py-0.5">
+                    {config.shiftSlots.map(s=>{
+                      const entry=dayS[s.id];
+                      const winUid=getUid(entry), u=winUid?users.find(uu=>uu.id===winUid):null;
+                      const isMe=winUid===me.id, isFilt=filterUid&&winUid===filterUid, auto=isAuto(entry);
+                      const pSize=poolSize(entry);
+                      const meIn=me.role==="provider"&&!winUid&&inPool(entry,me.id);
+                      const filtInPool=filterUid&&!winUid&&inPool(entry,filterUid);
+                      if(u) return(
+                        <div key={s.id}
+                          className={`text-[9px] sm:text-[10px] px-1 py-0.5 rounded leading-tight truncate font-medium ${isMe?"bg-green-100 text-green-800":isFilt?"bg-purple-100 text-purple-800":"text-white"}`}
+                          style={!isMe&&!isFilt?{background:s.color}:{}} title={`${s.name}: ${u.name}${auto?" (auto)":""}`}>
+                          {u.name.split(" ")[0]}{auto?" ⚙":""}
+                        </div>
+                      );
+                      if(pSize>0) return(
+                        <div key={s.id}
+                          className={`text-[9px] sm:text-[10px] px-1 py-0.5 rounded leading-tight truncate font-semibold border ${meIn?"bg-blue-100 text-blue-800 border-blue-300":filtInPool?"bg-purple-100 text-purple-800 border-purple-300":"bg-white border-slate-300 text-slate-700"}`}
+                          title={`${s.name}: pool of ${pSize}`}>
+                          {meIn?`You +${pSize-1}`:`${s.name} · ${pSize}`}
+                        </div>
+                      );
+                      return(
+                        <div key={s.id}
+                          className="text-[9px] sm:text-[10px] px-1 py-0.5 rounded leading-tight truncate font-semibold bg-white"
+                          style={{border:`1.5px solid ${s.color}`, color:s.color}}
+                          title={`${s.name}: open`}>
+                          {s.name}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex flex-wrap gap-x-3 gap-y-1 mt-3 text-[11px] text-slate-500">
+          <Legend color="bg-blue-50" label="0 pts"/><Legend color="bg-blue-100" label="+1"/>
+          <Legend color="bg-amber-100" label="+2"/><Legend color="bg-amber-200" label="+3"/><Legend color="bg-amber-300" label="+4"/>
+          {me.role==="provider"&&<Legend color="bg-red-100" label="Blocked"/>}
+          {me.role==="provider"&&<span className="flex items-center gap-1"><span className="text-emerald-500">⭐</span>Preferred</span>}
+          {me.role==="provider"&&<Legend ring="ring-2 ring-blue-400" label="In pool"/>}
+          <Legend ring="ring-2 ring-green-500" label="Awarded"/>
+          {filterUid&&<Legend ring="ring-2 ring-purple-500" label="Filtered user"/>}
+          {me.role==="admin"&&<Legend ring="ring-2 ring-orange-500" label="⚠ Hard to fill"/>}
+          {me.role==="admin"&&<span className="flex items-center gap-1"><span className="text-amber-600">⚙</span>Auto-filled</span>}
+        </div>
+      </div>
+    );
+  };
+
+  /* ══ LIST VIEW ══ */
+  const ListView = () => {
+    if(!blockDays.length) return <p className="text-sm text-slate-500 text-center py-8">No block dates set.</p>;
+    // When a provider filter is active, only render days where the selected user has an awarded shyft or is in a pool.
+    const visibleDays = filterUid
+      ? blockDays.filter(k=>{
+          const day = shifts[k]||{};
+          return Object.values(day).some(e=>getUid(e)===filterUid || inPool(e,filterUid));
+        })
+      : blockDays;
+    if(filterUid && visibleDays.length===0) return <p className="text-sm text-slate-500 text-center py-8">No shifts yet for this user.</p>;
+    return(
+      <div className="space-y-2">
+        {visibleDays.map(k=>{
+          const date=parseDk(k), dayS=shifts[k]||{}, base=dayPts(date,config), hol=config.holidays[k];
+          const myUn=me.role==="provider"&&isUnavail(me.id,k);
+          const myShift=me.role==="provider"&&Object.values(dayS).some(e=>getUid(e)===me.id);
+          const filled=Object.values(dayS).filter(e=>getUid(e)).length, total=config.shiftSlots.length;
+          const myWant=me.role==="provider"&&isWanted(me.id,k);
+          const pillBg=base===0?"bg-slate-100 text-slate-600":base===1?"bg-blue-100 text-blue-700":base===2?"bg-amber-100 text-amber-800":base===3?"bg-amber-200 text-amber-900":"bg-amber-300 text-amber-900";
+          const insights=dayInsights(k);
+          const adminChallenging=!!insights?.challenging;
+          const adminHasAuto=!!insights?.hasAuto;
+          return(
+            <button key={k} onClick={()=>setEditingDay(k)}
+              className={`w-full border rounded-xl p-3 flex items-center gap-3 active:bg-slate-50 text-left ${myShift?"bg-white border-green-400 border-2":myUn?"bg-red-50 border-red-300":adminChallenging?"bg-orange-50 border-orange-400 border-2":"bg-white border-slate-200"}`}>
+              <div className="w-12 h-12 rounded-lg bg-slate-50 flex flex-col items-center justify-center flex-shrink-0">
+                <div className="text-[10px] font-semibold text-slate-500 leading-none">{DAYS_SHORT[date.getDay()]}</div>
+                <div className="text-lg font-bold leading-tight">{date.getDate()}</div>
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex flex-wrap items-center gap-1.5 mb-0.5">
+                  <span className="font-medium text-sm">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}{myWant?<span className="text-emerald-500 ml-0.5">⭐</span>:""}</span>
+                  {base>0&&<span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${pillBg}`}>+{base}</span>}
+                  {hol&&<span className="text-[10px] bg-green-100 text-green-800 px-1.5 py-0.5 rounded-full truncate">{hol}</span>}
+                  {myUn&&<span className="text-[10px] bg-red-200 text-red-900 px-1.5 py-0.5 rounded-full font-semibold">✕ Blocked</span>}
+                  {adminChallenging&&(
+                    <span className="text-[10px] bg-orange-100 text-orange-800 border border-orange-300 px-1.5 py-0.5 rounded-full font-semibold"
+                      title={`${insights.blockedCount}/${insights.totalProvs} blocked · 0 preferred · all slots auto-assigned`}>
+                      ⚠ Hard to fill
+                    </span>
+                  )}
+                  {adminHasAuto&&!adminChallenging&&(
+                    <span className="text-[10px] bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded-full font-medium">⚙ Auto-filled</span>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {config.shiftSlots.map(s=>{
+                    const entry=dayS[s.id], winUid=getUid(entry), u=winUid?users.find(x=>x.id===winUid):null;
+                    const isMe=winUid===me.id, auto=isAuto(entry);
+                    const pSize=poolSize(entry), meIn=me.role==="provider"&&!winUid&&inPool(entry,me.id);
+                    if(u) return(
+                      <span key={s.id} className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${isMe?"bg-green-100 text-green-800":"text-white"}`}
+                        style={!isMe?{background:s.color}:{}}>
+                        {s.name}: {isMe?"You":u.name.split(" ")[0]}{auto?" ⚙":""}
+                      </span>
+                    );
+                    if(pSize>0) return(
+                      <span key={s.id} className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border-2 ${meIn?"bg-blue-100 text-blue-800 border-blue-300":"bg-white text-slate-700 border-slate-300"}`}>
+                        {s.name}: {meIn?`You + ${pSize-1}`:`Pool ${pSize}`}
+                      </span>
+                    );
+                    return <span key={s.id} className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-white border-2"
+                      style={{borderColor:s.color, color:s.color}}>
+                      {s.name}: Open
+                    </span>;
+                  })}
+                </div>
+              </div>
+              <div className={`text-xs font-semibold flex-shrink-0 ${filled===total?"text-slate-400":filled===0?"text-blue-600":"text-amber-600"}`}>{filled}/{total}</div>
+            </button>
+          );
+        })}
+      </div>
+    );
+  };
+
+  /* ══ PAGES ══ */
+  const ProviderHome = () => {
+    const earned=getPtsEarned(me.id), count=getShiftCount(me.id), autoC=getAutoCount(me.id);
+    const avail=getAvailInfo(me.id), total=me.points+earned-avail.penalty;
+    const min=mySeniority?.minShifts||0, rem=Math.max(0,min-count);
+    return(<>
+      <h1 className="text-2xl font-semibold mb-1">Hi, {me.name.split(" ")[0]}</h1>
+      <p className="text-sm text-slate-500 mb-5">
+        {mySeniority?<>Set as <span className="font-medium text-slate-700">{mySeniority.name}</span> · min {min} shifts</>:<span className="text-amber-600">Waiting for admin to assign your seniority.</span>}
+      </p>
+      {autoC>0&&(()=>{ const npc=getAutoNonPrefCount(me.id); const autoBonus=autoC*(config.involuntaryBonus||0), npBonus=npc*(config.nonPreferredBonus||0); return (
+        <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 mb-3 text-sm">
+          <span className="font-medium text-blue-900">⚙ {autoC} auto-assigned shift{autoC>1?"s":""}</span>
+          <span className="text-blue-700"> (+{autoBonus+npBonus} bonus pts{npc>0?<span className="text-[11px]"> · {autoBonus} auto + {npBonus} non-pref</span>:null})</span>
+        </div>
+      );})()}
+      {!avail.meets&&currentBlock&&(
+        <div className="bg-red-50 border border-red-200 rounded-xl p-3 mb-3 text-sm">
+          <div className="font-medium text-red-900 mb-1">⚠️ Availability shortfall</div>
+          <div className="text-red-800 text-xs">
+            {avail.dayShort>0&&<>Need {avail.dayShort} more available day(s). </>}
+            {avail.wkShort>0&&<>Need {avail.wkShort} more weekend day(s). </>}
+            <span className="font-semibold">Penalty: −{avail.penalty} pts.</span>
+          </div>
+        </div>
+      )}
+      <div className="grid grid-cols-3 gap-2 sm:gap-4 mb-5">
+        <Stat label="Total pts" value={total.toFixed(total%1?1:0)} color={total<0?"text-red-600":"text-amber-600"}/>
+        <Stat label="Shifts" value={`${count}/${min||"—"}`} color="text-blue-600"/>
+        <Stat label="Available" value={`${avail.availD}/${blockDays.length||"—"}`} color={avail.meets?"text-green-600":"text-red-600"}/>
+      </div>
+      {currentBlock&&(
+        <div className="bg-white rounded-xl border border-slate-200 p-4 mb-3">
+          <div className="text-sm font-semibold mb-1">{currentBlock.name||"This block"}</div>
+          <p className="text-sm text-slate-600">{MONTHS_SHORT[parseDk(currentBlock.start).getMonth()]} {parseDk(currentBlock.start).getDate()} → {MONTHS_SHORT[parseDk(currentBlock.end).getMonth()]} {parseDk(currentBlock.end).getDate()}</p>
+          <p className="text-sm mt-1">Signup is {currentBlock.signupOpen?<span className="text-green-700 font-medium">open</span>:<span className="text-slate-700 font-medium">closed</span>}.</p>
+        </div>
+      )}
+      <div>
+        <button onClick={()=>setPage("schedule")} className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-medium text-sm">Open schedule →</button>
+      </div>
+    </>);
+  };
+
+  const AdminHome = () => {
+    const provs=users.filter(u=>u.role==="provider"), unassigned=provs.filter(u=>!u.seniorityId);
+    let assigned=0, pendingPool=0, contested=0;
+    Object.values(shifts).forEach(d=>Object.values(d).forEach(e=>{
+      if(getUid(e)) assigned++;
+      else { pendingPool++; if(poolSize(e)>1) contested++; }
+    }));
+    const totalSlots=blockDays.length*config.shiftSlots.length, open=totalSlots-assigned-pendingPool;
+    const failingAvail=provs.filter(u=>!getAvailInfo(u.id).meets);
+    return(<>
+      <h1 className="text-2xl font-semibold mb-1">Dashboard</h1>
+      <p className="text-sm text-slate-500 mb-3">Block overview.</p>
+      {/* Block switcher — when 2+ blocks exist, admin can pick which one these stats + actions apply to. */}
+      {(config.blocks||[]).length>0&&(
+        <div className="bg-white rounded-xl border border-slate-200 p-3 mb-4 flex flex-wrap items-center gap-2">
+          <label className="text-xs font-medium text-slate-600 flex-shrink-0">Viewing block</label>
+          <select value={config.currentBlockId||""} onChange={e=>updateConfig({currentBlockId:e.target.value?parseInt(e.target.value):null})}
+            className="flex-1 min-w-[8rem] px-2 py-1.5 border border-slate-300 rounded-md text-sm bg-white">
+            {config.blocks.map(b=>{
+              const range = b.start&&b.end ? ` (${MONTHS_SHORT[parseDk(b.start).getMonth()]} ${parseDk(b.start).getDate()}–${MONTHS_SHORT[parseDk(b.end).getMonth()]} ${parseDk(b.end).getDate()})` : " (dates unset)";
+              return <option key={b.id} value={b.id}>{b.name||"Block"}{range}</option>;
+            })}
+          </select>
+          <button onClick={()=>setPage("setup")} className="text-xs font-medium text-blue-700 hover:text-blue-800 px-2 py-1">Manage →</button>
+        </div>
+      )}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3 mb-5">
+        <Stat label="Providers" value={provs.length} color="text-blue-600"/>
+        <Stat label="Awarded" value={totalSlots?`${assigned}/${totalSlots}`:"—"} color={assigned===totalSlots?"text-green-600":"text-amber-600"} small/>
+        <Stat label="In pool" value={pendingPool} color={pendingPool>0?"text-blue-600":"text-slate-400"}/>
+        <Stat label="Signup" value={currentBlock?.signupOpen?"Open":"Closed"} color={currentBlock?.signupOpen?"text-green-600":"text-slate-500"}/>
+      </div>
+      <div className="bg-white rounded-xl border border-slate-200 p-4 mb-3">
+        <div className="font-semibold mb-3">Quick actions</div>
+        <div className="grid grid-cols-2 gap-2">
+          {currentBlock?.signupOpen?
+            <button onClick={()=>setReconcilePreview(computeReconcile())} disabled={pendingPool===0}
+              className="py-2.5 text-sm font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40">
+              {pendingPool===0?"No pools to reconcile":`Close & reconcile (${pendingPool})`}
+            </button>
+            :<button onClick={()=>updateCurrentBlock({signupOpen:true})} disabled={!currentBlock}
+              className="py-2.5 text-sm font-medium rounded-lg bg-green-600 text-white hover:bg-green-700 disabled:opacity-40">
+              {currentBlock?"Open signup":"No block selected"}
+            </button>
+          }
+          <button onClick={()=>setAutoPreview(computeAutoAssign())} disabled={totalSlots-assigned===0}
+            className="py-2.5 text-sm font-medium rounded-lg bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-40">
+            {totalSlots-assigned===0?"All filled ✓":`Auto-fill ${totalSlots-assigned} leftover`}
+          </button>
+          <button onClick={()=>setPage("setup")} className="py-2.5 text-sm border border-slate-300 rounded-lg hover:bg-slate-50">Setup</button>
+          <button onClick={()=>setPage("people")} className="py-2.5 text-sm border border-slate-300 rounded-lg hover:bg-slate-50">People</button>
+        </div>
+        {contested>0&&<p className="text-[11px] text-slate-500 mt-2">{contested} contested slot{contested===1?"":"s"} in pool — reconcile awards to highest pts (winner loses 1 pt per tie-break).</p>}
+        {(assigned>0||pendingPool>0)&&(
+          <div className="mt-3 pt-3 border-t border-slate-100">
+            <button onClick={()=>setConfirmReset(true)} className="w-full py-2 text-xs font-medium rounded-lg border border-red-200 text-red-700 hover:bg-red-50">
+              ↺ Reset block
+            </button>
+            <p className="text-[11px] text-slate-500 mt-1.5">Clears all awards and pools for this block and reopens signup. Reverses any tie-break point penalties from the last reconcile. Keeps availability, preferences, and targets.</p>
+          </div>
+        )}
+      </div>
+      {unassigned.length>0&&<div className="bg-amber-50 border border-amber-200 rounded-xl p-4 mb-3"><div className="font-semibold text-amber-900 mb-1">{unassigned.length} need seniority assigned</div><button onClick={()=>setPage("people")} className="text-sm bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded-lg font-medium mt-1">Assign →</button></div>}
+      {failingAvail.length>0&&<div className="bg-red-50 border border-red-200 rounded-xl p-4 mb-3"><div className="font-semibold text-red-900 mb-1">{failingAvail.length} below availability minimum</div><ul className="text-sm text-red-800 mt-1 space-y-0.5">{failingAvail.map(u=>{const a=getAvailInfo(u.id);return <li key={u.id}>{u.name} — {a.availD} days · −{a.penalty} pts</li>;})}</ul></div>}
+    </>);
+  };
+
+  const ShiftsPage = () => {
+    const provs = users.filter(u=>u.role==="provider").sort((a,b)=>a.name.localeCompare(b.name));
+    const fu = filterUid?users.find(u=>u.id===filterUid):null;
+    let fCount = 0;
+    if(filterUid){
+      for(const k of blockDays) for(const s of config.shiftSlots) if(getUid(shifts[k]?.[s.id])===filterUid) fCount++;
+    }
+    return(<>
+      <div className="flex items-center justify-between mb-3">
+        <h1 className="text-2xl font-semibold">{me.role==="admin"?"Calendar":"Pick shifts"}</h1>
+        <div className="flex bg-slate-100 rounded-lg p-0.5">
+          <button onClick={()=>setShiftsView("list")} className={`px-3 py-1.5 text-xs font-medium rounded-md ${shiftsView==="list"?"bg-white shadow text-slate-900":"text-slate-500"}`}>List</button>
+          <button onClick={()=>setShiftsView("cal")} className={`px-3 py-1.5 text-xs font-medium rounded-md ${shiftsView==="cal"?"bg-white shadow text-slate-900":"text-slate-500"}`}>Calendar</button>
+        </div>
+      </div>
+      <p className="text-sm text-slate-500 mb-3">
+        {me.role==="admin"?"Tap any day to assign.":!me.seniorityId?"Admin must assign your seniority.":currentBlock?.signupOpen?"Tap a day to sign up.":"Signup closed — view only."}
+      </p>
+      <div className="flex items-center gap-2 mb-3">
+        <label className="text-xs text-slate-500 whitespace-nowrap">Show shifts for</label>
+        <select value={filterUid||""} onChange={e=>setFilterUid(e.target.value?parseInt(e.target.value):null)} className="flex-1 min-w-0 px-3 py-1.5 text-sm border border-slate-300 rounded-lg bg-white">
+          <option value="">Everyone</option>
+          {provs.map(u=>(<option key={u.id} value={u.id}>{u.name}{u.id===me.id?" (you)":""}</option>))}
+        </select>
+        {filterUid&&<button onClick={()=>setFilterUid(null)} className="text-xs text-slate-500 hover:text-slate-900 px-2 py-1">Clear</button>}
+      </div>
+      {filterUid&&<p className="text-xs text-slate-500 mb-3 px-1">Showing {fCount} awarded shift{fCount===1?"":"s"} for <span className="font-medium text-slate-700">{fu?.name}</span>.</p>}
+      <div className="bg-white rounded-xl border border-slate-200 p-3 sm:p-5">
+        {shiftsView==="list"?ListView():CalendarView()}
+      </div>
+    </>);
+  };
+
+  // Provider-only combined Schedule page: targets + preferences + blocks + pool sign-up in one view.
+  // Replaces the old separate Availability + Shifts pages (admins still have the Calendar page).
+  const SchedulePage = () => {
+    const avail=getAvailInfo(me.id);
+    const t=me.targets||{min:0,ideal:0,max:0};
+    const want=wantedCount(me.id);
+    return(<>
+      <h1 className="text-2xl font-semibold mb-1">Schedule</h1>
+      <p className="text-sm text-slate-500 mb-3">
+        Mark preferred dates, block the ones you can't, and join the pool for specific shifts — all in one place.
+      </p>
+
+      <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-4 text-sm">
+        <div className="font-semibold text-amber-900 mb-1">How this works</div>
+        <ul className="text-amber-900 text-[13px] space-y-0.5 list-disc list-inside">
+          <li><span className="font-semibold">Join the pool (tap a day)</span> — claim specific slots you want. If nobody else joins, it's yours.</li>
+          <li><span className="font-semibold">Preferred dates (⭐)</span> — considered first when auto-assign fills any leftovers.</li>
+          <li><span className="font-semibold">Blocked days</span> — never auto-assigned there. Classify them (Working, Vacation, Conference, Personal Conflict).</li>
+          <li><span className="font-semibold">Targets (min / ideal / max)</span> — auto-assign tries to land you between min and ideal.</li>
+          <li><span className="font-semibold">Back-to-back preference</span> — tell auto-assign whether to cluster your shifts together or space them out.</li>
+        </ul>
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-4 mb-4">
+        <div className="flex items-baseline justify-between mb-2">
+          <div className="font-medium text-sm">Shift targets this block</div>
+          <div className="text-xs text-slate-500">{want} preferred date{want===1?"":"s"}</div>
+        </div>
+        <div className="grid grid-cols-3 gap-2 mb-1">
+          {[["min","Minimum"],["ideal","Ideal"],["max","Maximum"]].map(([k,l])=>{
+            const floor = (k==="min" && mySeniority) ? (mySeniority.minShifts||0) : 0;
+            const readOnlyMin = k==="min" && floor>0;
+            return(
+              <div key={k}>
+                <div className="text-[11px] text-slate-500 mb-1">{l}{readOnlyMin&&<span className="ml-1 text-slate-400">🔒</span>}</div>
+                <input type="number" min={floor} value={Math.max(floor, t[k]||0)}
+                  onChange={e=>setTargets(me.id,{...t,[k]:Math.max(floor,parseInt(e.target.value)||0)})}
+                  className={`w-full px-3 py-2 border border-slate-300 rounded-lg text-sm ${readOnlyMin?"bg-slate-50 text-slate-600":""}`}/>
+              </div>
+            );
+          })}
+        </div>
+        {mySeniority?(
+          <p className="text-[11px] text-slate-500 mt-1">Your minimum is set by your seniority (<span className="font-medium">{mySeniority.name}</span> = {mySeniority.minShifts||0}). You can raise your personal minimum but not lower it.</p>
+        ):(
+          <p className="text-[11px] text-slate-500 mt-1">Once an admin assigns your seniority, your minimum will be set automatically.</p>
+        )}
+      </div>
+
+      {(() => {
+        const sp = me.spacingPref || { mode: "none", maxConsecutive: 3, minGap: 2 };
+        const setSp = patch => updateUser(me.id, { spacingPref: {...sp, ...patch} });
+        return(
+          <div className="bg-white rounded-xl border border-slate-200 p-4 mb-4">
+            <div className="font-medium text-sm mb-1">Back-to-back shifts</div>
+            <p className="text-xs text-slate-500 mb-3">Do you prefer your shifts clustered together or spread out? Auto-assign uses this as a soft preference.</p>
+            <div className="grid grid-cols-3 gap-2 mb-3">
+              {[["none","No preference"],["consecutive","Back-to-back OK"],["spread","Spread out"]].map(([v,l])=>(
+                <button key={v} onClick={()=>setSp({mode:v})}
+                  className={`text-xs py-2 px-2 rounded-lg font-medium border ${sp.mode===v?"bg-blue-600 border-blue-600 text-white":"bg-white border-slate-300 text-slate-700 hover:bg-slate-50"}`}>
+                  {l}
+                </button>
+              ))}
+            </div>
+            {sp.mode==="consecutive"&&(
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-slate-600 flex-1">Max consecutive shifts you'll accept</label>
+                <input type="number" min="2" max="14" value={sp.maxConsecutive||3}
+                  onChange={e=>setSp({maxConsecutive:Math.max(2,Math.min(14,parseInt(e.target.value)||2))})}
+                  className="w-16 px-2 py-1.5 border border-slate-300 rounded-lg text-sm text-center"/>
+              </div>
+            )}
+            {sp.mode==="spread"&&(
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-slate-600 flex-1">Ideal minimum days between shifts</label>
+                <input type="number" min="1" max="14" value={sp.minGap||2}
+                  onChange={e=>setSp({minGap:Math.max(1,Math.min(14,parseInt(e.target.value)||1))})}
+                  className="w-16 px-2 py-1.5 border border-slate-300 rounded-lg text-sm text-center"/>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      <div className="grid grid-cols-3 gap-2 sm:gap-3 mb-4">
+        <Stat label="Preferred days" value={want} color="text-emerald-600" sub="No minimum"/>
+        <Stat label="Available days" value={avail.availD} color={avail.dayShort>0?"text-red-600":"text-green-600"} sub={`Min required: ${config.minAvailableDays}`}/>
+        <Stat label="Weekend days available" value={avail.availW} color={avail.wkShort>0?"text-red-600":"text-green-600"} sub={`Min required: ${config.minAvailableWeekendDays}`}/>
+      </div>
+
+      {avail.penalty>0?
+        <div className="bg-red-50 border border-red-200 rounded-xl p-3 mb-4 text-sm"><div className="font-medium text-red-900">−{avail.penalty} pts penalty</div><div className="text-red-700 text-xs">{avail.dayShort>0&&<>Need {avail.dayShort} more day(s). </>}{avail.wkShort>0&&<>Need {avail.wkShort} more weekend day(s).</>}</div></div>
+        :<div className="bg-green-50 border border-green-200 rounded-xl p-3 mb-4 text-sm"><div className="font-medium text-green-900">✓ Meets availability requirement</div></div>
+      }
+
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs text-slate-500">
+          {blockDays.length} day{blockDays.length===1?"":"s"} in block
+          {currentBlock && <> · signup <span className={currentBlock.signupOpen?"text-green-700 font-medium":"text-slate-600 font-medium"}>{currentBlock.signupOpen?"open":"closed"}</span></>}
+        </div>
+        <div className="flex bg-slate-100 rounded-lg p-0.5">
+          {[["list","📋 List"],["calendar","📅 Calendar"]].map(([v,l])=>(
+            <button key={v} onClick={()=>setAvailView(v)}
+              className={`px-2.5 py-1 text-xs font-medium rounded-md transition ${availView===v?"bg-white shadow text-slate-900":"text-slate-500 hover:text-slate-700"}`}>
+              {l}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-3 sm:p-5">
+        {!blockDays.length?<p className="text-sm text-slate-500 text-center py-4">Block dates not set yet.</p>:
+          availView==="list"?ScheduleList():CalendarView()}
+      </div>
+    </>);
+  };
+
+  // Merged list view for providers: date + point value + slot/pool chips + prefer/block controls.
+  // Tap the row header to open DaySheet (handles pool join/leave and reason picker).
+  const ScheduleList = () => (
+    <div className="space-y-2">{blockDays.map(k=>{
+      const date=parseDk(k), blocked=isUnavail(me.id,k), reason=unavailReason(me.id,k);
+      const wanted=isWanted(me.id,k), dayS=shifts[k]||{}, hasShift=Object.values(dayS).some(e=>getUid(e)===me.id);
+      const isWk=isWeekend(k), pts=dayPts(date,config), hol=config.holidays[k];
+      const filled=Object.values(dayS).filter(e=>getUid(e)).length, total=config.shiftSlots.length;
+      // Point pill — deeper amber for more points, no red.
+      const pillBg = pts===0?"bg-slate-100 text-slate-600":pts===1?"bg-blue-100 text-blue-700":pts===2?"bg-amber-100 text-amber-800":pts===3?"bg-amber-200 text-amber-900":"bg-amber-300 text-amber-900";
+      const cardBg = blocked?"bg-red-50 border-red-300":hasShift?"bg-white border-green-400 border-2":wanted?"bg-emerald-50 border-emerald-200":"bg-white border-slate-200";
+      return(
+        <div key={k} className={`rounded-xl border ${cardBg}`}>
+          <button onClick={()=>setEditingDay(k)} className="w-full flex items-center gap-3 p-3 text-left active:bg-slate-50 rounded-t-xl">
+            <div className="w-12 h-12 rounded-lg bg-slate-50 flex flex-col items-center justify-center flex-shrink-0">
+              <div className="text-[10px] font-semibold text-slate-500 leading-none">{DAYS_SHORT[date.getDay()]}</div>
+              <div className="text-lg font-bold leading-tight">{date.getDate()}</div>
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex flex-wrap items-center gap-1.5 mb-1">
+                <span className="font-medium text-sm">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}{wanted?<span className="text-emerald-500 ml-0.5">⭐</span>:""}</span>
+                {pts>0&&<span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${pillBg}`}>+{pts}</span>}
+                {isWk&&<span className="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full">Weekend</span>}
+                {hol&&<span className="text-[10px] bg-green-100 text-green-800 px-1.5 py-0.5 rounded-full">{hol}</span>}
+                {blocked&&<span className="text-[10px] bg-red-200 text-red-900 px-1.5 py-0.5 rounded-full font-semibold">✕ Blocked</span>}
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {config.shiftSlots.map(s=>{
+                  const entry=dayS[s.id], winUid=getUid(entry), u=winUid?users.find(x=>x.id===winUid):null;
+                  const isMe=winUid===me.id, auto=isAuto(entry);
+                  const pSize=poolSize(entry), meIn=!winUid&&inPool(entry,me.id);
+                  if(u) return(
+                    <span key={s.id} className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${isMe?"bg-green-100 text-green-800":"text-white"}`}
+                      style={!isMe?{background:s.color}:{}}>
+                      {s.name}: {isMe?"You":u.name.split(" ")[0]}{auto?" ⚙":""}
+                    </span>
+                  );
+                  if(pSize>0) return(
+                    <span key={s.id} className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border-2 ${meIn?"bg-blue-100 text-blue-800 border-blue-300":"bg-white text-slate-700 border-slate-300"}`}>
+                      {s.name}: {meIn?`You + ${pSize-1}`:`Pool ${pSize}`}
+                    </span>
+                  );
+                  return <span key={s.id} className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-white border-2"
+                    style={{borderColor:s.color, color:s.color}}>
+                    {s.name}: Open
+                  </span>;
+                })}
+              </div>
+            </div>
+            <div className={`text-xs font-semibold flex-shrink-0 ${filled===total?"text-slate-400":filled===0?"text-blue-600":"text-amber-600"}`}>{filled}/{total}</div>
+          </button>
+          <div className="flex flex-wrap items-center gap-1.5 px-3 pb-3 pt-1 border-t border-slate-100">
+            <button onClick={()=>togglePreference(k)} disabled={blocked}
+              className={`text-xs px-2.5 py-1.5 rounded-lg font-medium ${wanted?"bg-emerald-500 text-white":"bg-slate-100 text-slate-600 hover:bg-slate-200"} ${blocked?"opacity-40 cursor-not-allowed":""}`}>
+              {wanted?"⭐ Preferred":"Prefer"}
+            </button>
+            <button onClick={()=>toggleUnavail(k)} disabled={hasShift&&!blocked}
+              className={`text-xs px-2.5 py-1.5 rounded-lg font-medium ${blocked?"bg-slate-600 text-white":"bg-slate-100 text-slate-600 hover:bg-slate-200"} ${hasShift&&!blocked?"opacity-40 cursor-not-allowed":""}`}>
+              {blocked?"✕ Blocked":"Block"}
+            </button>
+            {blocked&&(
+              <select value={reason||""} onChange={e=>setUnavailReason(k,e.target.value)}
+                className="text-xs px-2 py-1.5 border border-slate-300 bg-white rounded-lg">
+                <option value="">— Reason (optional) —</option>
+                {UNAVAIL_REASONS.map(r=><option key={r} value={r}>{r}</option>)}
+              </select>
+            )}
+            <button onClick={()=>setEditingDay(k)} className="ml-auto text-xs px-2.5 py-1.5 rounded-lg font-medium bg-blue-600 text-white hover:bg-blue-700">
+              {blocked?"Open":currentBlock?.signupOpen?"Pool / slots":"View"}
+            </button>
+          </div>
+        </div>
+      );
+    })}</div>
+  );
+
+  const MyShiftsPage = () => {
+    const mine=[], pending=[];
+    Object.entries(shifts).sort().forEach(([k,day])=>{
+      Object.entries(day).forEach(([sid,e])=>{
+        const slot=config.shiftSlots.find(s=>s.id===parseInt(sid)), date=parseDk(k);
+        if(getUid(e)===me.id){
+          const pts=dayPts(date,config)*(slot?.credit||1);
+          const nonPref=isAuto(e)&&!(preferences[me.id]||[]).includes(k);
+          mine.push({k,date,slot,pts,auto:isAuto(e),nonPref});
+        } else if(!getUid(e)&&inPool(e,me.id)){
+          pending.push({k,date,slot,pSize:poolSize(e)});
+        }
+      });
+    });
+    return(<>
+      <h1 className="text-2xl font-semibold mb-1">My shifts</h1>
+      <p className="text-sm text-slate-500 mb-4">{mine.length} awarded · {pending.length} in pool · {getPtsEarned(me.id).toFixed(1)} pts earned</p>
+      {pending.length>0&&(
+        <div className="mb-4">
+          <div className="text-xs font-medium text-slate-500 mb-2 px-1">PENDING (in pool)</div>
+          <div className="space-y-2">{pending.map((m,i)=>{
+            const others=m.pSize-1;
+            return(
+              <button key={`p${i}`} onClick={()=>setEditingDay(m.k)} className="w-full bg-blue-50 border border-blue-200 rounded-xl p-3 flex items-center gap-3 active:bg-blue-100 text-left">
+                <div className="w-12 h-12 rounded-lg bg-white flex flex-col items-center justify-center">
+                  <div className="text-[10px] font-bold text-blue-600">{DAYS_SHORT[m.date.getDay()]}</div>
+                  <div className="text-lg font-bold text-blue-700">{m.date.getDate()}</div>
+                </div>
+                <div className="flex-1">
+                  <div className="font-medium text-sm">{MONTHS_SHORT[m.date.getMonth()]} {m.date.getDate()}, {m.date.getFullYear()}</div>
+                  <div className="flex items-center gap-1.5 text-xs">
+                    <span className="font-medium" style={{color:m.slot?.color}}>{m.slot?.name}</span>
+                    <span className="text-slate-500">· {others===0?"only you":`you + ${others} other${others===1?"":"s"}`}</span>
+                  </div>
+                </div>
+                <span className="bg-blue-100 text-blue-700 text-xs px-2 py-1 rounded-full font-medium">In pool</span>
+              </button>
+            );
+          })}</div>
+        </div>
+      )}
+      {mine.length>0&&pending.length>0&&<div className="text-xs font-medium text-slate-500 mb-2 px-1">AWARDED</div>}
+      {!mine.length&&!pending.length?
+        <div className="bg-white rounded-xl border border-slate-200 p-8 text-center"><div className="text-3xl mb-2">📅</div><p className="text-sm text-slate-500">No shifts yet. Join a pool on the Shifts page.</p></div>
+        :mine.length>0?<div className="space-y-2">{mine.map((m,i)=>(
+          <button key={i} onClick={()=>setEditingDay(m.k)} className="w-full bg-white border border-slate-200 rounded-xl p-3 flex items-center gap-3 active:bg-slate-50 text-left">
+            <div className="w-12 h-12 rounded-lg bg-slate-50 flex flex-col items-center justify-center">
+              <div className="text-[10px] font-bold text-slate-500">{DAYS_SHORT[m.date.getDay()]}</div>
+              <div className="text-lg font-bold">{m.date.getDate()}</div>
+            </div>
+            <div className="flex-1">
+              <div className="font-medium text-sm">{MONTHS_SHORT[m.date.getMonth()]} {m.date.getDate()}, {m.date.getFullYear()}</div>
+              <div className="flex items-center gap-1.5 text-xs">
+                <span className="font-medium" style={{color:m.slot?.color}}>{m.slot?.name}</span>
+                {m.auto&&<span className="bg-blue-100 text-blue-700 text-[10px] font-medium px-1.5 py-0.5 rounded">Auto +{(config.involuntaryBonus||0)+(m.nonPref?(config.nonPreferredBonus||0):0)}{m.nonPref&&(config.nonPreferredBonus||0)>0?" ★":""}</span>}
+                {m.nonPref&&(config.nonPreferredBonus||0)>0&&<span className="text-[10px] text-slate-500">non-preferred</span>}
+              </div>
+            </div>
+            <span className="bg-green-100 text-green-700 text-xs px-2 py-1 rounded-full font-medium">+{(m.pts+(m.auto?(config.involuntaryBonus||0):0)+(m.nonPref?(config.nonPreferredBonus||0):0)).toFixed(m.pts%1?2:0)}</span>
+          </button>
+        ))}</div>:null
+      }
+    </>);
+  };
+
+  const StandingsPage = () => (<>
+    <h1 className="text-2xl font-semibold mb-1">Standings</h1>
+    <p className="text-sm text-slate-500 mb-4">Higher total = priority on contested slots.</p>
+    <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+      {[...users].filter(u=>u.role==="provider")
+        .map(u=>({...u,total:totalPts(u.id),earned:getPtsEarned(u.id),penalty:getAvailInfo(u.id).penalty}))
+        .sort((a,b)=>b.total-a.total)
+        .map((u,i)=>{
+          const lvl=config.seniorityLevels.find(l=>l.id===u.seniorityId);
+          return(
+            <div key={u.id} className={`flex items-center gap-3 p-3 border-b border-slate-100 last:border-0 ${u.id===me.id?"bg-blue-50":""}`}>
+              <div className="w-7 text-center text-sm font-bold text-slate-400">#{i+1}</div>
+              <div className="w-9 h-9 rounded-full text-white flex items-center justify-center text-xs font-semibold flex-shrink-0" style={{background:COLORS[u.id%COLORS.length]}}>{initials(u.name)}</div>
+              <div className="flex-1 min-w-0">
+                <div className="font-medium text-sm truncate">{u.name}{u.id===me.id?" (you)":""}</div>
+                <div className="text-xs text-slate-500">{lvl?.name||"Unassigned"}</div>
+              </div>
+              <div className="text-right">
+                <div className={`font-bold ${u.total<0?"text-red-600":"text-amber-600"}`}>{u.total.toFixed(1)}</div>
+                <div className="text-[10px] text-slate-400">{u.points} + {u.earned.toFixed(1)}{u.penalty>0?` − ${u.penalty}`:""}</div>
+              </div>
+            </div>
+          );
+        })}
+    </div>
+  </>);
+
+  const SetupPage = () => (<>
+    <h1 className="text-2xl font-semibold mb-1">Block setup</h1>
+    <p className="text-sm text-slate-500 mb-4">Define dates, points, seniority, and rules.</p>
+    <div className="bg-white rounded-xl border border-slate-200 p-4 sm:p-5 space-y-5">
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <div className="font-medium text-sm">Blocks</div>
+          <button onClick={()=>{
+            const id = Date.now();
+            const n = (config.blocks?.length||0) + 1;
+            const nb = { id, name:`Block ${n}`, start:"", end:"", signupOpen:false };
+            updateConfig({blocks:[...(config.blocks||[]), nb], currentBlockId:id});
+          }}
+            className="text-xs font-medium px-2.5 py-1 rounded-md bg-blue-50 text-blue-700 hover:bg-blue-100">
+            + New block
+          </button>
+        </div>
+        <p className="text-[11px] text-slate-500 mb-2">Create a new block when the current one wraps. Old blocks stay available — switch between them to review their data.</p>
+        {(!config.blocks||config.blocks.length===0)?(
+          <p className="text-xs text-slate-500 italic py-2">No blocks yet. Tap <span className="font-medium">+ New block</span> to create your first.</p>
+        ):(
+          <div className="space-y-2">
+            {config.blocks.map((b, i) => {
+              const isCur = b.id === config.currentBlockId;
+              const patchBlock = patch => {
+                const blocks = config.blocks.map(x => x.id===b.id ? {...x, ...patch} : x);
+                updateConfig({blocks});
+              };
+              return(
+                <div key={b.id} className={`rounded-lg border p-3 ${isCur?"border-blue-400 bg-blue-50":"border-slate-200 bg-white"}`}>
+                  <div className="flex items-center gap-2 mb-2">
+                    <input value={b.name||""} onChange={e=>patchBlock({name:e.target.value})}
+                      placeholder={`Block ${i+1}`}
+                      className="flex-1 min-w-0 px-2 py-1.5 border border-slate-300 rounded-md text-sm font-medium"/>
+                    {isCur?(
+                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-600 text-white font-medium">Current</span>
+                    ):(
+                      <button onClick={()=>updateConfig({currentBlockId:b.id})}
+                        className="text-[11px] font-medium px-2 py-1 rounded-md border border-slate-300 hover:bg-slate-50">
+                        Make current
+                      </button>
+                    )}
+                    {config.blocks.length>1&&<button onClick={()=>{
+                      if(!confirm(`Delete "${b.name||"this block"}"? Shifts that fall inside its dates stay in history but will no longer be visible as a block.`)) return;
+                      const remaining = config.blocks.filter(x=>x.id!==b.id);
+                      const nextCurrent = isCur ? (remaining[0]?.id||null) : config.currentBlockId;
+                      updateConfig({blocks:remaining, currentBlockId:nextCurrent});
+                    }} className="text-red-500 hover:text-red-700 px-1 text-sm" title="Delete block">✕</button>}
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <div className="text-[10px] text-slate-500 mb-1">Start</div>
+                      <input type="date" value={b.start||""} onChange={e=>patchBlock({start:e.target.value})}
+                        className="w-full px-2 py-1.5 border border-slate-300 rounded-md text-sm"/>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-slate-500 mb-1">End</div>
+                      <input type="date" value={b.end||""} onChange={e=>patchBlock({end:e.target.value})}
+                        className="w-full px-2 py-1.5 border border-slate-300 rounded-md text-sm"/>
+                    </div>
+                  </div>
+                  <div className="mt-2 flex items-center justify-between text-[11px] text-slate-500">
+                    <span>
+                      Signup <span className={b.signupOpen?"text-green-700 font-medium":"text-slate-600 font-medium"}>{b.signupOpen?"open":"closed"}</span>
+                    </span>
+                    {isCur&&<span className="text-slate-400">Use the button below to toggle signup / reconcile</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <div className="font-medium text-sm">Point values {config.pointValuesLocked&&<span className="ml-1 text-slate-400">🔒</span>}</div>
+          <button onClick={()=>updateConfig({pointValuesLocked:!config.pointValuesLocked})}
+            className={`text-xs font-medium px-2.5 py-1 rounded-md ${config.pointValuesLocked?"bg-blue-50 text-blue-700 hover:bg-blue-100":"bg-amber-50 text-amber-700 hover:bg-amber-100"}`}>
+            {config.pointValuesLocked?"Unlock to customize":"Lock"}
+          </button>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+          {[["weekday","Mon-Thu"],["fri","Fri"],["sat","Sat"],["sun","Sun"],["holiday","Holiday"]].map(([k,l])=>(
+            <Field key={k} label={l}>
+              <input type="number" step="0.5" value={config.pointValues[k]} disabled={config.pointValuesLocked}
+                onChange={e=>updateConfig({pointValues:{...config.pointValues,[k]:parseFloat(e.target.value)||0}})}
+                className={`w-full px-3 py-2 border border-slate-300 rounded-lg text-sm ${config.pointValuesLocked?"bg-slate-100 text-slate-500 cursor-not-allowed":""}`}/>
+            </Field>
+          ))}
+        </div>
+        {config.pointValuesLocked&&<p className="text-[11px] text-slate-500 mt-1.5 italic">Using default point values. Click <span className="font-medium">Unlock to customize</span> to change them.</p>}
+      </div>
+      <div><div className="font-medium text-sm mb-2">Availability requirements</div>
+        <div className="grid grid-cols-3 gap-2">
+          <Field label="Min days"><input type="number" min="0" value={config.minAvailableDays} onChange={e=>updateConfig({minAvailableDays:parseInt(e.target.value)||0})} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"/></Field>
+          <Field label="Min weekends"><input type="number" min="0" value={config.minAvailableWeekendDays} onChange={e=>updateConfig({minAvailableWeekendDays:parseInt(e.target.value)||0})} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"/></Field>
+          <Field label="Pts per miss"><input type="number" min="0" step="0.5" value={config.penaltyPerMissingDay} onChange={e=>updateConfig({penaltyPerMissingDay:parseFloat(e.target.value)||0})} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"/></Field>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Bonus pts per auto-assigned shift"><input type="number" min="0" step="0.5" value={config.involuntaryBonus} onChange={e=>updateConfig({involuntaryBonus:parseFloat(e.target.value)||0})} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"/></Field>
+          <Field label="Bonus pts for non-preferred date"><input type="number" min="0" step="0.5" value={config.nonPreferredBonus??1} onChange={e=>updateConfig({nonPreferredBonus:parseFloat(e.target.value)||0})} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"/></Field>
+        </div>
+        <p className="text-[11px] text-slate-500 mt-1">Auto-assign bonus applies to every auto-filled shift. The non-preferred bonus is <span className="font-medium">added on top</span> when the user didn't star that date as preferred (they also didn't block it).</p>
+        <Field label="Pts deducted for winning a conflict"><input type="number" min="0" step="0.5" value={config.conflictPenalty??1} onChange={e=>updateConfig({conflictPenalty:parseFloat(e.target.value)||0})} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"/></Field>
+      </div>
+      <div><div className="font-medium text-sm mb-2">Seniority levels</div>
+        {config.seniorityLevels.map((l,i)=>(
+          <div key={l.id} className="flex items-center gap-2 mb-2">
+            <input value={l.name} onChange={e=>{const n=[...config.seniorityLevels];n[i]={...n[i],name:e.target.value};updateConfig({seniorityLevels:n});}} className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="Level name"/>
+            <span className="text-xs text-slate-500">Min</span>
+            <input type="number" min="0" value={l.minShifts} onChange={e=>{const n=[...config.seniorityLevels];n[i]={...n[i],minShifts:parseInt(e.target.value)||0};updateConfig({seniorityLevels:n});}} className="w-16 px-2 py-2 border border-slate-300 rounded-lg text-sm"/>
+            {config.seniorityLevels.length>1&&<button onClick={()=>updateConfig({seniorityLevels:config.seniorityLevels.filter(x=>x.id!==l.id)})} className="text-red-500 hover:text-red-700 px-2">✕</button>}
+          </div>
+        ))}
+        <button onClick={()=>updateConfig({seniorityLevels:[...config.seniorityLevels,{id:Date.now(),name:"New level",minShifts:2}]})} className="px-3 py-2 text-sm border border-dashed border-slate-300 rounded-lg hover:bg-slate-50 w-full">+ Add level</button>
+      </div>
+      <div><div className="font-medium text-sm mb-2">Shift slots per day</div>
+        {config.shiftSlots.map((s,i)=>(
+          <div key={s.id} className="flex items-center gap-2 mb-2">
+            <input type="color" value={s.color} onChange={e=>{const n=[...config.shiftSlots];n[i]={...n[i],color:e.target.value};updateConfig({shiftSlots:n});}} className="w-9 h-9 rounded border border-slate-300 cursor-pointer flex-shrink-0"/>
+            <input value={s.name} onChange={e=>{const n=[...config.shiftSlots];n[i]={...n[i],name:e.target.value};updateConfig({shiftSlots:n});}} className="flex-1 min-w-0 px-3 py-2 border border-slate-300 rounded-lg text-sm"/>
+            <input type="number" step="0.05" min="0" max="2" value={s.credit} onChange={e=>{const n=[...config.shiftSlots];n[i]={...n[i],credit:parseFloat(e.target.value)||0};updateConfig({shiftSlots:n});}} className="w-16 px-2 py-2 border border-slate-300 rounded-lg text-sm"/>
+            {config.shiftSlots.length>1&&<button onClick={()=>updateConfig({shiftSlots:config.shiftSlots.filter(x=>x.id!==s.id)})} className="text-red-500 hover:text-red-700 px-2">✕</button>}
+          </div>
+        ))}
+        <button onClick={()=>updateConfig({shiftSlots:[...config.shiftSlots,{id:Date.now(),name:"New slot",credit:1.0,color:COLORS[config.shiftSlots.length%COLORS.length]}]})} className="px-3 py-2 text-sm border border-dashed border-slate-300 rounded-lg hover:bg-slate-50 w-full">+ Add slot</button>
+      </div>
+      <div><div className="font-medium text-sm mb-2">Holidays</div>
+        {Object.entries(config.holidays).map(([d,n])=>(
+          <div key={d} className="flex items-center gap-2 mb-2">
+            <input type="date" value={d} disabled className="px-3 py-2 border border-slate-300 rounded-lg text-sm bg-slate-50 flex-1 sm:flex-none"/>
+            <input type="text" value={n} placeholder="Name" onChange={e=>updateConfig({holidays:{...config.holidays,[d]:e.target.value}})} className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm"/>
+            <button onClick={()=>{const h={...config.holidays};delete h[d];updateConfig({holidays:h});}} className="text-red-500 hover:text-red-700 px-2">✕</button>
+          </div>
+        ))}
+        <AddHoliday onAdd={(d,n)=>updateConfig({holidays:{...config.holidays,[d]:n}})}/>
+      </div>
+      <button onClick={()=>currentBlock?.signupOpen?setReconcilePreview(computeReconcile()):updateCurrentBlock({signupOpen:true})}
+        disabled={!currentBlock||!currentBlock.start||!currentBlock.end}
+        className={`w-full py-3 text-sm font-medium rounded-lg ${currentBlock?.signupOpen?"bg-red-50 text-red-700 hover:bg-red-100":"bg-green-600 text-white hover:bg-green-700"} disabled:opacity-40 disabled:cursor-not-allowed`}>
+        {!currentBlock?"Create a block first":!currentBlock.start||!currentBlock.end?"Set block start + end dates":currentBlock.signupOpen?`Close signup & reconcile pool (${currentBlock.name||"current block"})`:`Open signup for ${currentBlock.name||"current block"}`}
+      </button>
+    </div>
+  </>);
+
+  const PeoplePage = () => (<>
+    <div className="flex items-start justify-between mb-1 gap-3">
+      <div className="min-w-0">
+        <h1 className="text-2xl font-semibold">People</h1>
+        <p className="text-sm text-slate-500">Assign seniority and adjust points.</p>
+      </div>
+      {me.role==="admin"&&<button onClick={()=>{setAddUserForm({name:"",username:"",email:"",role:"provider",seniorityId:""});setAddUserOpen(true);}} className="flex-shrink-0 bg-blue-600 text-white text-sm font-medium px-3 py-2 rounded-lg hover:bg-blue-700">+ Add user</button>}
+    </div>
+    <div className="mb-4"></div>
+    <div className="space-y-2">
+      {users.map(u=>{
+        const earned=getPtsEarned(u.id), a=u.role==="provider"?getAvailInfo(u.id):null;
+        return(
+          <div key={u.id} className="bg-white rounded-xl border border-slate-200 p-3">
+            <div className="flex items-start gap-3 mb-2">
+              <div className="w-10 h-10 rounded-full text-white flex items-center justify-center text-sm font-semibold flex-shrink-0" style={{background:COLORS[u.id%COLORS.length]}}>{initials(u.name)}</div>
+              <div className="flex-1 min-w-0">
+                <div className="font-medium">{u.name}</div>
+                <div className="text-xs text-slate-500">@{u.username} · <span className={u.role==="admin"?"text-purple-600 font-medium":""}>{u.role}</span></div>
+              </div>
+              {u.id!==me.id&&<button onClick={()=>deleteUser(u.id)} className="text-red-500 hover:text-red-700 text-xs px-2">Delete</button>}
+            </div>
+            {u.role==="provider"&&(
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-slate-500 flex-shrink-0 w-20">Seniority</label>
+                  <select value={u.seniorityId||""} onChange={e=>updateUser(u.id,{seniorityId:e.target.value?parseInt(e.target.value):null})} className="flex-1 text-sm border border-slate-300 rounded-lg px-2 py-1.5 bg-white">
+                    <option value="">— Unassigned —</option>
+                    {config.seniorityLevels.map(l=><option key={l.id} value={l.id}>{l.name} (min {l.minShifts})</option>)}
+                  </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-slate-500 flex-shrink-0 w-20">Prior pts</label>
+                  <button onClick={()=>adjustPoints(u.id,-1)} className="w-8 h-8 border border-slate-300 rounded hover:bg-slate-50">−</button>
+                  <span className="font-semibold text-blue-600 min-w-[2rem] text-center">{u.points}</span>
+                  <button onClick={()=>adjustPoints(u.id,1)} className="w-8 h-8 border border-slate-300 rounded hover:bg-slate-50">+</button>
+                </div>
+                <div className="text-xs text-slate-500" style={{paddingLeft:"5.5rem"}}>
+                  Earned {earned.toFixed(1)}{a?.penalty>0?<span className="text-red-600"> · −{a.penalty} penalty</span>:""} → <span className="font-semibold">{totalPts(u.id).toFixed(1)} total</span>
+                </div>
+                <div className="text-xs text-slate-500" style={{paddingLeft:"5.5rem"}}>
+                  Targets: <span className="font-medium">{(u.targets?.min)||0}/{(u.targets?.ideal)||0}/{(u.targets?.max)||0}</span> min/ideal/max · <span className="text-emerald-600 font-medium">{wantedCount(u.id)} preferred</span>
+                </div>
+                {(() => {
+                  const sp = u.spacingPref;
+                  if(!sp || sp.mode==="none") return null;
+                  const label = sp.mode==="consecutive"
+                    ? `Back-to-back OK · max ${sp.maxConsecutive||3} in a row`
+                    : `Spread out · ≥${sp.minGap||2} day${(sp.minGap||2)===1?"":"s"} between shifts`;
+                  return <div className="text-xs text-slate-500" style={{paddingLeft:"5.5rem"}}>Spacing: <span className="font-medium">{label}</span></div>;
+                })()}
+                {a&&!a.meets&&<div className="text-xs bg-red-50 text-red-700 px-2 py-1.5 rounded">⚠ {a.availD}/{config.minAvailableDays} days, {a.availW}/{config.minAvailableWeekendDays} weekends</div>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  </>);
+
+  /* ══ SUPER (OWNER) DASHBOARD ══ */
+  const copyCode = (c) => {
+    try { navigator.clipboard?.writeText(c); setCopied(c); setTimeout(()=>setCopied(""), 1500); flash("Copied"); } catch { flash("⚠️ Copy failed"); }
+  };
+  const groupMemberCount = (gid) => {
+    try { const raw = localStorage.getItem("shyft_"+gKey(gid,"users")); if(!raw) return 0; return (JSON.parse(raw)||[]).length; } catch { return 0; }
+  };
+  const SuperDashboard = () => (
+    <div className="min-h-screen bg-slate-50">
+      <nav className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3 flex items-center justify-between sticky top-0 z-40">
+        <div className="flex items-center gap-2">
+          <div className="w-8 h-8 rounded-lg bg-purple-600 text-white flex items-center justify-center font-bold">S</div>
+          <span className="font-semibold text-slate-900">Shyft</span>
+          <span className="ml-2 text-[10px] sm:text-xs px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 font-medium whitespace-nowrap">Owner</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="hidden sm:inline text-sm text-slate-700">{me.name}</span>
+          <button onClick={signOut} className="text-xs sm:text-sm px-3 py-1.5 border border-slate-300 rounded-lg hover:bg-slate-50">Sign out</button>
+        </div>
+      </nav>
+      <main className="p-4 sm:p-6 max-w-3xl mx-auto">
+        <h1 className="text-2xl font-semibold mb-1">Groups</h1>
+        <p className="text-sm text-slate-500 mb-5">Every group has its own users, calendar, and settings. Share the codes with the group's members.</p>
+
+        <div className="bg-white rounded-xl border border-slate-200 p-4 mb-4">
+          <div className="font-semibold mb-3">Create a new group</div>
+          <div className="flex gap-2">
+            <input value={groupForm.name} onChange={e=>setGroupForm({name:e.target.value})} onKeyDown={e=>{if(e.key==="Enter"&&groupForm.name.trim()){createGroup(groupForm.name);setGroupForm({name:""});}}}
+              className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="Group name (e.g. ED Attendings)"/>
+            <button onClick={async()=>{ if(!groupForm.name.trim()) return; await createGroup(groupForm.name); setGroupForm({name:""}); }}
+              className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium rounded-lg">
+              + Create
+            </button>
+          </div>
+          <p className="text-[11px] text-slate-500 mt-2">Both codes are auto-generated. Share the <span className="font-medium">group code</span> with all members, and the <span className="font-medium">admin code</span> only with whoever should administer the group.</p>
+        </div>
+
+        {groups.length===0?(
+          <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-sm text-slate-500">
+            No groups yet. Create one above to get started.
+          </div>
+        ):(
+          <div className="space-y-2">{groups.slice().sort((a,b)=>b.createdAt-a.createdAt).map(g=>{
+            const mc = groupMemberCount(g.id);
+            return(
+              <div key={g.id} className="bg-white rounded-xl border border-slate-200 p-4">
+                <div className="flex items-start justify-between gap-3 mb-3">
+                  <div>
+                    <div className="font-semibold text-base">{g.name}</div>
+                    <div className="text-xs text-slate-500">{mc} member{mc===1?"":"s"} · created {new Date(g.createdAt).toLocaleDateString()}</div>
+                  </div>
+                  <button onClick={()=>deleteGroup(g.id)} className="text-red-600 hover:text-red-700 text-xs font-medium px-2 py-1">Delete</button>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="bg-slate-50 rounded-lg p-2.5">
+                    <div className="text-[10px] font-medium text-slate-500 mb-1 uppercase tracking-wide">Group code</div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-base font-semibold text-slate-800 tracking-wider">{g.groupCode}</span>
+                      <button onClick={()=>copyCode(g.groupCode)} className="ml-auto text-[11px] text-blue-600 hover:text-blue-800 font-medium">{copied===g.groupCode?"Copied":"Copy"}</button>
+                    </div>
+                  </div>
+                  <div className="bg-purple-50 rounded-lg p-2.5">
+                    <div className="text-[10px] font-medium text-purple-700 mb-1 uppercase tracking-wide">Admin code</div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-base font-semibold text-purple-900 tracking-wider">{g.adminCode}</span>
+                      <button onClick={()=>copyCode(g.adminCode)} className="ml-auto text-[11px] text-purple-700 hover:text-purple-900 font-medium">{copied===g.adminCode?"Copied":"Copy"}</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}</div>
+        )}
+
+        <div className="mt-6 text-xs text-slate-400 text-center">
+          {supers.length} owner account{supers.length===1?"":"s"}. New owners register at the Owner tab on the sign-in screen with the bootstrap code.
+        </div>
+      </main>
+      {toast&&<Toast msg={toast}/>}
+    </div>
+  );
+
+  /* ══ NAV & RENDER ══ */
+  if(me.role==="super") return SuperDashboard();
+
+  const navItems = me.role==="admin"
+    ? [{id:"home",icon:"📊",label:"Home"},{id:"shifts",icon:"📅",label:"Calendar"},{id:"setup",icon:"⚙️",label:"Setup"},{id:"people",icon:"👥",label:"People"}]
+    : [{id:"home",icon:"🏠",label:"Home"},{id:"schedule",icon:"📅",label:"Schedule"},{id:"myshifts",icon:"✅",label:"Mine"},{id:"standings",icon:"⭐",label:"Ranks"}];
+
+  const renderPage = () => {
+    if(page==="home") return me.role==="admin"?AdminHome():ProviderHome();
+    // "shifts" is the admin-side calendar page; providers land here too if they came from a pre-merge link.
+    if(page==="shifts") return me.role==="admin"?ShiftsPage():SchedulePage();
+    if(page==="schedule") return SchedulePage();
+    // Legacy availability route → redirect to the merged schedule page.
+    if(page==="availability") return SchedulePage();
+    if(page==="myshifts") return MyShiftsPage();
+    if(page==="standings") return StandingsPage();
+    if(page==="setup") return SetupPage();
+    if(page==="people") return PeoplePage();
+  };
+
+  return(
+    <div className="min-h-screen bg-slate-50 pb-20 lg:pb-0">
+      <nav className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3 flex items-center justify-between sticky top-0 z-40">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center font-bold flex-shrink-0">S</div>
+          <span className="font-semibold text-slate-900 hidden sm:inline">Shyft</span>
+          {currentBlock&&<span className={`ml-1 sm:ml-3 text-[10px] sm:text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${currentBlock.signupOpen?"bg-green-100 text-green-700":"bg-slate-100 text-slate-600"}`}>
+            {currentBlock.name||"Block"} · signup {currentBlock.signupOpen?"open":"closed"}
+          </span>}
+        </div>
+        <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+          <span className="hidden sm:flex items-center gap-2 text-sm">
+            <span className="w-7 h-7 rounded-full text-white flex items-center justify-center text-xs font-semibold" style={{background:COLORS[me.id%COLORS.length]}}>{initials(me.name)}</span>
+            <span className="truncate max-w-[150px]">{me.name}</span>
+          </span>
+          <span className="sm:hidden w-8 h-8 rounded-full text-white flex items-center justify-center text-xs font-semibold" style={{background:COLORS[me.id%COLORS.length]}}>{initials(me.name)}</span>
+          <button onClick={signOut} className="text-xs sm:text-sm px-2 sm:px-3 py-1.5 border border-slate-300 rounded-lg hover:bg-slate-50">Sign out</button>
+        </div>
+      </nav>
+      <div className="flex">
+        <aside className="hidden lg:block w-56 p-4 border-r border-slate-200 min-h-[calc(100vh-57px)] bg-white">
+          <div className="space-y-1">{navItems.map(n=>(
+            <button key={n.id} onClick={()=>setPage(n.id)}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm w-full text-left transition ${page===n.id?"bg-blue-50 text-blue-700 font-medium":"text-slate-600 hover:bg-slate-100"}`}>
+              <span>{n.icon}</span> {n.label}
+            </button>
+          ))}</div>
+        </aside>
+        <main className="flex-1 p-4 sm:p-6 max-w-3xl mx-auto w-full">{renderPage()}</main>
+      </div>
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 flex z-40">
+        {navItems.map(n=>(
+          <button key={n.id} onClick={()=>setPage(n.id)}
+            className={`flex-1 py-2 flex flex-col items-center gap-0.5 ${page===n.id?"text-blue-600":"text-slate-500"}`}>
+            <span className="text-xl leading-none">{n.icon}</span>
+            <span className="text-[10px] font-medium">{n.label}</span>
+          </button>
+        ))}
+      </nav>
+      {DaySheet()}{Onboarding()}{AutoAssignModal()}{ReconcileModal()}{ConfirmResetModal()}{AddUserModal()}{NewUserInfoModal()}
+      {toast&&<Toast msg={toast}/>}
+    </div>
+  );
+}
+
+const Stat = ({label,value,color,small,sub}) => (
+  <div className="bg-white rounded-xl border border-slate-200 p-3 sm:p-4">
+    <div className="text-[11px] sm:text-xs text-slate-500 mb-1">{label}</div>
+    <div className={`font-bold ${small?"text-sm sm:text-base":"text-xl sm:text-2xl"} ${color}`}>{value}</div>
+    {sub&&<div className="text-[10px] sm:text-[11px] text-slate-400 mt-0.5">{sub}</div>}
+  </div>
+);
+const Field = ({label,children}) => (<div className="mb-3"><div className="text-xs font-medium text-slate-600 mb-1">{label}</div>{children}</div>);
+const Toast = ({msg}) => (<div className="fixed bottom-20 lg:bottom-6 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-4 py-2 rounded-lg text-sm shadow-lg z-50">{msg}</div>);
+const Legend = ({color,ring,label}) => (<span className="flex items-center gap-1"><span className={`inline-block w-3 h-3 rounded ${color||""} ${ring||""}`}/>{label}</span>);
+const AddHoliday = ({onAdd}) => {
+  const [d,setD]=useState(""); const [n,setN]=useState("");
+  return(
+    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+      <input type="date" value={d} onChange={e=>setD(e.target.value)} className="px-3 py-2 border border-slate-300 rounded-lg text-sm"/>
+      <input type="text" value={n} onChange={e=>setN(e.target.value)} placeholder="Holiday name" className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm"/>
+      <button onClick={()=>{if(d&&n){onAdd(d,n);setD("");setN("");}}} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium">Add</button>
+    </div>
+  );
+};

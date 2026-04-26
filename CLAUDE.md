@@ -1,0 +1,278 @@
+# Vesper — Claude Code project notes
+
+The product is **Vesper Scheduling** (call it **Vesper** for short) — a scheduling application **for medical professionals**. Providers sign up for / bid on shifts, an admin reconciles, a marketplace handles last-minute trades. Built around a phased lifecycle (availability → reconciliation → locked) with a points-based priority system.
+
+This file is the catch-up brief for Claude Code instances joining the project mid-stream. **Read it first** before exploring code — the architecture has a few non-obvious gotchas that will burn time if you discover them by accident.
+
+> **Naming note for Claude:** the codebase predates the rebrand and still uses **`shyft`** in technical identifiers — file names (`ShiftApp.v3.jsx`, `shyft-v3.html`, `/tmp/shyft_head.v3.html`), the localStorage namespace (`shyft3_*`), the migration markers (`shyft3_migrate_from_v2`, `shyft3_g{gid}_migrate_top_options`), and the `SUPER_BOOTSTRAP = "Shyft-Kai-Dave"` owner-bootstrap secret. **Leave these alone.** Renaming the storage namespace would invalidate every existing user's data; renaming the bootstrap string would break owner-account creation. Only update brand mentions in user-facing UI strings, comments, and docs.
+
+---
+
+## Product principles
+
+The interface must be **clean, professional, simple, and intuitive.** This is the audience's standing requirement — medical professionals don't have time to learn a complex tool, and the UI carries the credibility of the product. When in doubt, simplify. When asked between "more powerful" and "easier to understand," pick easier. Recent design moves (e.g. the v3.1 collapse from per-slot pools + per-day preference into a single 4-state Top Option model) are worked examples of this principle.
+
+## Project scope & constraints
+
+- **Hobby project.** David is building this on his own time. **Keep recurring costs near zero.** No paid SaaS dependencies, no per-seat licenses, no managed services that charge by request volume. Default to self-hostable / free-tier / open-source choices. If something must cost money, flag it with a cost estimate before implementing.
+- **No backend yet.** All state is in browser localStorage. This is intentional and fine for the current single-user-per-browser hobby phase.
+- **Future direction (not yet started):**
+  - **Backend that auto-logs all scheduling data** so the model can learn from it (which providers bid what, how reconciliations played out, who flagged shifts, etc.). Persistent server-side store, append-only log shape preferred. Treat this as a near-term ambition — design new features so they're easy to mirror server-side later.
+  - **Hosted as a website** so anyone can visit it. Static-host-friendly (the current single-file build is already there). Likely target: GitHub Pages / Cloudflare Pages / Netlify free tier.
+- **Don't pre-build the backend.** The frontend is still the active surface. When designing new features, just keep the data model clean and append-friendly so the eventual backend port is straightforward.
+
+---
+
+## Active version: v3 (with v3.1 simplification)
+
+Three forks coexist in this directory; only one is active.
+
+| Version | Source | Built artifact | Status |
+|---------|--------|----------------|--------|
+| v1 | `ShiftApp.jsx` | `shyft.html` | Frozen, do not touch |
+| v2 | `ShiftApp.v2.jsx` | `shyft-v2.html` | Frozen, kept side-by-side |
+| **v3** | **`ShiftApp.v3.jsx`** | **`shyft-v3.html`** | **Active — all new work goes here** |
+
+v3 forked from v2 to add the phase state machine, confirm/flag, marketplace, and lock-time crediting. v3.1 (current) replaced the per-slot pool model with a per-day "Top Option" model — see [Top Option model](#top-option-model-v31-current) below.
+
+Each version has its own localStorage namespace:
+- v1/v2: `shyft_*` (shared)
+- **v3: `shyft3_*` (separate — won't collide with v2)**
+
+v3 imports v2 data once on first load via the `shyft3_migrate_from_v2` marker.
+
+---
+
+## Build pipeline (read carefully)
+
+The runtime artifact is **assembled from three pieces**, not edited directly:
+
+```
+[/tmp/shyft_head.v3.html]   ← module-scope constants, helpers, migration code
+       ↓
+[ShiftApp.v3.jsx, lines from `^export default function ShiftApp` onward]
+       ↓
+[/tmp/shyft_tail.v3.html]   ← <ReactDOM.createRoot(...).render(<ShiftApp/>)>
+       ↓
+shyft-v3.html
+```
+
+Build command (verified working):
+
+```bash
+cd "/Users/davidfurfaro/Desktop/Shyft Claude"
+N=$(grep -n "^export default function ShiftApp" ShiftApp.v3.jsx | cut -d: -f1)
+{ cat /tmp/shyft_head.v3.html
+  tail -n +"$N" ShiftApp.v3.jsx | sed 's/^export default function ShiftApp/function ShiftApp/'
+  cat /tmp/shyft_tail.v3.html
+} > shyft-v3.html
+```
+
+After every build, sanity-check braces:
+
+```bash
+o=$(grep -o '{' shyft-v3.html | wc -l) && c=$(grep -o '}' shyft-v3.html | wc -l) && echo "$o/$c"
+```
+
+If they don't match, you have a syntax error.
+
+### ⚠ Critical gotcha: head-template sync
+
+**Lines 1–96 of `ShiftApp.v3.jsx` (everything before `export default function ShiftApp`) are reference-only.** They exist for IDE readability but are **never** in the runtime build — the `tail -n +N` strips them.
+
+The actual runtime constants live in `/tmp/shyft_head.v3.html`. **If you change a module-scope constant or helper in the JSX preamble, you MUST mirror the change in the head template, or it won't take effect.**
+
+Common things that need both updates:
+- `DEFAULT_CONFIG`
+- `PHASE`, `PHASE_LABEL`, `PHASE_DESC`, `PHASE_TONE`
+- `phaseOf`, `isAvailabilityOpen`, `isReconciling`, `isLocked`
+- `getUid`, `isAuto`, `getSource`
+- `currentBlockOf`, `inBlock`
+- Date helpers, color tables, etc.
+
+Component-local helpers (anything inside `function ShiftApp(...)`) only need updating in the JSX — they're inside the slice that gets included.
+
+---
+
+## File map
+
+| Path | Role |
+|------|------|
+| `ShiftApp.v3.jsx` | Source of truth for all v3 code. Edit this. |
+| `/tmp/shyft_head.v3.html` | Runtime preamble (DOCTYPE, Tailwind config, migration, module-scope helpers). Mirror constants here. |
+| `/tmp/shyft_tail.v3.html` | Runtime postamble. Just `<ReactDOM>.render()`. Don't touch. |
+| `shyft-v3.html` | Built artifact. **Never edit by hand** — gets overwritten. |
+| `Phases for Shyft and Rules for shift assignment.docx` | The spec. Source of truth for behavior. Re-read when in doubt. |
+| `~/.claude/plans/*.md` | Planning artifacts. Look for the most recent one for context on the latest change. |
+
+---
+
+## Phase state machine
+
+Every block has a `phase` field. UI gates read-only state on this.
+
+```
+availability  →  reconciliation  →  locked
+   (admin           (admin             (admin
+   "Close             "Lock             "Unlock"
+   & assign")         block")           reverts to recon)
+```
+
+- **availability**: providers edit availability/preferences/Top Options/bids. Pools (Top Options) accept signups.
+- **reconciliation**: assignments computed and frozen. Providers confirm/flag awarded shifts. Marketplace open. Auto-swap engine fires on flag.
+- **locked**: points are committed (Step 2 of build, deferred). Marketplace stays open for take-style trades. Admin adjustments allowed.
+
+Phase constants:
+
+```js
+const PHASE = { AVAIL: "availability", RECON: "reconciliation", LOCKED: "locked" };
+const phaseOf = b => (b && b.phase) || PHASE.AVAIL;
+const isAvailabilityOpen = b => phaseOf(b) === PHASE.AVAIL;
+const isReconciling = b => phaseOf(b) === PHASE.RECON;
+const isLocked = b => phaseOf(b) === PHASE.LOCKED;
+```
+
+The "Close & assign" admin action is the big one — it runs `computeReconcile` (process Top Options, place winners, charge bids) → `computeAutoAssign` (two-pass: preferred → available) → transitions phase to `RECON` → opens the Block Report modal. All in one click.
+
+---
+
+## Top Option model (v3.1, current)
+
+The most recent significant change. Replaces the v2/v3.0 "per-slot pool" model.
+
+**Old mental model (gone):** Provider joins Primary pool OR Backup pool independently per day. Plus a separate per-day Preferred star.
+
+**New mental model:** Each day has 4 mutually exclusive states per provider:
+
+| State | Bid? | Auto-assign tier |
+|-------|------|------------------|
+| 🎯 **Top Option** | Yes (1+) | Tier 0 — wins via reconcile |
+| ⭐ **Preferred** | No | Tier 1 — auto-assign first pass |
+| **Available** (default) | No | Tier 2 — auto-assign second pass |
+| 🚫 **Blocked** | n/a | Excluded |
+
+When picking Top Option, the provider also chooses a **slot preference** (Primary / Backup / Either). Lenient cascade: if their preferred slot is taken by a higher bidder, they get the other open slot.
+
+**Storage:**
+
+```js
+// Per-day commitment map
+topOptions[dateKey] = {
+  [uid]: { bid: number, slotPref: number|null }   // slotPref = slotId or null (Either)
+}
+// Per-slot entries are AWARD-ONLY — no .pool, no .bids
+shifts[dateKey][slotId] = {
+  uid, auto, source, confirm, flagReason, swappedFrom, takenFrom, bid?
+}
+```
+
+**Key handlers (all inside ShiftApp component):**
+- `setTopOption(dateKey, slotPref, bid)` / `clearTopOption(dateKey)`
+- `setBid(dateKey, n)` / `setSlotPref(dateKey, slotId|null)`
+- `togglePreference(k)` / `toggleUnavail(k)` (existing, with new invariants — clearing preference also clears Top Option)
+
+**Helpers (component-local, NOT in head template):**
+- `inTopOption(dateKey, uid)` → bool
+- `dayTopOptionerCount(dateKey)` → int
+- `getDayTopOptioners(dateKey)` → object map
+- `getDayBid(dateKey, uid)` → number
+- `getDaySlotPref(dateKey, uid)` → slotId|null
+- `TOP_OPTION_DEFAULT_BID = 1`
+
+A one-time migration in `loadGroup` walks any pre-existing `entry.pool` arrays and converts them to the new `topOptions` map. Marker: `shyft3_g{gid}_migrate_top_options`.
+
+---
+
+## Reconciliation features (Phase 3)
+
+Three things added on top of the phase machine:
+
+### Confirm / Flag (per awarded shift)
+
+Each entry can carry `confirm: "ok"|"flagged"` and `flagReason: string`. Provider sees Confirm/Flag buttons on each of their awarded shifts in the **My shifts** page during Reconciliation+.
+
+`flagShift(dateKey, slotId, reason)` runs `computeAutoSwap` first. If a candidate is found (someone preferring this date, below max, not blocked, has seniority), the shift reassigns silently. If not, the entry is marked flagged AND auto-posted to the marketplace at zero incentive.
+
+### Auto-swap engine
+
+`computeAutoSwap(dateKey, slotId, originalUid)` returns the best swap candidate or `null`. Filters: prefers the date, below max, not blocked, has seniority, not already on this day. Tiebreak: highest `snapshotPtsForReconcile()` then lowest uid.
+
+### Marketplace (take-style trades)
+
+```js
+marketplace[i] = {
+  id, dateKey, slotId, sellerId, incentivePts,
+  postedAt, status: "open"|"taken"|"cancelled",
+  takenBy?, takenAt?, autoPosted?, flagReason?
+}
+```
+
+Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`. Listings appear in the **Trades** page (in nav for both providers and admin). Open count badged on nav. Two-sided swaps NOT implemented (only one-sided post-for-take).
+
+---
+
+## Coding conventions
+
+- **Single-file React, no build tools.** Babel-standalone in the browser. JSX at runtime.
+- **Tailwind via CDN** with extensions for `brand-*`, `ink-*`, `canvas`, `surface`, `shadow-card`. See head template.
+- **Inter font.** Stat tiles use `tabular-nums` for alignment.
+- **No external state libs.** Plain `useState`. Persistence via `window.storage` (a thin localStorage wrapper).
+- **Compact code, dense comments.** The codebase favors slightly-dense JSX with explanatory comments above complex blocks rather than spreading things out. Match this style.
+- **Source-tag awarded entries.** When awarding a shift, set `source` to one of: `pool` | `pool-solo` | `cascade` | `preferred-auto` | `available-auto` | `auto-swap` | `marketplace` | `admin`. The block report attributes by source.
+- **No emojis in code unless they're already part of the UX vocabulary** (🎯 ⭐ ✕ ⚙ 📣). User explicitly favors emoji UI for state markers.
+
+---
+
+## What's done / what's pending
+
+### Done in v3
+- ✅ Phase state machine (availability/reconciliation/locked) with admin transitions
+- ✅ One-time migration from v2
+- ✅ "Close & assign" combined action (reconcile + auto-assign + phase advance + report)
+- ✅ Confirm/Flag UI on My Shifts
+- ✅ Auto-swap engine on flag
+- ✅ Take-style marketplace + Trades page + nav badge
+- ✅ Calendar/ScheduleList read-only mode in Reconciliation+ (hide personal preferred/blocked overlays)
+- ✅ Lock/Unlock confirm modals
+- ✅ Block report (source-bucketed per-provider counts)
+- ✅ Alerts module on admin dashboard
+- ✅ **v3.1: Top Option model replacing per-slot pools**
+
+### Pending (deferred by user)
+- ⏳ **Lock-time point crediting** ("Step 2"). Today, points credit at reconcile via `users.points` directly. Spec wants `users.points` (locked balance) split from `pendingPoints[blockId]` (this block's accruals), with pending → locked at the Lock transition. Marketplace incentive points already move at take-time, but the snapshot-vs-live points distinction isn't fully wired.
+- ⏳ Two-sided trades (swap my Friday for your Sunday). Currently only one-sided takes.
+- ⏳ Admin-added incentive points on open shifts (separate from marketplace seller incentives).
+- ⏳ Schedule snapshot at Lock (frozen "My final schedule" view per user, persisted with the block).
+
+---
+
+## Verification quick reference
+
+Build + brace check + symbol presence:
+
+```bash
+cd "/Users/davidfurfaro/Desktop/Shyft Claude"
+N=$(grep -n "^export default function ShiftApp" ShiftApp.v3.jsx | cut -d: -f1)
+{ cat /tmp/shyft_head.v3.html; tail -n +"$N" ShiftApp.v3.jsx | sed 's/^export default function ShiftApp/function ShiftApp/'; cat /tmp/shyft_tail.v3.html; } > shyft-v3.html
+o=$(grep -o '{' shyft-v3.html | wc -l) && c=$(grep -o '}' shyft-v3.html | wc -l) && echo "braces $o/$c"
+```
+
+Smoke test (open `shyft-v3.html` in browser):
+1. Sign in as admin → Setup → create a block in Availability phase
+2. Sign in as provider → Schedule → tap a day → 🎯 Top Option → bid + slot pref
+3. Repeat for a few providers, some contested
+4. Admin → Close & assign → verify report shows pool/cascade/auto rows
+5. Provider → Mine → confirm one shift, flag another (try both auto-swap and no-candidate paths)
+6. Trades page → take a listed shift as another provider
+7. Admin → Lock block
+
+---
+
+## Working with the user (David)
+
+- Prefers conversational design discussions before implementation. When proposing a change with multiple valid approaches, surface 2–3 alternatives.
+- Builds incrementally. Each step should produce a working artifact.
+- Wants the UI to remain simple for end users. Prefers consolidating duplicate concepts over adding more controls.
+- Single-file React + Tailwind + babel-standalone is non-negotiable. Don't introduce a build tool.
+- TodoWrite is welcome for multi-step features. Skip it for trivial changes.
+- Plan mode is welcome for significant architectural changes — user often initiates with "go in to plan mode."
