@@ -4,7 +4,7 @@ The product is **Vesper Scheduling** (call it **Vesper** for short) — a schedu
 
 This file is the catch-up brief for Claude Code instances joining the project mid-stream. **Read it first** before exploring code — the architecture has a few non-obvious gotchas that will burn time if you discover them by accident.
 
-> **Naming note for Claude:** the codebase predates the rebrand and still uses **`shyft`** in technical identifiers — file names (`ShiftApp.v3.jsx`, `shyft-v3.html`, `/tmp/shyft_head.v3.html`), the localStorage namespace (`shyft3_*`), the migration markers (`shyft3_migrate_from_v2`, `shyft3_g{gid}_migrate_top_options`), and the `SUPER_BOOTSTRAP = "Shyft-Kai-Dave"` owner-bootstrap secret. **Leave these alone.** Renaming the storage namespace would invalidate every existing user's data; renaming the bootstrap string would break owner-account creation. Only update brand mentions in user-facing UI strings, comments, and docs.
+> **Naming note for Claude:** the codebase predates the rebrand and still uses **`shyft`** in technical identifiers — file names (`ShiftApp.v3.jsx`, `shyft-v3.html`, `templates/shyft_head.v3.html`), the localStorage namespace (`shyft3_*`), the migration markers (`shyft3_migrate_from_v2`, `shyft3_g{gid}_migrate_top_options`), and the `SUPER_BOOTSTRAP = "Shyft-Kai-Dave"` owner-bootstrap secret. **Leave these alone.** Renaming the storage namespace would invalidate every existing user's data; renaming the bootstrap string would break owner-account creation. Only update brand mentions in user-facing UI strings, comments, and docs.
 
 ---
 
@@ -48,23 +48,22 @@ v3 imports v2 data once on first load via the `shyft3_migrate_from_v2` marker.
 The runtime artifact is **assembled from three pieces**, not edited directly:
 
 ```
-[/tmp/shyft_head.v3.html]   ← module-scope constants, helpers, migration code
+[templates/shyft_head.v3.html]   ← module-scope constants, helpers, migration code
        ↓
 [ShiftApp.v3.jsx, lines from `^export default function ShiftApp` onward]
        ↓
-[/tmp/shyft_tail.v3.html]   ← <ReactDOM.createRoot(...).render(<ShiftApp/>)>
+[templates/shyft_tail.v3.html]   ← <ReactDOM.createRoot(...).render(<ShiftApp/>)>
        ↓
 shyft-v3.html
 ```
 
-Build command (verified working):
+Build command — run from the project root (the folder that contains `ShiftApp.v3.jsx` and `templates/`):
 
 ```bash
-cd "/Users/davidfurfaro/Desktop/Shyft Claude"
 N=$(grep -n "^export default function ShiftApp" ShiftApp.v3.jsx | cut -d: -f1)
-{ cat /tmp/shyft_head.v3.html
+{ cat templates/shyft_head.v3.html
   tail -n +"$N" ShiftApp.v3.jsx | sed 's/^export default function ShiftApp/function ShiftApp/'
-  cat /tmp/shyft_tail.v3.html
+  cat templates/shyft_tail.v3.html
 } > shyft-v3.html
 ```
 
@@ -80,7 +79,7 @@ If they don't match, you have a syntax error.
 
 **Lines 1–96 of `ShiftApp.v3.jsx` (everything before `export default function ShiftApp`) are reference-only.** They exist for IDE readability but are **never** in the runtime build — the `tail -n +N` strips them.
 
-The actual runtime constants live in `/tmp/shyft_head.v3.html`. **If you change a module-scope constant or helper in the JSX preamble, you MUST mirror the change in the head template, or it won't take effect.**
+The actual runtime constants live in `templates/shyft_head.v3.html`. **If you change a module-scope constant or helper in the JSX preamble, you MUST mirror the change in the head template, or it won't take effect.**
 
 Common things that need both updates:
 - `DEFAULT_CONFIG`
@@ -99,9 +98,11 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | Path | Role |
 |------|------|
 | `ShiftApp.v3.jsx` | Source of truth for all v3 code. Edit this. |
-| `/tmp/shyft_head.v3.html` | Runtime preamble (DOCTYPE, Tailwind config, migration, module-scope helpers). Mirror constants here. |
-| `/tmp/shyft_tail.v3.html` | Runtime postamble. Just `<ReactDOM>.render()`. Don't touch. |
-| `shyft-v3.html` | Built artifact. **Never edit by hand** — gets overwritten. |
+| `templates/shyft_head.v3.html` | Runtime preamble (DOCTYPE, Tailwind config, migration, module-scope helpers). Mirror constants here. |
+| `templates/shyft_tail.v3.html` | Runtime postamble. Just `<ReactDOM>.render()`. Don't touch. |
+| `shyft-v3.html` | Built artifact. **Never edit by hand** — gets overwritten. Cloudflare Pages serves this. |
+| `index.html` | Tiny redirect to `shyft-v3.html` so the root URL of the deployed site loads the app. |
+| `wrangler.jsonc` | Cloudflare Workers static-assets config. Used by the GitHub-Pages deploy pipeline. |
 | `Phases for Shyft and Rules for shift assignment.docx` | The spec. Source of truth for behavior. Re-read when in doubt. |
 | `~/.claude/plans/*.md` | Planning artifacts. Look for the most recent one for context on the latest change. |
 
@@ -251,9 +252,9 @@ Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`. Listing
 Build + brace check + symbol presence:
 
 ```bash
-cd "/Users/davidfurfaro/Desktop/Shyft Claude"
+# Run from the project root (the folder that contains ShiftApp.v3.jsx and templates/).
 N=$(grep -n "^export default function ShiftApp" ShiftApp.v3.jsx | cut -d: -f1)
-{ cat /tmp/shyft_head.v3.html; tail -n +"$N" ShiftApp.v3.jsx | sed 's/^export default function ShiftApp/function ShiftApp/'; cat /tmp/shyft_tail.v3.html; } > shyft-v3.html
+{ cat templates/shyft_head.v3.html; tail -n +"$N" ShiftApp.v3.jsx | sed 's/^export default function ShiftApp/function ShiftApp/'; cat templates/shyft_tail.v3.html; } > shyft-v3.html
 o=$(grep -o '{' shyft-v3.html | wc -l) && c=$(grep -o '}' shyft-v3.html | wc -l) && echo "braces $o/$c"
 ```
 

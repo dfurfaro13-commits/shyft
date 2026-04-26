@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <!-- v3 fork: phase state machine (availability → reconciliation → locked), confirm/flag,
+       admin incentive points, take/trade marketplace, lock-time point crediting. Has its
+       own storage namespace ("shyft3_*") with a one-time importer from v2's "shyft_*". -->
+  <meta name="generator" content="Vesper Scheduling v3"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Vesper</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    // Tailwind extension: Inter as default sans, semantic brand palette, softer card shadows.
+    // Keeps all stock tailwind utilities available; adds bg-canvas, bg-surface, text-brand-*, shadow-card.
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
+          },
+          colors: {
+            brand: {
+              50:  '#EFF6FF',
+              100: '#DBEAFE',
+              200: '#BFDBFE',
+              500: '#3B82F6',
+              600: '#2563EB',
+              700: '#1D4ED8',
+              800: '#1E40AF',
+            },
+            ink: {
+              900: '#0F172A',
+              700: '#334155',
+              500: '#64748B',
+              400: '#94A3B8',
+            },
+            canvas: '#F1F5F9',
+            surface: '#FFFFFF',
+          },
+          boxShadow: {
+            card: '0 1px 2px 0 rgb(15 23 42 / 0.04), 0 1px 3px 0 rgb(15 23 42 / 0.04)',
+            'card-lg': '0 2px 6px -1px rgb(15 23 42 / 0.06), 0 4px 16px -4px rgb(15 23 42 / 0.06)',
+            'card-hover': '0 4px 12px -2px rgb(15 23 42 / 0.08), 0 8px 24px -8px rgb(15 23 42 / 0.08)',
+          },
+          borderRadius: {
+            'xl2': '1rem',
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    html, body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background: #F1F5F9; color: #0F172A; }
+    body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+    #root:empty::after {
+      content: "Loading…";
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      color: #94A3B8;
+      font-family: 'Inter', system-ui, sans-serif;
+      font-size: 0.875rem;
+    }
+    /* Custom range slider: fatter track, colored fill, prominent thumb */
+    input[type="range"].v2-slider {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 6px; background: #E2E8F0; border-radius: 999px; outline: none;
+    }
+    input[type="range"].v2-slider::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 20px; height: 20px; border-radius: 999px;
+      background: #2563EB; border: 3px solid white;
+      box-shadow: 0 1px 3px rgba(15,23,42,0.2); cursor: pointer;
+    }
+    input[type="range"].v2-slider::-moz-range-thumb {
+      width: 20px; height: 20px; border-radius: 999px;
+      background: #2563EB; border: 3px solid white;
+      box-shadow: 0 1px 3px rgba(15,23,42,0.2); cursor: pointer;
+    }
+    /* Hide native number-input spinners on inputs that render their own ± stepper */
+    input[type="number"].v2-num-input::-webkit-inner-spin-button,
+    input[type="number"].v2-num-input::-webkit-outer-spin-button {
+      -webkit-appearance: none; margin: 0;
+    }
+    input[type="number"].v2-num-input { -moz-appearance: textfield; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script>
+    // One-time v2 → v3 import. Copies every "shyft_*" key into "shyft3_*" (without overwriting
+    // anything v3 has already written), then upgrades each group's config to add `phase` to
+    // every block (signupOpen:true → "availability", false → "reconciliation"). v2 keeps its own
+    // storage untouched so it can keep running side-by-side.
+    (function(){
+      const MARKER = "shyft3_migrate_from_v2";
+      if (localStorage.getItem(MARKER) === "done") return;
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) keys.push(localStorage.key(i));
+      keys.forEach(k => {
+        if (k.startsWith("shyft_") && !k.startsWith("shyft3_")) {
+          const v3Key = "shyft3_" + k.slice("shyft_".length);
+          if (localStorage.getItem(v3Key) === null) {
+            localStorage.setItem(v3Key, localStorage.getItem(k));
+          }
+        }
+      });
+      // Walk imported group configs and stamp phase onto every block.
+      const v3Keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("shyft3_") && k.endsWith("_config")) v3Keys.push(k);
+      }
+      v3Keys.forEach(k => {
+        try {
+          const cfg = JSON.parse(localStorage.getItem(k));
+          if (cfg && Array.isArray(cfg.blocks)) {
+            let mutated = false;
+            cfg.blocks = cfg.blocks.map(b => {
+              if (b && b.phase) return b;
+              mutated = true;
+              const phase = b && b.signupOpen ? "availability" : "reconciliation";
+              return { ...b, phase };
+            });
+            if (mutated) localStorage.setItem(k, JSON.stringify(cfg));
+          }
+        } catch(e) { /* malformed config — leave it for the app to repair */ }
+      });
+      localStorage.setItem(MARKER, "done");
+    })();
+
+    // Storage shim — v3 owns the "shyft3_*" namespace exclusively.
+    window.storage = {
+      get: async (key) => {
+        const val = localStorage.getItem("shyft3_" + key);
+        return val ? { value: val } : null;
+      },
+      set: async (key, val) => {
+        localStorage.setItem("shyft3_" + key, val);
+      }
+    };
+  </script>
+
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useMemo } = React;
+
+    const DAYS_SHORT = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+    const DAYS_LONG = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+    const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+    const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const COLORS = ["#3B82F6","#8B5CF6","#EC4899","#10B981","#F59E0B","#EF4444","#06B6D4","#84CC16","#F97316","#A855F7"];
+    const UNAVAIL_REASONS = ["Working","Vacation","Conference","Personal Conflict"];
+
+    // ── Phase state machine ─────────────────────────────────────────────────────
+    // Each block lives in exactly one phase. Transitions are admin-driven and one-way
+    // (with a confirm-revert from reconciliation back to availability that wipes assignments).
+    //   availability    — providers edit availability/preferences/pools/bids
+    //   reconciliation  — assignments are computed and frozen; users confirm/flag; trades open
+    //   locked          — points formally distributed; trades still allowed for adjustments
+    const PHASE = { AVAIL: "availability", RECON: "reconciliation", LOCKED: "locked" };
+    const PHASE_LABEL = {
+      [PHASE.AVAIL]: "Availability",
+      [PHASE.RECON]: "Reconciliation",
+      [PHASE.LOCKED]: "Locked",
+    };
+    const PHASE_DESC = {
+      [PHASE.AVAIL]: "Providers are entering availability and setting Top Options",
+      [PHASE.RECON]: "Assignments are out — providers can confirm or flag, trades are open",
+      [PHASE.LOCKED]: "Points are distributed — trades and admin adjustments still allowed",
+    };
+    const PHASE_TONE = {
+      // Tailwind utility set per phase, used by phase-pill chrome.
+      [PHASE.AVAIL]: { bg: "bg-emerald-50", text: "text-emerald-700", border: "border-emerald-200", dot: "bg-emerald-500" },
+      [PHASE.RECON]: { bg: "bg-amber-50",   text: "text-amber-800",   border: "border-amber-200",   dot: "bg-amber-500"   },
+      [PHASE.LOCKED]:{ bg: "bg-slate-100",  text: "text-slate-700",   border: "border-slate-300",   dot: "bg-slate-500"   },
+    };
+    const phaseOf = b => (b && b.phase) || PHASE.AVAIL;
+    const isAvailabilityOpen = b => phaseOf(b) === PHASE.AVAIL;
+    const isReconciling = b => phaseOf(b) === PHASE.RECON;
+    const isLocked = b => phaseOf(b) === PHASE.LOCKED;
+
+    const DEFAULT_CONFIG = {
+      blocks: [], currentBlockId: null,
+      // `signupOpen` no longer exists on the config — phase lives on each block in `blocks[].phase`.
+      // Legacy `blockStart`/`blockEnd` remain only for the legacy-fallback synthetic block (single
+      // pre-multitenant block, gradually phased out). New blocks always go in `blocks[]`.
+      blockStart: "", blockEnd: "",
+      shiftSlots: [
+        { id: 1, name: "Primary", credit: 1.0, color: "#F59E0B" },
+        { id: 2, name: "Backup", credit: 1.0, color: "#8B5CF6" },
+      ],
+      pointValues: { weekday: 1, fri: 2, sat: 3, sun: 2, holiday: 4 },
+      pointValuesLocked: true,
+      holidays: {},
+      seniorityLevels: [
+        { id: 1, name: "Senior", minShifts: 2 },
+        { id: 2, name: "Junior", minShifts: 3 },
+      ],
+      // Two distinct availability rules: (1) must PREFER ≥N days, (2) may BLOCK ≤N days. Falling
+      // short on (1) costs preferredShortfallPenalty; going over on (2) costs blockOverLimitPenalty/day,
+      // and once totalPts would dip below zero, additional blocks are forbidden.
+      minPreferredDays: 6, minPreferredWeekendDays: 2, preferredShortfallPenalty: 1,
+      maxBlockedDays: 14, maxBlockedWeekendDays: 4, blockOverLimitPenalty: 1,
+      involuntaryBonus: 1, nonPreferredBonus: 1,
+    };
+
+    async function sha256(s) {
+      const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    const dk = (y, m, d) => `${y}-${String(m+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+    const parseDk = k => { const [y,m,d] = k.split("-").map(Number); return new Date(y,m-1,d); };
+    const dim = (y, m) => new Date(y, m+1, 0).getDate();
+    const fdow = (y, m) => new Date(y, m, 1).getDay();
+    const initials = n => n.split(" ").map(s=>s[0]).join("").slice(0,2).toUpperCase();
+    const isWeekend = k => { const d = parseDk(k).getDay(); return d===0||d===6; };
+    const getUid = e => (typeof e==="object"&&e!==null)?(e.uid??null):e;
+    const isAuto = e => typeof e==="object"&&e!==null&&!!e.auto;
+    // v3.1 — entries are award-only. The pool/bid concept moved to a per-day topOptions map,
+    // so the legacy module-scope helpers (getPool, inPool, poolSize, getBid, setEntryBid,
+    // clearEntryBid, DEFAULT_BID) are gone. Component-level helpers replace them — see
+    // inTopOption/dayTopOptionerCount/getDayBid/etc. inside the ShiftApp component.
+    // Awarded entries carry a `source` tag indicating how they were filled, used for the post-block
+    // report. Tags: "pool" (top-bidder won), "pool-solo" (single Top-Optioner), "cascade" (took the
+    // other open slot after losing slot pref), "preferred-auto" (auto-filled on a starred date),
+    // "available-auto" (auto-filled on an available non-preferred date), "auto-swap" (replaced a
+    // flagged provider), "marketplace" (taken via the trade marketplace), "admin" (manual override).
+    const getSource = e => {
+      if(!e || !getUid(e)) return null;
+      if(e.source) return e.source;
+      if(isAuto(e)) return "unknown-auto";
+      return "unknown-manual";
+    };
+
+    const dayPts = (date, cfg) => {
+      const k = dk(date.getFullYear(), date.getMonth(), date.getDate());
+      if (cfg.holidays[k]) return cfg.pointValues.holiday;
+      const dow = date.getDay();
+      if (dow===5) return cfg.pointValues.fri;
+      if (dow===6) return cfg.pointValues.sat;
+      if (dow===0) return cfg.pointValues.sun;
+      return cfg.pointValues.weekday;
+    };
+
+    const currentBlockOf = cfg => {
+      if(cfg.currentBlockId && Array.isArray(cfg.blocks)){
+        const b = cfg.blocks.find(x => x.id === cfg.currentBlockId);
+        if(b) return b;
+      }
+      // Legacy single-block fallback — only kicks in when there are no blocks[] entries at all.
+      // Synthesizes a phase based on the deprecated `signupOpen` boolean if it's still around.
+      if(cfg.blockStart && cfg.blockEnd) {
+        const phase = cfg.signupOpen ? PHASE.AVAIL : PHASE.RECON;
+        return { id:"legacy", name:"Block", start:cfg.blockStart, end:cfg.blockEnd, phase };
+      }
+      return null;
+    };
+    const inBlock = (k, cfg) => { const b = currentBlockOf(cfg); return !!(b && k >= b.start && k <= b.end); };
+
+    const SUPER_BOOTSTRAP = "Shyft-Kai-Dave";
+    const gKey = (gid, k) => `g${gid}_${k}`;
+    const genCode = (len=6) => { const c="ABCDEFGHJKMNPQRSTUVWXYZ23456789"; let s=""; for(let i=0;i<len;i++) s+=c[Math.floor(Math.random()*c.length)]; return s; };
+
+
+
