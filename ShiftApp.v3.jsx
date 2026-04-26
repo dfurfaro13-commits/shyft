@@ -1508,7 +1508,7 @@ export default function ShiftApp() {
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 w-full max-w-sm p-7">
           <div className="mb-1 flex justify-center">
-            <VesperLogoStacked height={140}/>
+            <ShiftLogoStacked height={140}/>
           </div>
           <p className="text-sm text-slate-500 mb-5">
             {authMode==="super"?"Create a new owner account. Existing owners sign in via the Sign in tab.":(noGroupsYet?"No groups yet — an owner must create one first.":"Sign in or join your group.")}
@@ -2284,7 +2284,7 @@ export default function ShiftApp() {
       ``,
       `Open the app and sign in with your username + the temporary password above.`,
     ].filter(Boolean).join("\n");
-    const mailto = `mailto:${email||""}?subject=${encodeURIComponent("Your Vesper login")}&body=${encodeURIComponent(body)}`;
+    const mailto = `mailto:${email||""}?subject=${encodeURIComponent("Your SHIFT login")}&body=${encodeURIComponent(body)}`;
     const copyInfo = () => { try { navigator.clipboard?.writeText(body); flash("Login info copied"); } catch { flash("⚠️ Copy failed"); } };
     return(
       <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setNewUserResult(null)}>
@@ -4017,8 +4017,8 @@ export default function ShiftApp() {
     <div className="min-h-screen bg-slate-50">
       <nav className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3 flex items-center justify-between sticky top-0 z-40">
         <div className="flex items-center gap-2">
-          <VesperIcon size={32}/>
-          <span className="font-semibold text-slate-900">Vesper</span>
+          <ShiftIcon size={32}/>
+          <span className="font-semibold text-slate-900">SHIFT</span>
           <span className="ml-2 text-[10px] sm:text-xs px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 font-medium whitespace-nowrap">Owner</span>
         </div>
         <div className="flex items-center gap-2">
@@ -4123,7 +4123,7 @@ export default function ShiftApp() {
       {/* Desktop sidebar */}
       <aside className="hidden lg:flex lg:flex-col w-[260px] flex-shrink-0 bg-surface border-r border-slate-200 px-4 py-5 sticky top-0 h-screen">
         <div className="mb-6 px-2">
-          <VesperLogo height={56}/>
+          <ShiftLogo height={56}/>
           <div className="text-[10px] font-semibold text-brand-700 uppercase tracking-wider mt-1">v3 · preview</div>
         </div>
         {currentBlock&&(()=>{ const sp=phaseOf(currentBlock); const st=PHASE_TONE[sp]; return (
@@ -4161,7 +4161,7 @@ export default function ShiftApp() {
         {/* Mobile topbar */}
         <header className="lg:hidden bg-surface border-b border-slate-200 px-4 py-3 flex items-center justify-between sticky top-0 z-40">
           <div className="flex items-center gap-2 min-w-0">
-            <VesperIcon size={28} className="flex-shrink-0"/>
+            <ShiftIcon size={28} className="flex-shrink-0"/>
             {currentBlock&&(()=>{ const tp=phaseOf(currentBlock); const tt=PHASE_TONE[tp]; return (
               <span className={`text-[10px] px-2 py-0.5 rounded-full whitespace-nowrap font-semibold ${tt.bg} ${tt.text}`}>
                 {currentBlock.name||"Block"} · {PHASE_LABEL[tp].toLowerCase()}
@@ -4200,9 +4200,9 @@ export default function ShiftApp() {
 
 // v2 Stat: card with uppercase micro-label, prominent value, optional sub.
 // The color prop sets value color (e.g. "text-brand-700"); default is inky.
-// Vesper brand mark — calendar grid with a centered 4-point star, all in #4A90E2.
+// Shift brand mark — calendar grid with a centered 4-point star, all in #4A90E2.
 // The icon is self-colored (no surrounding tile needed); drop it directly in place of a tile.
-const VesperIcon = ({size=40, className=""}) => (
+const ShiftIcon = ({size=40, className=""}) => (
   <svg width={size} height={size} viewBox="0 0 64 64" fill="none" aria-hidden="true" className={className}>
     <rect x="8" y="12" width="48" height="52" rx="6" fill="#4A90E2" fillOpacity="0.15" stroke="#4A90E2" strokeWidth="3"/>
     <rect x="14" y="6" width="6" height="12" rx="2" fill="#4A90E2"/>
@@ -4212,10 +4212,10 @@ const VesperIcon = ({size=40, className=""}) => (
     <path d="M 22 42 L 32 45 L 42 42 L 32 39 Z" fill="#4A90E2"/>
   </svg>
 );
-// Stacked Vesper logotype — icon centered on top, "VESPER" wordmark below, "SCHEDULING" subtitle.
+// Stacked Shift logotype — icon centered on top, "SHIFT" wordmark below, "SCHEDULING" subtitle.
 // Used on the sign-in hero where vertical centerstage is appropriate.
-const VesperLogoStacked = ({height=140, className=""}) => (
-  <svg height={height} viewBox="0 0 240 140" fill="none" aria-label="Vesper Scheduling" className={className}>
+const ShiftLogoStacked = ({height=140, className=""}) => (
+  <svg height={height} viewBox="0 0 240 140" fill="none" aria-label="SHIFT Scheduling" className={className}>
     <g transform="translate(102, 0)">
       <rect x="6" y="16" width="36" height="40" rx="3" fill="#4A90E2" fillOpacity="0.1" stroke="#4A90E2" strokeWidth="2"/>
       <rect x="10" y="12" width="4" height="8" rx="1" fill="#4A90E2"/>
@@ -4224,24 +4224,24 @@ const VesperLogoStacked = ({height=140, className=""}) => (
       <path d="M 24 32 L 26 38 L 24 44 L 22 38 Z" fill="#4A90E2"/>
       <path d="M 18 38 L 24 40 L 30 38 L 24 36 Z" fill="#4A90E2"/>
     </g>
-    <text x="120" y="85" fontFamily="Inter, system-ui, -apple-system, sans-serif" fontSize="32" fontWeight="700" fill="#1f2937" letterSpacing="1" textAnchor="middle">VESPER</text>
+    <text x="120" y="85" fontFamily="Inter, system-ui, -apple-system, sans-serif" fontSize="32" fontWeight="700" fill="#1f2937" letterSpacing="1" textAnchor="middle">SHIFT</text>
     <text x="120" y="105" fontFamily="Inter, system-ui, -apple-system, sans-serif" fontSize="14" fontWeight="500" fill="#4A90E2" letterSpacing="4" textAnchor="middle">SCHEDULING</text>
   </svg>
 );
-// Full Vesper logotype — calendar icon + "VESPER" wordmark. Pass dark={true} for the
+// Full Shift logotype — calendar icon + "SHIFT" wordmark. Pass dark={true} for the
 // white-text variant (use on dark backgrounds). Sized by `height` (default 32px); width auto-scales.
-const VesperLogo = ({height=32, dark=false, className=""}) => {
+const ShiftLogo = ({height=32, dark=false, className=""}) => {
   const fillOp = dark ? 0.15 : 0.1;
   const textFill = dark ? "#FFFFFF" : "#1f2937";
   return (
-    <svg height={height} viewBox="0 0 240 80" fill="none" aria-label="Vesper Scheduling" className={className}>
+    <svg height={height} viewBox="0 0 240 80" fill="none" aria-label="SHIFT Scheduling" className={className}>
       <rect x="6" y="16" width="36" height="40" rx="3" fill="#4A90E2" fillOpacity={fillOp} stroke="#4A90E2" strokeWidth="2"/>
       <rect x="10" y="12" width="4" height="8" rx="1" fill="#4A90E2"/>
       <rect x="34" y="12" width="4" height="8" rx="1" fill="#4A90E2"/>
       <line x1="6" y1="24" x2="42" y2="24" stroke="#4A90E2" strokeWidth="2"/>
       <path d="M 24 32 L 26 38 L 24 44 L 22 38 Z" fill="#4A90E2"/>
       <path d="M 18 38 L 24 40 L 30 38 L 24 36 Z" fill="#4A90E2"/>
-      <text x="56" y="45" fontFamily="Inter, system-ui, -apple-system, sans-serif" fontSize="28" fontWeight="700" fill={textFill} letterSpacing="1">VESPER</text>
+      <text x="56" y="45" fontFamily="Inter, system-ui, -apple-system, sans-serif" fontSize="28" fontWeight="700" fill={textFill} letterSpacing="1">SHIFT</text>
     </svg>
   );
 };

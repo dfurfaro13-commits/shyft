@@ -1,6 +1,6 @@
-# Vesper — Claude Code project notes
+# SHIFT — Claude Code project notes
 
-The product is **Vesper Scheduling** (call it **Vesper** for short) — a scheduling application **for medical professionals**. Providers sign up for / bid on shifts, an admin reconciles, a marketplace handles last-minute trades. Built around a phased lifecycle (availability → reconciliation → locked) with a points-based priority system.
+The product is **SHIFT Scheduling** (call it **SHIFT** for short) — a scheduling application **for medical professionals**. Providers sign up for / bid on shifts, an admin reconciles, a marketplace handles last-minute trades. Built around a phased lifecycle (availability → reconciliation → locked) with a points-based priority system.
 
 This file is the catch-up brief for Claude Code instances joining the project mid-stream. **Read it first** before exploring code — the architecture has a few non-obvious gotchas that will burn time if you discover them by accident.
 

@@ -1,4 +1,4 @@
-// Cloudflare Workers config for serving Vesper as a static-asset site.
+// Cloudflare Workers config for serving SHIFT as a static-asset site.
 // No server-side code — Cloudflare just serves the HTML/CSS/JS files from this
 // directory directly to visitors. Visiting the root URL hits index.html, which
 // redirects to shyft-v3.html.
