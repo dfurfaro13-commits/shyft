@@ -175,7 +175,7 @@
   </script>
 
   <script type="text/babel" data-presets="react">
-    const { useState, useEffect, useMemo } = React;
+    const { useState, useEffect, useMemo, useRef } = React;
 
     const DAYS_SHORT = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
     const DAYS_LONG = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
@@ -371,6 +371,14 @@ function ShiftApp() {
   const [magicLinkSent, setMagicLinkSent] = useState(false);
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudError, setCloudError] = useState("");
+  // Phase C: snapshot sync. cloudSyncOffer = { groupId, cloudGroupId, clientTs, serverTs } when
+  // the cloud has data newer than this device's last persist for the active group.
+  const [cloudSyncOffer, setCloudSyncOffer] = useState(null);
+  // unclaimedCloudGroups = cloud groups in `cloudUser.memberships` that have no matching local
+  // group (matched by cloudGroupId). Shown on the auth screen as "Restore" cards.
+  const [unclaimedCloudGroups, setUnclaimedCloudGroups] = useState([]);
+  const snapshotUploadTimer = useRef(null);
+  const snapshotUploadInflight = useRef(false);
 
   useEffect(() => {
     (async () => {
@@ -518,6 +526,9 @@ function ShiftApp() {
   const persist = async (key, val) => {
     if(!groupId){ /* called before a group is active — ignore to avoid leaking into root keys */ return; }
     try { await window.storage.set(gKey(groupId,key), JSON.stringify(val), true); } catch { flash("⚠️ Save failed"); }
+    // Phase C: stamp a local-modified time and schedule a debounced cloud snapshot.
+    try { localStorage.setItem(`shyft3_g${groupId}_lastModified`, String(Date.now())); } catch {}
+    scheduleSnapshotUpload();
   };
   const persistRoot = async (key, val) => {
     try { await window.storage.set(key, JSON.stringify(val), true); } catch { flash("⚠️ Save failed"); }
@@ -682,6 +693,132 @@ function ShiftApp() {
       flash("⚠️ Couldn't create invite link");
       return null;
     }
+  };
+
+  // Phase C: snapshot upload + download helpers.
+  //
+  // The snapshot is the entire per-group state plus the local-only group metadata
+  // (groupCode, adminCode, etc.) bundled together so a different device can fully recreate
+  // the group from cloud.
+  const buildSnapshotPayload = (gid) => {
+    const g = groups.find(x => x.id === gid);
+    if (!g) return null;
+    return {
+      meta: {
+        name: g.name,
+        groupCode: g.groupCode,
+        adminCode: g.adminCode,
+        createdAt: g.createdAt,
+        cloudGroupId: g.cloudGroupId,
+      },
+      users, config,
+      shifts, unavail: unavailability, prefs: preferences,
+      marketplace, topOptions, openIncentives,
+    };
+  };
+
+  const uploadSnapshot = async () => {
+    if (!cloudUser || !currentGroup?.cloudGroupId || !groupId) return;
+    if (snapshotUploadInflight.current) return;
+    snapshotUploadInflight.current = true;
+    try {
+      const payload = buildSnapshotPayload(groupId);
+      if (!payload) return;
+      const clientTs = Date.now();
+      try { localStorage.setItem(`shyft3_g${groupId}_lastModified`, String(clientTs)); } catch {}
+      await window.api.fetchJSON("/api/snapshots", {
+        method: "POST",
+        body: JSON.stringify({ groupId: currentGroup.cloudGroupId, payload, clientTs }),
+      });
+    } catch {} finally {
+      snapshotUploadInflight.current = false;
+    }
+  };
+  const scheduleSnapshotUpload = () => {
+    if (!cloudUser || !currentGroup?.cloudGroupId) return;
+    if (snapshotUploadTimer.current) clearTimeout(snapshotUploadTimer.current);
+    snapshotUploadTimer.current = setTimeout(uploadSnapshot, 2000);
+  };
+
+  // Apply a snapshot payload to localStorage and React state for a given local groupId.
+  // Used by both the in-group "sync from cloud" banner and the first-device-claim flow.
+  const applySnapshot = async (gid, payload) => {
+    if (!payload) return;
+    const writeKey = (k, v) => { try { localStorage.setItem(`shyft3_${gKey(gid,k)}`, JSON.stringify(v)); } catch {} };
+    writeKey("users", payload.users || []);
+    writeKey("config", payload.config || DEFAULT_CONFIG);
+    writeKey("shifts", payload.shifts || {});
+    writeKey("unavail", payload.unavail || {});
+    writeKey("prefs", payload.prefs || {});
+    writeKey("marketplace", payload.marketplace || []);
+    writeKey("topOptions", payload.topOptions || {});
+    writeKey("openIncentives", payload.openIncentives || {});
+    // If the calling group is the active one, refresh React state so the UI reflects the new data.
+    if (gid === groupId) await loadGroup(gid);
+  };
+
+  // Pull /api/snapshots/:cloudGroupId/latest and decide whether to offer a sync. Called after
+  // loadGroup completes for any cloud-mirrored group.
+  const checkCloudSyncOffer = async (gid, cloudGid) => {
+    if (!cloudUser || !cloudGid) return;
+    let snap = null;
+    try { snap = await window.api.fetchJSON("/api/snapshots/" + encodeURIComponent(cloudGid) + "/latest"); }
+    catch (e) { return; /* 404 = no remote yet, ignore */ }
+    if (!snap?.payload) return;
+    let localTs = 0;
+    try { localTs = parseInt(localStorage.getItem(`shyft3_g${gid}_lastModified`)||"0", 10) || 0; } catch {}
+    if ((snap.clientTs||0) > localTs + 1000) {
+      // Cloud is meaningfully newer (1s slack to avoid loop on round-trips).
+      setCloudSyncOffer({ groupId: gid, cloudGroupId: cloudGid, clientTs: snap.clientTs, serverTs: snap.serverTs, payload: snap.payload });
+    }
+  };
+  const acceptCloudSync = async () => {
+    if (!cloudSyncOffer) return;
+    await applySnapshot(cloudSyncOffer.groupId, cloudSyncOffer.payload);
+    try { localStorage.setItem(`shyft3_g${cloudSyncOffer.groupId}_lastModified`, String(cloudSyncOffer.clientTs)); } catch {}
+    setCloudSyncOffer(null);
+    flash("✅ Synced from cloud");
+  };
+
+  // First-device-claim: build the list of cloud groups (from cloudUser.memberships) that don't
+  // have a corresponding local group. Recomputed whenever cloudUser or groups change.
+  useEffect(() => {
+    if (!cloudUser?.memberships?.length) { setUnclaimedCloudGroups([]); return; }
+    const localCloudGids = new Set(groups.map(g => g.cloudGroupId).filter(Boolean));
+    setUnclaimedCloudGroups(cloudUser.memberships.filter(m => !localCloudGids.has(m.groupId)));
+  }, [cloudUser, groups]);
+
+  // After a group is loaded AND cloud session is known, check whether the cloud has newer data.
+  // Re-runs whenever the active group changes or the cloud session boots.
+  useEffect(() => {
+    if (!groupId || !cloudUser || !currentGroup?.cloudGroupId) { setCloudSyncOffer(null); return; }
+    checkCloudSyncOffer(groupId, currentGroup.cloudGroupId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupId, cloudUser, currentGroup?.cloudGroupId]);
+
+  // Pull a snapshot from cloud and create a fresh local group entry from its meta.
+  // The user will need their existing local username/password (saved in the snapshot's `users`)
+  // to actually sign in — this only restores the data, not the session.
+  const claimCloudGroup = async (cloudGid, cloudGroupName) => {
+    let snap = null;
+    try { snap = await window.api.fetchJSON("/api/snapshots/" + encodeURIComponent(cloudGid) + "/latest"); }
+    catch (e) { flash("⚠️ This group has no cloud snapshot yet — open it on your other device first"); return; }
+    if (!snap?.payload) { flash("⚠️ Empty cloud snapshot"); return; }
+    const meta = snap.payload.meta || {};
+    const newId = Date.now();
+    const ng = {
+      id: newId,
+      name: meta.name || cloudGroupName || "Restored group",
+      groupCode: meta.groupCode || genCode(6),
+      adminCode: meta.adminCode || genCode(6),
+      createdAt: meta.createdAt || Date.now(),
+      cloudGroupId: cloudGid,
+    };
+    const next = [...groups, ng];
+    setGroups(next); await persistRoot("groups", next);
+    await applySnapshot(newId, snap.payload);
+    try { localStorage.setItem(`shyft3_g${newId}_lastModified`, String(snap.clientTs)); } catch {}
+    flash(`✅ "${ng.name}" restored — sign in with your existing credentials`);
   };
 
   // Phase B: append-only event log helper. Fire-and-forget. No-op when the user isn't
@@ -1852,7 +1989,37 @@ function ShiftApp() {
       : null;
     return(
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 w-full max-w-sm p-7">
+        <div className="w-full max-w-sm space-y-3">
+        {/* Phase C: cloud account strip + first-device-claim. When the user has a cloud session,
+            show their email and a list of cloud groups not yet present on this device. Each
+            unclaimed group can be restored from its latest /api/snapshots payload. */}
+        {cloudUser && (
+          <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-2.5 flex items-center justify-between">
+            <span className="text-xs text-blue-800">Cloud: <span className="font-medium">{cloudUser.user.email}</span></span>
+            <button onClick={signOutCloud} className="text-xs text-blue-700 hover:text-blue-900 font-medium">Sign out</button>
+          </div>
+        )}
+        {cloudUser && unclaimedCloudGroups.length>0 && (
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5">
+            <div className="font-semibold text-sm text-slate-900 mb-1">Restore groups from your other device</div>
+            <p className="text-xs text-slate-500 mb-3">These cloud groups aren't on this device yet. Restoring fetches the latest snapshot saved by your other device.</p>
+            <div className="space-y-2">
+              {unclaimedCloudGroups.map(m => (
+                <div key={m.groupId} className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-slate-200">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-slate-900 truncate">{m.groupName}</div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wide">{m.role}</div>
+                  </div>
+                  <button onClick={()=>claimCloudGroup(m.groupId, m.groupName)}
+                    className="text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg flex-shrink-0">
+                    Restore
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-7">
           <div className="mb-1 flex justify-center">
             <ShiftLogoStacked height={140}/>
           </div>
@@ -1933,6 +2100,7 @@ function ShiftApp() {
           {authMode==="signup"&&<p className="text-xs text-slate-400 mt-4 text-center">Group and admin codes come from your group's owner.</p>}
           {authMode==="super"&&<p className="text-xs text-slate-400 mt-4 text-center">An owner bootstrap code is required to create an owner account.</p>}
           </>)}
+        </div>
         </div>
         {toast&&<Toast msg={toast}/>}
       </div>
@@ -4679,6 +4847,23 @@ function ShiftApp() {
     : "Dates not set";
   return(
     <div className="min-h-screen bg-canvas text-ink-900 lg:flex pb-20 lg:pb-0">
+      {/* Phase C cloud-sync banner — fires when /api/snapshots/:gid/latest reports a clientTs
+          newer than this device's last persist. User clicks "Sync now" to overwrite local
+          state with the cloud snapshot. */}
+      {cloudSyncOffer&&(
+        <div className="fixed top-0 inset-x-0 z-50 bg-amber-50 border-b border-amber-200 px-4 py-2.5 flex items-center justify-between gap-3 text-sm">
+          <div className="text-amber-900">
+            <span className="font-medium">Newer version of this group available</span>
+            <span className="text-amber-700"> from another device.</span>
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <button onClick={()=>setCloudSyncOffer(null)}
+              className="text-xs font-medium text-amber-700 hover:text-amber-900 px-2 py-1">Dismiss</button>
+            <button onClick={acceptCloudSync}
+              className="text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded-lg">Sync now</button>
+          </div>
+        </div>
+      )}
       {/* Desktop sidebar */}
       <aside className="hidden lg:flex lg:flex-col w-[260px] flex-shrink-0 bg-surface border-r border-slate-200 px-4 py-5 sticky top-0 h-screen">
         <div className="mb-6 px-2">

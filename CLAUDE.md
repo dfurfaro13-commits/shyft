@@ -110,6 +110,7 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | `src/lib/` | Backend helpers (`db`, `session`, `cookies`, `email`, `csrf`, `ids`, `ratelimit`, `http`). |
 | `migrations/0001_init.sql` | D1 schema for Phase A: `users`, `groups`, `memberships`, `invites`, `login_tokens`, `sessions`. |
 | `migrations/0002_events.sql` | Phase B append-only event log (`events` table). |
+| `migrations/0003_snapshots.sql` | Phase C per-group state snapshot (`snapshots` table). Latest only — full history lives in R2. |
 | `Phases for Shyft and Rules for shift assignment.docx` | The spec. Source of truth for behavior. Re-read when in doubt. |
 | `legacy/` | Archived v1/v2 source + built HTML, plus v1-era assignment-algorithm simulators (`simulate.js`, `simulate.py`). **Do not read or grep into.** |
 | `~/.claude/plans/*.md` | Planning artifacts. Look for the most recent one for context on the latest change. |
@@ -136,6 +137,17 @@ Every meaningful state mutation also fires a `POST /api/events` to D1 — the pr
 Currently logged event types: `topOption.set`, `topOption.clear`, `preference.toggle`, `unavail.toggle`, `block.reconcile`, `block.lock`, `block.unlock`, `shift.confirm`, `shift.flag`, `marketplace.post`, `marketplace.take`, `marketplace.cancel`. The Worker rejects unknown types — to add a new event type, append to `ALLOWED_TYPES` in `src/api/events.js` first.
 
 R2 archival of the event log (originally part of the Phase B plan) is deferred — D1 is queryable directly and we'll dump monthly archives to R2 only when the corpus gets large enough to need it.
+
+### Phase C — snapshot sync
+
+After every per-group `persist()`, a debounced uploader (~2s) fires `POST /api/snapshots` with the entire per-group state plus the local-only group metadata (`groupCode`, `adminCode`, `name`, `createdAt`). D1 stores the latest (one row per group, last-write-wins). R2 stores history (one immutable object per write at `snapshots/<groupId>/<server_ts>-<client_ts>.json`).
+
+Two consumer flows on the frontend:
+
+- **Sync banner.** When a cloud-signed-in user opens a cloud-mirrored group, `checkCloudSyncOffer` compares the server's `client_ts` to this device's `shyft3_g<gid>_lastModified`. If cloud is meaningfully newer, an amber banner appears at the top of the in-group shell offering "Sync now" — which calls `applySnapshot` to overwrite the 8 per-group keys and reload the group.
+- **First-device-claim.** On the auth screen, `cloudUser.memberships` is filtered against local `groups[]` (matched by `cloudGroupId`). Any unclaimed cloud group renders a "Restore" card; clicking it pulls the latest snapshot, creates a new local `groups[]` entry from `payload.meta`, and writes the 8 per-group keys. The user then signs in locally with credentials that came back inside the snapshot's `users` array.
+
+The uploader silently no-ops when the user isn't cloud-signed-in or the active group has no `cloudGroupId`. localStorage remains source of truth — Phase C is mirroring, not migration.
 
 ---
 

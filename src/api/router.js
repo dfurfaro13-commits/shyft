@@ -4,6 +4,7 @@
 import { authRequest, authVerify, authLogout, me } from "./auth.js";
 import { createGroup, createInvite, getInvite } from "./groups.js";
 import { logEvent } from "./events.js";
+import { putSnapshot, getLatestSnapshot } from "./snapshots.js";
 import { err } from "../lib/http.js";
 
 const routes = [
@@ -15,6 +16,8 @@ const routes = [
   ["POST", "/api/groups/:gid/invites",            createInvite],
   ["GET",  "/api/invites/:token",                 getInvite],
   ["POST", "/api/events",                         logEvent],
+  ["POST", "/api/snapshots",                      putSnapshot],
+  ["GET",  "/api/snapshots/:groupId/latest",      getLatestSnapshot],
 ];
 
 export async function handleApi(req, env) {
