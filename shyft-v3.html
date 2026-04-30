@@ -329,6 +329,8 @@ function ShiftApp() {
   const [showBlockReport, setShowBlockReport] = useState(false);
   const [filterUid, setFilterUid] = useState(null);
   const [copied, setCopied] = useState(""); // SuperDashboard copy-to-clipboard feedback (hook must run on every render — Rules of Hooks)
+  const [renamingGid, setRenamingGid] = useState(null); // SuperDashboard inline-rename: which group's name is being edited
+  const [renameValue, setRenameValue] = useState("");   // SuperDashboard inline-rename: in-flight new-name input value
   const [addUserOpen, setAddUserOpen] = useState(false);
   const [addUserForm, setAddUserForm] = useState({ name:"", username:"", email:"", role:"provider", seniorityId:"" });
   const [newUserResult, setNewUserResult] = useState(null); // { name, username, tempPassword, email } — shown after admin creates a user
@@ -593,10 +595,13 @@ function ShiftApp() {
   const deleteGroup = async (gid) => {
     const g = groups.find(x=>x.id===gid); if(!g) return;
     if(!confirm(`Delete group "${g.name}" and all of its data? This cannot be undone.`)) return;
-    // Purge per-group keys
-    for(const k of ["users","config","shifts","unavail","prefs"]){
-      try { localStorage.removeItem("shyft_"+gKey(gid,k)); } catch{}
+    // Purge per-group keys. Uses shyft3_ prefix to match window.storage shim, and includes
+    // every v3-era key (marketplace, topOptions, openIncentives) plus the per-group migration
+    // marker so a deletion leaves no orphans behind.
+    for(const k of ["users","config","shifts","unavail","prefs","marketplace","topOptions","openIncentives"]){
+      try { localStorage.removeItem("shyft3_"+gKey(gid,k)); } catch{}
     }
+    try { localStorage.removeItem(`shyft3_g${gid}_migrate_top_options`); } catch{}
     const next = groups.filter(x=>x.id!==gid); setGroups(next); await persistRoot("groups", next);
     flash(`🗑 Group "${g.name}" deleted`);
   };
@@ -4188,10 +4193,83 @@ function ShiftApp() {
   const copyCode = (c) => {
     try { navigator.clipboard?.writeText(c); setCopied(c); setTimeout(()=>setCopied(""), 1500); flash("Copied"); } catch { flash("⚠️ Copy failed"); }
   };
-  const groupMemberCount = (gid) => {
-    try { const raw = localStorage.getItem("shyft_"+gKey(gid,"users")); if(!raw) return 0; return (JSON.parse(raw)||[]).length; } catch { return 0; }
+  // Reads a per-group localStorage value (shyft3_ namespace) and JSON-parses it. Returns
+  // `fallback` if the key is missing or unparseable. Used by the Owner dashboard to inspect
+  // groups the Owner isn't currently loaded into — Owner accounts have no `groupId` so the
+  // in-memory `users`/`config`/etc state is empty for them, but localStorage has everything.
+  const readGroupKey = (gid, k, fallback) => {
+    try { const raw = localStorage.getItem("shyft3_"+gKey(gid,k)); return raw ? JSON.parse(raw) : fallback; }
+    catch { return fallback; }
   };
-  const SuperDashboard = () => (
+  // Aggregate stats for one group, computed cold from localStorage. Safe to call for any
+  // group regardless of which one (if any) is currently loaded.
+  const getGroupStats = (gid) => {
+    const gusers = readGroupKey(gid, "users", []);
+    const cfg = readGroupKey(gid, "config", null);
+    const market = readGroupKey(gid, "marketplace", []);
+    const blocks = (cfg && Array.isArray(cfg.blocks)) ? cfg.blocks : [];
+    const activeBlock = (cfg && cfg.currentBlockId) ? blocks.find(b=>b.id===cfg.currentBlockId) : null;
+    // Block ids are Date.now() at create-time (see Setup → New block), so the max id is a
+    // reasonable proxy for "newest write" along with user.createdAt and marketplace timestamps.
+    let lastActivity = 0;
+    for(const b of blocks){ if(b.id>lastActivity) lastActivity = b.id; }
+    for(const u of gusers){ if(u.createdAt && u.createdAt>lastActivity) lastActivity = u.createdAt; }
+    for(const l of market){
+      if(l.postedAt && l.postedAt>lastActivity) lastActivity = l.postedAt;
+      if(l.takenAt  && l.takenAt >lastActivity) lastActivity = l.takenAt;
+    }
+    return {
+      admins: gusers.filter(u=>u.role==="admin").length,
+      providers: gusers.filter(u=>u.role==="provider").length,
+      members: gusers.length,
+      blocksTotal: blocks.length,
+      blocksLocked: blocks.filter(b=>phaseOf(b)===PHASE.LOCKED).length,
+      activeBlock: activeBlock ? {phase: phaseOf(activeBlock), name: activeBlock.name||"", start: activeBlock.start||"", end: activeBlock.end||""} : null,
+      lastActivity: lastActivity || null,
+    };
+  };
+  // Owner action: rename a group. Updates groups[] in root storage; per-group data unaffected.
+  const renameGroup = async (gid, newName) => {
+    const name = (newName||"").trim();
+    if(!name){ flash("⚠️ Name required"); return; }
+    const next = groups.map(g => g.id===gid ? {...g, name} : g);
+    setGroups(next); await persistRoot("groups", next);
+    flash(`✏️ Renamed to "${name}"`);
+  };
+  // Owner action: regenerate both join codes for a group. Existing user accounts (which sign
+  // in by username/password) keep working — only new joiners need the new codes.
+  const rollGroupCodes = async (gid) => {
+    const g = groups.find(x=>x.id===gid); if(!g) return;
+    if(!confirm(`Generate new group + admin codes for "${g.name}"? The old codes will stop working immediately. Existing members can still sign in.`)) return;
+    const taken = new Set(groups.flatMap(x=>x.id===gid?[]:[x.groupCode,x.adminCode]));
+    let gc, ac;
+    do { gc = genCode(6); } while(taken.has(gc));
+    do { ac = genCode(6); } while(taken.has(ac) || ac===gc);
+    const next = groups.map(x => x.id===gid ? {...x, groupCode:gc, adminCode:ac} : x);
+    setGroups(next); await persistRoot("groups", next);
+    flash(`🔄 New codes for "${g.name}"`);
+  };
+  // Compact relative-time formatter for the last-activity hint on each Owner card.
+  const fmtAgo = (ts) => {
+    if(!ts) return "—";
+    const s = Math.floor((Date.now()-ts)/1000);
+    if(s<60) return "just now";
+    if(s<3600) return `${Math.floor(s/60)}m ago`;
+    if(s<86400) return `${Math.floor(s/3600)}h ago`;
+    if(s<604800) return `${Math.floor(s/86400)}d ago`;
+    return new Date(ts).toLocaleDateString();
+  };
+  const SuperDashboard = () => {
+    // Per-group stats computed cold from localStorage; aggregated for the platform totals strip.
+    const allStats = groups.map(g => ({...getGroupStats(g.id), gid:g.id}));
+    const totals = allStats.reduce((a,s)=>({
+      admins: a.admins + s.admins,
+      providers: a.providers + s.providers,
+      blocks: a.blocks + s.blocksTotal,
+      active: a.active + (s.activeBlock ? 1 : 0),
+    }), {admins:0, providers:0, blocks:0, active:0});
+
+    return (
     <div className="min-h-screen bg-slate-50">
       <nav className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3 flex items-center justify-between sticky top-0 z-40">
         <div className="flex items-center gap-2">
@@ -4206,7 +4284,32 @@ function ShiftApp() {
       </nav>
       <main className="p-4 sm:p-6 max-w-3xl mx-auto">
         <h1 className="text-2xl font-semibold mb-1">Groups</h1>
-        <p className="text-sm text-slate-500 mb-5">Every group has its own users, calendar, and settings. Share the codes with the group's members.</p>
+        <p className="text-sm text-slate-500 mb-4">Every group has its own users, calendar, and settings. Share the codes with the group's members.</p>
+
+        {/* Platform totals strip — one-glance summary across every group. Hidden when there
+            are zero groups (the empty-state below carries the call-to-action instead). */}
+        {groups.length>0&&(
+          <div className="grid grid-cols-4 gap-2 mb-4">
+            <div className="bg-white rounded-lg border border-slate-200 p-2.5 text-center">
+              <div className="text-lg font-semibold text-slate-900 tabular-nums leading-tight">{groups.length}</div>
+              <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Group{groups.length===1?"":"s"}</div>
+            </div>
+            <div className="bg-white rounded-lg border border-slate-200 p-2.5 text-center">
+              <div className="text-lg font-semibold text-slate-900 tabular-nums leading-tight">{totals.admins}</div>
+              <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Admin{totals.admins===1?"":"s"}</div>
+            </div>
+            <div className="bg-white rounded-lg border border-slate-200 p-2.5 text-center">
+              <div className="text-lg font-semibold text-slate-900 tabular-nums leading-tight">{totals.providers}</div>
+              <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Providers</div>
+            </div>
+            <div className="bg-white rounded-lg border border-slate-200 p-2.5 text-center">
+              <div className="text-lg font-semibold text-slate-900 tabular-nums leading-tight">
+                {totals.blocks}<span className="text-xs font-medium text-slate-400 ml-1">· {totals.active} live</span>
+              </div>
+              <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Blocks</div>
+            </div>
+          </div>
+        )}
 
         <div className="bg-white rounded-xl border border-slate-200 p-4 mb-4">
           <div className="font-semibold mb-3">Create a new group</div>
@@ -4227,16 +4330,75 @@ function ShiftApp() {
           </div>
         ):(
           <div className="space-y-2">{groups.slice().sort((a,b)=>b.createdAt-a.createdAt).map(g=>{
-            const mc = groupMemberCount(g.id);
+            const s = getGroupStats(g.id);
+            const renaming = renamingGid===g.id;
+            const tone = s.activeBlock ? PHASE_TONE[s.activeBlock.phase] : null;
             return(
               <div key={g.id} className="bg-white rounded-xl border border-slate-200 p-4">
-                <div className="flex items-start justify-between gap-3 mb-3">
-                  <div>
-                    <div className="font-semibold text-base">{g.name}</div>
-                    <div className="text-xs text-slate-500">{mc} member{mc===1?"":"s"} · created {new Date(g.createdAt).toLocaleDateString()}</div>
+                {/* Header: name (or inline rename input) + actions row. */}
+                <div className="flex items-start justify-between gap-3 mb-1">
+                  <div className="flex-1 min-w-0">
+                    {renaming?(
+                      <div className="flex gap-1.5 items-center">
+                        <input autoFocus value={renameValue} onChange={e=>setRenameValue(e.target.value)}
+                          onKeyDown={e=>{
+                            if(e.key==="Enter"){ renameGroup(g.id, renameValue); setRenamingGid(null); }
+                            if(e.key==="Escape") setRenamingGid(null);
+                          }}
+                          className="flex-1 px-2 py-1 border border-slate-300 rounded text-base font-semibold"/>
+                        <button onClick={()=>{ renameGroup(g.id, renameValue); setRenamingGid(null); }}
+                          className="text-xs font-medium text-emerald-700 hover:text-emerald-800 px-2 py-1">Save</button>
+                        <button onClick={()=>setRenamingGid(null)}
+                          className="text-xs font-medium text-slate-500 hover:text-slate-700 px-2 py-1">Cancel</button>
+                      </div>
+                    ):(
+                      <div className="font-semibold text-base truncate">{g.name}</div>
+                    )}
+                    <div className="text-xs text-slate-500 mt-0.5">
+                      Last activity {fmtAgo(s.lastActivity)} · created {new Date(g.createdAt).toLocaleDateString()}
+                    </div>
                   </div>
-                  <button onClick={()=>deleteGroup(g.id)} className="text-red-600 hover:text-red-700 text-xs font-medium px-2 py-1">Delete</button>
+                  {!renaming&&(
+                    <div className="flex items-center flex-shrink-0">
+                      <button onClick={()=>{ setRenameValue(g.name); setRenamingGid(g.id); }} className="text-slate-600 hover:text-slate-900 text-xs font-medium px-2 py-1">Rename</button>
+                      <button onClick={()=>rollGroupCodes(g.id)} className="text-slate-600 hover:text-slate-900 text-xs font-medium px-2 py-1">Roll codes</button>
+                      <button onClick={()=>deleteGroup(g.id)} className="text-red-600 hover:text-red-700 text-xs font-medium px-2 py-1">Delete</button>
+                    </div>
+                  )}
                 </div>
+
+                {/* Stat strip — admins · providers · blocks(/locked) · active phase. */}
+                <div className="grid grid-cols-4 gap-2 my-3">
+                  <div className="bg-slate-50 rounded-lg p-2 text-center">
+                    <div className="text-base font-semibold text-slate-900 tabular-nums leading-tight">{s.admins}</div>
+                    <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Admin{s.admins===1?"":"s"}</div>
+                  </div>
+                  <div className="bg-slate-50 rounded-lg p-2 text-center">
+                    <div className="text-base font-semibold text-slate-900 tabular-nums leading-tight">{s.providers}</div>
+                    <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Providers</div>
+                  </div>
+                  <div className="bg-slate-50 rounded-lg p-2 text-center">
+                    <div className="text-base font-semibold text-slate-900 tabular-nums leading-tight">
+                      {s.blocksTotal}<span className="text-xs font-medium text-slate-400 ml-1">· {s.blocksLocked} lk</span>
+                    </div>
+                    <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Blocks</div>
+                  </div>
+                  <div className={`rounded-lg p-2 text-center border ${tone?`${tone.bg} ${tone.border}`:"bg-slate-50 border-transparent"}`}>
+                    {s.activeBlock?(
+                      <>
+                        <div className={`text-xs font-semibold leading-tight ${tone.text} truncate`}>{PHASE_LABEL[s.activeBlock.phase]}</div>
+                        <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide truncate">{s.activeBlock.name||"Active"}</div>
+                      </>
+                    ):(
+                      <>
+                        <div className="text-xs font-medium text-slate-400 leading-tight">No active</div>
+                        <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Block</div>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Codes — unchanged from previous design. */}
                 <div className="grid grid-cols-2 gap-2">
                   <div className="bg-slate-50 rounded-lg p-2.5">
                     <div className="text-[10px] font-medium text-slate-500 mb-1 uppercase tracking-wide">Group code</div>
@@ -4264,7 +4426,8 @@ function ShiftApp() {
       </main>
       {toast&&<Toast msg={toast}/>}
     </div>
-  );
+    );
+  };
 
   /* ══ NAV & RENDER ══ */
   if(me.role==="super") return SuperDashboard();
