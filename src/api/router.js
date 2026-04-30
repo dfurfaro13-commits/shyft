@@ -1,8 +1,9 @@
 // URL-pattern dispatch. Tiny, no dependencies. Each entry is [method, pattern, handler].
 // Patterns support :param segments which are extracted into the third arg.
 
-import { authRequest, authVerify, authLogout, me } from "./auth.js";
-import { createGroup, createInvite, getInvite } from "./groups.js";
+import { authRequest, authVerify, authPassword, authLogout, me } from "./auth.js";
+import { createGroup, createInvite, getInvite, migrateGroup } from "./groups.js";
+import { createUser } from "./users.js";
 import { logEvent } from "./events.js";
 import { putSnapshot, getLatestSnapshot } from "./snapshots.js";
 import { err } from "../lib/http.js";
@@ -10,11 +11,14 @@ import { err } from "../lib/http.js";
 const routes = [
   ["POST", "/api/auth/request",                   authRequest],
   ["GET",  "/api/auth/verify",                    authVerify],
+  ["POST", "/api/auth/password",                  authPassword],
   ["POST", "/api/auth/logout",                    authLogout],
   ["GET",  "/api/me",                             me],
   ["POST", "/api/groups",                         createGroup],
   ["POST", "/api/groups/:gid/invites",            createInvite],
+  ["POST", "/api/groups/:gid/migrate",            migrateGroup],
   ["GET",  "/api/invites/:token",                 getInvite],
+  ["POST", "/api/users",                          createUser],
   ["POST", "/api/events",                         logEvent],
   ["POST", "/api/snapshots",                      putSnapshot],
   ["GET",  "/api/snapshots/:groupId/latest",      getLatestSnapshot],

@@ -3,6 +3,7 @@ import { newId, randomToken, sha256Hex } from "../lib/ids.js";
 import { sendMagicLink } from "../lib/email.js";
 import { checkLoginRateLimit } from "../lib/ratelimit.js";
 import { requireCsrfHeader } from "../lib/csrf.js";
+import { verifyPassword } from "../lib/passwords.js";
 import {
   createSession,
   getSessionUser,
@@ -13,6 +14,8 @@ import {
 import { json, noContent, err, html, readJson, normalizeEmail, isEmail } from "../lib/http.js";
 
 const LOGIN_TOKEN_TTL_SEC = 60 * 15;
+const PASSWORD_RATE_LIMIT = 10;          // per (email, ip) per hour
+const PASSWORD_RATE_WINDOW = 3600;
 
 // POST /api/auth/request  { email, inviteToken? }
 export async function authRequest(req, env) {
@@ -129,6 +132,52 @@ export async function authVerify(req, env) {
 
   return html(verifyPage(user.email, env.APP_URL || "/", inviteNote), {
     headers: { "Set-Cookie": sessionSetCookieHeader(sidRaw) },
+  });
+}
+
+// POST /api/auth/password  { email, password }
+// Per stress-test: stricter limits than magic-link (10/hr per (email, ip)) since passwords
+// are brute-forceable. Constant-time response shape regardless of whether the email exists.
+export async function authPassword(req, env) {
+  const csrf = requireCsrfHeader(req);
+  if (csrf) return csrf;
+  const body = await readJson(req);
+  const email = normalizeEmail(body.email);
+  const password = String(body.password || "");
+  if (!isEmail(email) || !password) return err(400, "invalid_credentials");
+
+  const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+  const since = nowSec() - PASSWORD_RATE_WINDOW;
+  const rate = await q1(
+    env,
+    "SELECT COUNT(*) AS n FROM password_attempts WHERE email = ? AND ip = ? AND ts >= ?",
+    email, ip, since,
+  );
+  if ((rate?.n || 0) >= PASSWORD_RATE_LIMIT) return err(429, "rate_limited");
+
+  const user = await q1(
+    env,
+    "SELECT id, email, display_name, password_hash FROM users WHERE email = ?",
+    email,
+  );
+  // Always run the verify even if user is missing — keeps timing roughly constant so
+  // attackers can't enumerate accounts via response time.
+  const ok = user?.password_hash ? await verifyPassword(password, user.password_hash) : false;
+
+  await exec(env,
+    "INSERT INTO password_attempts (email, ip, ok) VALUES (?, ?, ?)",
+    email, ip, ok ? 1 : 0,
+  );
+
+  if (!ok || !user) return err(401, "invalid_credentials");
+
+  const { raw: sidRaw } = await createSession(env, user.id);
+  return new Response(JSON.stringify({ user: { id: user.id, email: user.email, displayName: user.display_name } }), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Set-Cookie": sessionSetCookieHeader(sidRaw),
+    },
   });
 }
 

@@ -1,5 +1,6 @@
 import { exec, q1, nowSec } from "../lib/db.js";
 import { newId, randomToken } from "../lib/ids.js";
+import { hashPassword, generateTempPassword } from "../lib/passwords.js";
 import { requireCsrfHeader } from "../lib/csrf.js";
 import { getSessionUser } from "../lib/session.js";
 import { json, err, readJson } from "../lib/http.js";
@@ -89,4 +90,94 @@ export async function getInvite(req, env, { token }) {
     role: row.role,
     expiresAt: row.expiresAt,
   });
+}
+
+// POST /api/groups/:gid/migrate
+//   { name, snapshot: <full snapshot payload>, users: [{ localId, name, role }, ...] }
+//
+// Phase D.2: turns a local-only group into a cloud group. The cloud-signed-in caller
+// becomes the new group's owner. Every local user listed becomes a `kind='test'` cloud
+// user with a synthetic email and a freshly-generated password — returned in the response
+// so the migrating admin can hand them out for testing. No emails are sent.
+//
+// `:gid` here is the LOCAL group id (numeric/timestamp). We mint a fresh cloud group id
+// ourselves; the local id is informational only.
+export async function migrateGroup(req, env, { gid }) {
+  const csrf = requireCsrfHeader(req);
+  if (csrf) return csrf;
+  const caller = await getSessionUser(env, req);
+  if (!caller) return err(401, "unauthorized");
+
+  const body = await readJson(req);
+  const name = String(body.name || "").trim();
+  if (!name) return err(400, "name_required");
+  const localUsers = Array.isArray(body.users) ? body.users : [];
+  const snapshotPayload = body.snapshot || null;
+  if (!snapshotPayload) return err(400, "snapshot_required");
+
+  const cloudGroupId = newId("grp");
+  const nowS = nowSec();
+
+  // 1. Create the group + caller's owner membership.
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO groups (id, name, owner_user_id) VALUES (?, ?, ?)")
+      .bind(cloudGroupId, name, caller.id),
+    env.DB.prepare("INSERT INTO memberships (user_id, group_id, role) VALUES (?, ?, 'owner')")
+      .bind(caller.id, cloudGroupId),
+  ]);
+
+  // 2. Create one test user per local user with a synthetic email + temp password.
+  const created = [];
+  for (const u of localUsers) {
+    const localId = String(u.localId ?? "");
+    const displayName = String(u.name || "user").slice(0, 80);
+    const role = u.role === "admin" ? "admin" : "provider";
+    const email = `${localId || newId("u").slice(2)}@${cloudGroupId}.test.invalid`.toLowerCase();
+    const tempPassword = generateTempPassword();
+    const passwordHash = await hashPassword(tempPassword);
+    const userId = newId("usr");
+    try {
+      await exec(
+        env,
+        "INSERT INTO users (id, email, display_name, kind, password_hash) VALUES (?, ?, ?, 'test', ?)",
+        userId, email, displayName, passwordHash,
+      );
+      await exec(
+        env,
+        "INSERT INTO memberships (user_id, group_id, role, local_uid) VALUES (?, ?, ?, ?)",
+        userId, cloudGroupId, role, localId || null,
+      );
+      created.push({ localId, name: displayName, email, tempPassword, role });
+    } catch (e) {
+      console.error("migrate user create failed:", displayName, e?.message || e);
+    }
+  }
+
+  // 3. Upload the snapshot directly into D1 + R2 so the new cloud group has data immediately.
+  const payloadStr = typeof snapshotPayload === "string" ? snapshotPayload : JSON.stringify(snapshotPayload);
+  const clientTs = Number.isFinite(+body.clientTs) ? Math.floor(+body.clientTs) : Date.now();
+  await exec(
+    env,
+    `INSERT INTO snapshots (group_id, user_id, payload, client_ts, server_ts) VALUES (?, ?, ?, ?, ?)`,
+    cloudGroupId, caller.id, payloadStr, clientTs, nowS,
+  );
+  if (env.R2) {
+    try {
+      const key = `snapshots/${cloudGroupId}/${nowS}-${clientTs}.json`;
+      await env.R2.put(key, payloadStr, {
+        httpMetadata: { contentType: "application/json" },
+        customMetadata: {
+          groupId: cloudGroupId,
+          userId: caller.id,
+          clientTs: String(clientTs),
+          serverTs: String(nowS),
+          migratedFromLocal: String(gid),
+        },
+      });
+    } catch (e) {
+      console.error("migrate snapshot R2 write failed:", e?.message || e);
+    }
+  }
+
+  return json({ cloudGroupId, name, users: created });
 }

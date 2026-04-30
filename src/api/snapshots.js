@@ -31,6 +31,24 @@ export async function putSnapshot(req, env) {
   );
   if (!membership) return err(403, "not_a_member");
 
+  // Phase D: optimistic concurrency. Caller may pass `If-Match: <serverTs>` (or `ifMatch`
+  // in the body for clients that can't set headers). If set and mismatched, return 409 with
+  // the current serverTs so the client can refetch and re-apply.
+  const ifMatchHeader = req.headers.get("If-Match");
+  const ifMatch = ifMatchHeader != null
+    ? parseInt(ifMatchHeader.replace(/"/g, ""), 10)
+    : (Number.isFinite(+body.ifMatch) ? Math.floor(+body.ifMatch) : null);
+  if (ifMatch != null) {
+    const existing = await q1(env, "SELECT server_ts FROM snapshots WHERE group_id = ?", groupId);
+    const currentServerTs = existing?.server_ts || 0;
+    if (currentServerTs !== ifMatch) {
+      return new Response(JSON.stringify({ error: "stale", serverTs: currentServerTs }), {
+        status: 409,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }
+
   const serverTs = nowSec();
 
   // D1: upsert the latest. Conflict on group_id (the primary key) → update.

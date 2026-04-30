@@ -154,8 +154,11 @@ export default function ShiftApp() {
   const [renamingGid, setRenamingGid] = useState(null); // SuperDashboard inline-rename: which group's name is being edited
   const [renameValue, setRenameValue] = useState("");   // SuperDashboard inline-rename: in-flight new-name input value
   const [addUserOpen, setAddUserOpen] = useState(false);
-  const [addUserForm, setAddUserForm] = useState({ name:"", username:"", email:"", role:"provider", seniorityId:"" });
-  const [newUserResult, setNewUserResult] = useState(null); // { name, username, tempPassword, email } — shown after admin creates a user
+  const [addUserForm, setAddUserForm] = useState({ name:"", username:"", email:"", role:"provider", seniorityId:"", isTest:false });
+  // After adminAddUser succeeds, this holds local credentials. If a cloud user was created
+  // alongside (cloud-mirrored group + cloud-signed-in admin), `cloud` carries the cloud
+  // credentials separately so the admin sees both options to share.
+  const [newUserResult, setNewUserResult] = useState(null); // { name, username, tempPassword, email, role, cloud?: { email, kind, tempPassword } }
 
   // ── Phase A backend (cloud auth, magic-link sign-in, owner invite links).
   // Cloud session is purely additive: localStorage stays source of truth in Phase A.
@@ -165,9 +168,13 @@ export default function ShiftApp() {
   const [cloudUser, setCloudUser] = useState(null);          // { id, email, displayName, memberships: [...] } | null
   const [pendingInvite, setPendingInvite] = useState(null);  // { token, groupId, groupName, role, expiresAt } | null
   const [cloudEmail, setCloudEmail] = useState("");
+  const [cloudPassword, setCloudPassword] = useState("");
   const [magicLinkSent, setMagicLinkSent] = useState(false);
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudError, setCloudError] = useState("");
+  // Phase D.2 migration UI: { localGroupId, name, users: [{name,email,tempPassword,role}] }
+  // when the SuperDashboard's confirm-migration modal is open or showing the result.
+  const [migrateState, setMigrateState] = useState(null);
   // Phase C: snapshot sync. cloudSyncOffer = { groupId, cloudGroupId, clientTs, serverTs } when
   // the cloud has data newer than this device's last persist for the active group.
   const [cloudSyncOffer, setCloudSyncOffer] = useState(null);
@@ -472,6 +479,24 @@ export default function ShiftApp() {
           : "Couldn't send the link. Try again."));
     } finally { setCloudBusy(false); }
   };
+  // Phase D.1: password sign-in for test users (and optionally real users who set one).
+  // Same session cookie as magic-link, so success path behaves identically.
+  const signInWithPassword = async (email, password) => {
+    setCloudBusy(true); setCloudError("");
+    try {
+      await window.api.fetchJSON("/api/auth/password", {
+        method: "POST",
+        body: JSON.stringify({ email: (email||"").trim().toLowerCase(), password }),
+      });
+      // Refresh /api/me so cloudUser reflects the new session immediately.
+      try { const meRes = await window.api.fetchJSON("/api/me"); if (meRes) setCloudUser(meRes); } catch {}
+      setCloudPassword("");
+    } catch (e) {
+      setCloudError(e?.body?.error === "rate_limited"
+        ? "Too many attempts. Try again in an hour."
+        : "Email or password is incorrect.");
+    } finally { setCloudBusy(false); }
+  };
   const signOutCloud = async () => {
     try { await window.api.fetchJSON("/api/auth/logout", { method: "POST" }); } catch {}
     setCloudUser(null);
@@ -592,6 +617,77 @@ export default function ShiftApp() {
     checkCloudSyncOffer(groupId, currentGroup.cloudGroupId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupId, cloudUser, currentGroup?.cloudGroupId]);
+
+  // Phase D.2: read a non-active group's full state from localStorage so we can ship it
+  // up during migration. (`buildSnapshotPayload` only works for the active group because
+  // it sources from React state.)
+  const readGroupStateFromStorage = (gid) => {
+    const read = (k, fallback) => {
+      try { const raw = localStorage.getItem(`shyft3_${gKey(gid, k)}`); return raw ? JSON.parse(raw) : fallback; }
+      catch { return fallback; }
+    };
+    return {
+      users: read("users", []),
+      config: read("config", DEFAULT_CONFIG),
+      shifts: read("shifts", {}),
+      unavail: read("unavail", {}),
+      prefs: read("prefs", {}),
+      marketplace: read("marketplace", []),
+      topOptions: read("topOptions", {}),
+      openIncentives: read("openIncentives", {}),
+    };
+  };
+
+  // Open the confirm-migrate modal for a local-only group.
+  const startMigrateGroup = (g) => {
+    if (!cloudUser) { flash("⚠️ Sign in to cloud first"); return; }
+    const state = readGroupStateFromStorage(g.id);
+    setMigrateState({
+      phase: "confirm",
+      group: g,
+      localUsers: state.users || [],
+      payload: {
+        meta: {
+          name: g.name,
+          groupCode: g.groupCode,
+          adminCode: g.adminCode,
+          createdAt: g.createdAt,
+          cloudGroupId: g.cloudGroupId,
+        },
+        ...state,
+      },
+    });
+  };
+  const cancelMigrate = () => setMigrateState(null);
+  // Confirm + perform the migration. On success, the local group gets a cloudGroupId and the
+  // modal flips to "result" mode, listing each migrated user's synthetic email + temp password.
+  const confirmMigrate = async () => {
+    if (!migrateState || migrateState.phase !== "confirm") return;
+    const g = migrateState.group;
+    try {
+      const r = await window.api.fetchJSON(`/api/groups/${encodeURIComponent(String(g.id))}/migrate`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: g.name,
+          snapshot: migrateState.payload,
+          users: (migrateState.localUsers || []).map(u => ({ localId: String(u.id), name: u.name, role: u.role })),
+          clientTs: Date.now(),
+        }),
+      });
+      // Persist cloudGroupId on the local group entry so subsequent snapshot uploads
+      // (and the "is migrated?" UI gating) work.
+      const next = groups.map(x => x.id === g.id ? { ...x, cloudGroupId: r.cloudGroupId } : x);
+      setGroups(next); await persistRoot("groups", next);
+      // Refresh memberships so cloudUser includes the newly-owned group.
+      try { const meRes = await window.api.fetchJSON("/api/me"); if (meRes) setCloudUser(meRes); } catch {}
+      // Stamp lastModified for the migrated group so future cloud-sync-offer checks skip it.
+      try { localStorage.setItem(`shyft3_g${g.id}_lastModified`, String(Date.now())); } catch {}
+      setMigrateState({ phase: "result", group: { ...g, cloudGroupId: r.cloudGroupId }, result: r });
+    } catch (e) {
+      flash("⚠️ Migration failed: " + (e?.message || "unknown"));
+      setMigrateState(null);
+    }
+  };
 
   // Pull a snapshot from cloud and create a fresh local group entry from its meta.
   // The user will need their existing local username/password (saved in the snapshot's `users`)
@@ -1851,13 +1947,27 @@ export default function ShiftApp() {
               <>
                 <Field label="Email"><input type="email" value={cloudEmail} autoComplete="email" autoCapitalize="none"
                   onChange={e=>setCloudEmail(e.target.value)}
-                  onKeyDown={e=>e.key==="Enter"&&cloudEmail.trim()&&!cloudBusy&&requestMagicLink(cloudEmail, pendingInvite?.token)}
                   className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500" placeholder="you@example.com"/></Field>
+                <Field label="Password (test users only — leave blank to magic-link)">
+                  <input type="password" value={cloudPassword} autoComplete="current-password"
+                    onChange={e=>setCloudPassword(e.target.value)}
+                    onKeyDown={e=>{
+                      if(e.key!=="Enter"||cloudBusy||!cloudEmail.trim()) return;
+                      if(cloudPassword) signInWithPassword(cloudEmail, cloudPassword);
+                      else requestMagicLink(cloudEmail, pendingInvite?.token);
+                    }}
+                    className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500" placeholder=""/>
+                </Field>
                 {cloudError&&<div className="text-xs text-red-600 mb-3">{cloudError}</div>}
-                <button onClick={()=>requestMagicLink(cloudEmail, pendingInvite?.token)}
+                <button onClick={()=>{
+                  if(cloudPassword) signInWithPassword(cloudEmail, cloudPassword);
+                  else requestMagicLink(cloudEmail, pendingInvite?.token);
+                }}
                   disabled={cloudBusy||!cloudEmail.trim()}
                   className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium text-base transition disabled:bg-slate-300">
-                  {cloudBusy?"Sending…":(pendingInvite?"Accept invite":"Send magic link")}
+                  {cloudBusy
+                    ? (cloudPassword?"Signing in…":"Sending…")
+                    : (cloudPassword?"Sign in":(pendingInvite?"Accept invite":"Send magic link"))}
                 </button>
                 <p className="text-xs text-slate-400 mt-4 text-center">
                   Cloud sign-in is independent of your local account — both keep working.
@@ -2558,6 +2668,10 @@ export default function ShiftApp() {
   // Admin-only: form for adding a new user to the current group with a generated temp password.
   const AddUserModal = () => {
     if(!addUserOpen) return null;
+    // Cloud test/real toggle is only meaningful when this group is cloud-mirrored AND the admin
+    // is cloud-signed-in. Otherwise we're creating local-only.
+    const cloudCreatable = !!(cloudUser && currentGroup?.cloudGroupId);
+    const isTest = !!addUserForm.isTest;
     return(
       <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setAddUserOpen(false)}>
         <div className="bg-white rounded-2xl max-w-md w-full p-5" onClick={e=>e.stopPropagation()}>
@@ -2565,16 +2679,22 @@ export default function ShiftApp() {
             <div className="font-semibold text-xl">Add user</div>
             <button onClick={()=>setAddUserOpen(false)} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:bg-slate-100 rounded-full text-xl leading-none">×</button>
           </div>
-          <p className="text-sm text-slate-500 mb-4">We'll generate a temporary password you can share. They can sign in with their username and the temp password right away.</p>
+          <p className="text-sm text-slate-500 mb-4">
+            {isTest
+              ? "Test user — synthetic email, password handed to you to share. No magic-link email is sent."
+              : "We'll generate a temporary password you can share. They can sign in with their username and the temp password right away."}
+          </p>
           <Field label="Full name"><input type="text" value={addUserForm.name}
             onChange={e=>setAddUserForm({...addUserForm,name:e.target.value})}
             className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="Jane Smith"/></Field>
           <Field label="Username"><input type="text" value={addUserForm.username} autoCapitalize="none"
             onChange={e=>setAddUserForm({...addUserForm,username:e.target.value})}
             className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="jsmith"/></Field>
-          <Field label="Email (optional — used to prefill the email share)"><input type="email" value={addUserForm.email}
-            onChange={e=>setAddUserForm({...addUserForm,email:e.target.value})}
-            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="jane@example.com"/></Field>
+          {!isTest && (
+            <Field label="Email (optional — used to prefill the email share)"><input type="email" value={addUserForm.email}
+              onChange={e=>setAddUserForm({...addUserForm,email:e.target.value})}
+              className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="jane@example.com"/></Field>
+          )}
           <div className="grid grid-cols-2 gap-2 mb-3">
             <Field label="Role">
               <select value={addUserForm.role} onChange={e=>setAddUserForm({...addUserForm,role:e.target.value})}
@@ -2593,18 +2713,49 @@ export default function ShiftApp() {
               </Field>
             )}
           </div>
+          {cloudCreatable && (
+            <label className="flex items-center gap-2 text-sm text-slate-700 mb-3 cursor-pointer">
+              <input type="checkbox" checked={isTest}
+                onChange={e=>setAddUserForm({...addUserForm,isTest:e.target.checked})}
+                className="rounded border-slate-300"/>
+              Test user (synthetic email, no magic-link sent)
+            </label>
+          )}
           <button onClick={async()=>{
               const result = await adminAddUser(addUserForm);
               if(result.error){ flash("⚠️ " + result.error); return; }
+              // Phase D.1: also create a cloud user + membership when this group is cloud-mirrored.
+              // Local and cloud have separate passwords and identifiers — admin sees both in the
+              // result modal and can hand out whichever fits the testing scenario.
+              let cloud = null;
+              if (cloudCreatable) {
+                try {
+                  const r = await window.api.fetchJSON("/api/users", {
+                    method: "POST",
+                    body: JSON.stringify({
+                      kind: isTest ? "test" : "real",
+                      role: result.user.role,
+                      displayName: result.user.name,
+                      email: isTest ? undefined : (result.user.email || addUserForm.email || undefined),
+                      groupId: currentGroup.cloudGroupId,
+                      localUid: String(result.user.id),
+                    }),
+                  });
+                  cloud = { email: r.email, kind: r.kind, tempPassword: r.tempPassword };
+                } catch (e) {
+                  flash("⚠️ Local user created; cloud creation failed");
+                }
+              }
               setNewUserResult({
                 name: result.user.name,
                 username: result.user.username,
                 tempPassword: result.tempPassword,
                 email: result.user.email,
                 role: result.user.role,
+                cloud,
               });
               setAddUserOpen(false);
-              setAddUserForm({ name:"", username:"", email:"", role:"provider", seniorityId:"" });
+              setAddUserForm({ name:"", username:"", email:"", role:"provider", seniorityId:"", isTest:false });
             }}
             className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2.5 rounded-lg text-sm font-medium">
             Generate account
@@ -2615,9 +2766,11 @@ export default function ShiftApp() {
   };
 
   // Shown after adminAddUser succeeds. Displays username + temp password with copy / email share helpers.
+  // Phase D.1: when a cloud user was also created (test or real), shows the cloud credentials in a
+  // separate panel so the admin can hand out either path.
   const NewUserInfoModal = () => {
     if(!newUserResult) return null;
-    const { name, username, tempPassword, email, role } = newUserResult;
+    const { name, username, tempPassword, email, role, cloud } = newUserResult;
     const gc = currentGroup?.groupCode || "";
     const body = [
       `Hi ${name.split(" ")[0]},`,
@@ -2657,6 +2810,33 @@ export default function ShiftApp() {
             </div>
           </div>
           <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2 mb-3">This password is shown only once. Copy it now — after you close this dialog there's no way to retrieve it (you'd have to delete and re-add the user).</p>
+          {cloud && (
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-3 space-y-2">
+              <div className="text-xs font-semibold text-blue-900 uppercase tracking-wide">
+                {cloud.kind==="test" ? "Cloud sign-in (test user)" : "Cloud sign-in (real user)"}
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="text-[10px] font-medium text-blue-700 uppercase tracking-wide">Email</div>
+                  <div className="font-mono text-xs text-slate-800 break-all">{cloud.email}</div>
+                </div>
+                <button onClick={()=>{try{navigator.clipboard?.writeText(cloud.email);flash("Email copied");}catch{}}}
+                  className="text-[11px] text-blue-700 hover:text-blue-900 font-medium flex-shrink-0">Copy</button>
+              </div>
+              {cloud.tempPassword ? (
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <div className="text-[10px] font-medium text-blue-700 uppercase tracking-wide">Cloud password</div>
+                    <div className="font-mono text-base font-bold tracking-wider text-slate-900">{cloud.tempPassword}</div>
+                  </div>
+                  <button onClick={()=>{try{navigator.clipboard?.writeText(cloud.tempPassword);flash("Cloud password copied");}catch{}}}
+                    className="text-[11px] text-blue-700 hover:text-blue-900 font-medium flex-shrink-0">Copy</button>
+                </div>
+              ) : (
+                <div className="text-[11px] text-blue-700">A magic-link sign-in email was sent to this address.</div>
+              )}
+            </div>
+          )}
           <div className="flex gap-2">
             <button onClick={copyInfo} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">📋 Copy login info</button>
             <a href={mailto} className="flex-1 py-2.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium text-center">
@@ -4545,6 +4725,9 @@ export default function ShiftApp() {
                     <div className="flex items-center flex-shrink-0">
                       <button onClick={()=>{ setRenameValue(g.name); setRenamingGid(g.id); }} className="text-slate-600 hover:text-slate-900 text-xs font-medium px-2 py-1">Rename</button>
                       <button onClick={()=>rollGroupCodes(g.id)} className="text-slate-600 hover:text-slate-900 text-xs font-medium px-2 py-1">Roll codes</button>
+                      {!g.cloudGroupId && cloudUser && (
+                        <button onClick={()=>startMigrateGroup(g)} className="text-blue-600 hover:text-blue-700 text-xs font-medium px-2 py-1">Migrate to cloud</button>
+                      )}
                       <button onClick={()=>deleteGroup(g.id)} className="text-red-600 hover:text-red-700 text-xs font-medium px-2 py-1">Delete</button>
                     </div>
                   )}
@@ -4607,8 +4790,73 @@ export default function ShiftApp() {
           {supers.length} owner account{supers.length===1?"":"s"}. New owners register at the Owner tab on the sign-in screen with the bootstrap code.
         </div>
       </main>
+      {migrateState && <MigrateModal/>}
       {toast&&<Toast msg={toast}/>}
     </div>
+    );
+  };
+
+  // Phase D.2: confirm-then-result modal for migrating a local group to the cloud.
+  // Confirm phase lists every local user about to become a cloud test user.
+  // Result phase lists each user with their synthetic email + temp password — the only
+  // chance the admin has to capture them.
+  const MigrateModal = () => {
+    if (!migrateState) return null;
+    const { phase, group, localUsers, result } = migrateState;
+    const copyAll = () => {
+      if (!result?.users?.length) return;
+      const lines = result.users.map(u => `${u.name} (${u.role}): ${u.email}  ${u.tempPassword}`).join("\n");
+      try { navigator.clipboard?.writeText(lines); flash("Cloud credentials copied"); } catch { flash("⚠️ Copy failed"); }
+    };
+    return (
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={cancelMigrate}>
+        <div className="bg-white rounded-2xl max-w-lg w-full p-5 max-h-[90vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
+          {phase === "confirm" ? (<>
+            <div className="text-2xl mb-1">☁️</div>
+            <div className="font-semibold text-xl mb-1">Migrate "{group.name}" to cloud</div>
+            <p className="text-sm text-slate-500 mb-3">
+              Creates a cloud group with you as the owner. {localUsers.length} local user{localUsers.length===1?"":"s"} will become cloud <span className="font-medium">test users</span> — synthetic emails, no magic-link sent. Their passwords are shown once on the next screen so you can hand them out for testing.
+            </p>
+            <div className="bg-slate-50 rounded-lg p-3 mb-4 max-h-48 overflow-y-auto">
+              {localUsers.length === 0
+                ? <div className="text-sm text-slate-500 italic">No local users — only the group itself will be migrated.</div>
+                : localUsers.map(u => (
+                  <div key={u.id} className="flex justify-between text-sm py-1">
+                    <span className="font-medium text-slate-800">{u.name}</span>
+                    <span className="text-slate-500">{u.role}</span>
+                  </div>
+                ))
+              }
+            </div>
+            <div className="flex gap-2">
+              <button onClick={cancelMigrate} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
+              <button onClick={confirmMigrate} className="flex-1 py-2.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium">Migrate</button>
+            </div>
+          </>) : (<>
+            <div className="text-2xl mb-1">✅</div>
+            <div className="font-semibold text-xl mb-1">"{group.name}" migrated</div>
+            <p className="text-sm text-slate-500 mb-3">Each test user can sign in via the Cloud tab using the email and password below. Copy or screenshot now — passwords are not stored anywhere retrievable.</p>
+            <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2 mb-3">Saving these is your responsibility — Cloudflare won't show them again.</p>
+            <div className="bg-slate-50 rounded-lg p-3 mb-3 max-h-72 overflow-y-auto space-y-2">
+              {(result?.users||[]).map(u => (
+                <div key={u.email} className="border-b border-slate-200 last:border-b-0 pb-2 last:pb-0">
+                  <div className="flex items-center justify-between">
+                    <div className="font-medium text-sm text-slate-900">{u.name}</div>
+                    <div className="text-[10px] uppercase tracking-wide text-slate-500">{u.role}</div>
+                  </div>
+                  <div className="font-mono text-[11px] text-slate-600 break-all">{u.email}</div>
+                  <div className="font-mono text-sm font-bold tracking-wider text-slate-900">{u.tempPassword}</div>
+                </div>
+              ))}
+              {(!result?.users || result.users.length===0) && <div className="text-sm text-slate-500 italic">No test users created.</div>}
+            </div>
+            <div className="flex gap-2">
+              <button onClick={copyAll} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">📋 Copy all</button>
+              <button onClick={cancelMigrate} className="flex-1 py-2.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium">Done</button>
+            </div>
+          </>)}
+        </div>
+      </div>
     );
   };
 

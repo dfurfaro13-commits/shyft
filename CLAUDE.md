@@ -111,6 +111,7 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | `migrations/0001_init.sql` | D1 schema for Phase A: `users`, `groups`, `memberships`, `invites`, `login_tokens`, `sessions`. |
 | `migrations/0002_events.sql` | Phase B append-only event log (`events` table). |
 | `migrations/0003_snapshots.sql` | Phase C per-group state snapshot (`snapshots` table). Latest only — full history lives in R2. |
+| `migrations/0004_users_passwords.sql` | Phase D: adds `users.password_hash`, `users.kind`, and `password_attempts` rate-limit table. |
 | `Phases for Shyft and Rules for shift assignment.docx` | The spec. Source of truth for behavior. Re-read when in doubt. |
 | `legacy/` | Archived v1/v2 source + built HTML, plus v1-era assignment-algorithm simulators (`simulate.js`, `simulate.py`). **Do not read or grep into.** |
 | `~/.claude/plans/*.md` | Planning artifacts. Look for the most recent one for context on the latest change. |
@@ -148,6 +149,18 @@ Two consumer flows on the frontend:
 - **First-device-claim.** On the auth screen, `cloudUser.memberships` is filtered against local `groups[]` (matched by `cloudGroupId`). Any unclaimed cloud group renders a "Restore" card; clicking it pulls the latest snapshot, creates a new local `groups[]` entry from `payload.meta`, and writes the 8 per-group keys. The user then signs in locally with credentials that came back inside the snapshot's `users` array.
 
 The uploader silently no-ops when the user isn't cloud-signed-in or the active group has no `cloudGroupId`. localStorage remains source of truth — Phase C is mirroring, not migration.
+
+### Phase D — backend-as-truth (D.1 + D.2 shipped; D.3 deferred)
+
+**D.1 (password auth + cloud user creation).** Cloud users now carry an optional PBKDF2 `password_hash` (SHA-256 with 310k iters, 16-byte salt; format `pbkdf2$310000$<salt>$<hash>`) and a `kind ∈ ('real','test')` designator. New endpoint `POST /api/auth/password` issues a session for `email + password`; rate-limited at 10/hr per `(email, ip)` via the new `password_attempts` table. Endpoint `POST /api/users` lets an owner/admin create a cloud user + membership — `kind='test'` mints a synthetic `<localId>@<cloudGroupId>.test.invalid` email and a temp password returned in the response; `kind='real'` validates the supplied email and pre-issues a magic-link via Resend.
+
+The admin "+ Add user" modal in PeoplePage now creates BOTH a local user (existing flow) AND, when the active group is cloud-mirrored AND admin is cloud-signed-in, a cloud user via `POST /api/users`. The modal gains a "Test user (synthetic email, no magic-link sent)" checkbox visible only when cloud creation is possible. `NewUserInfoModal` shows local credentials and, if the cloud user was also created, the cloud credentials in a separate panel. The auth-screen Cloud tab gained a password field — leaving it empty falls through to the existing magic-link flow.
+
+**D.2 (one-shot migration).** `POST /api/groups/:gid/migrate` creates a cloud group, marks the caller `owner`, creates one `kind='test'` user per local user with a synthetic email + freshly-generated PBKDF2 password (returned in response so admin can hand them out), and uploads the supplied snapshot directly to D1 + R2. The SuperDashboard renders a **"Migrate to cloud"** button on every local-only group when the admin is cloud-signed-in. The confirm-modal lists the users about to be migrated; on success, the result-modal lists each user with their email + temp password (only shown once).
+
+**D.3 (deferred).** The auth screen still carries the Sign in / Sign up / Owner tabs; the `SUPER_BOOTSTRAP` constant and `supers[]` state still exist. D.3 deletes those once all of David's groups are migrated and tested.
+
+**Concurrency control.** `POST /api/snapshots` accepts `If-Match: <serverTs>` and returns 409 with the current serverTs when stale. The frontend doesn't yet send `If-Match` — backwards-compatible last-write-wins is preserved during D.1/D.2; D.3 will make it mandatory.
 
 ---
 
