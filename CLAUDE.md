@@ -106,8 +106,7 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | `index.html` | Tiny redirect to `shyft-v3.html` so the root URL of the deployed site loads the app. |
 | `wrangler.jsonc` | Cloudflare Workers static-assets config. Used by the GitHub-Pages deploy pipeline. |
 | `Phases for Shyft and Rules for shift assignment.docx` | The spec. Source of truth for behavior. Re-read when in doubt. |
-| `legacy/` | Archived v1/v2 source + built HTML. **Do not read or grep into.** |
-| `simulate.js`, `simulate.py` | v1-era reference simulators of the assignment algorithm. Not part of the build. Not loaded automatically. |
+| `legacy/` | Archived v1/v2 source + built HTML, plus v1-era assignment-algorithm simulators (`simulate.js`, `simulate.py`). **Do not read or grep into.** |
 | `~/.claude/plans/*.md` | Planning artifacts. Look for the most recent one for context on the latest change. |
 
 ---
