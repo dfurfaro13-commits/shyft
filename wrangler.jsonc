@@ -12,7 +12,8 @@
 //   SESSION_PEPPER  — random ≥32 bytes; pepper for SHA-256 over login + session tokens.
 //
 // Vars (non-secret):
-//   APP_URL    — origin used in magic-link URLs and redirects. Match your Pages subdomain.
+//   APP_URL    — origin used in magic-link URLs and redirects. The custom-domain origin.
+//   EMAIL_FROM — Resend sender address. Must be on a verified Resend domain.
 //   DEV_EMAIL  — set to "console" in .dev.vars to log magic links instead of sending.
 {
 	"name": "shyft",
@@ -23,7 +24,8 @@
 		"binding": "ASSETS"
 	},
 	"vars": {
-		"APP_URL": "https://shyft.dfurfaro13.workers.dev",
+		"APP_URL": "https://app.shift-scheduling.com",
+		"EMAIL_FROM": "SHIFT <noreply@shift-scheduling.com>",
 		"DEV_EMAIL": ""
 	},
 	"d1_databases": [
