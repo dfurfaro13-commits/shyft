@@ -147,6 +147,31 @@
         localStorage.setItem("shyft3_" + key, val);
       }
     };
+
+    // Cloud API helper. Same-origin fetch with the CSRF header the Worker requires.
+    // Phase A only — used by the cloud sign-in flow. localStorage is still source of truth.
+    window.api = {
+      async fetchJSON(path, opts = {}) {
+        const res = await fetch(path, {
+          ...opts,
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Requested-With": "shift",
+            ...(opts.headers || {}),
+          },
+        });
+        if (res.status === 204) return null;
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const e = new Error(body.error || ("HTTP " + res.status));
+          e.status = res.status;
+          e.body = body;
+          throw e;
+        }
+        return body;
+      },
+    };
   </script>
 
   <script type="text/babel" data-presets="react">

@@ -1,0 +1,41 @@
+# Files that should NOT be uploaded as public static assets.
+# The Worker (_worker.js + src/) is bundled server-side and runs at /api/*; it must
+# never be readable at /_worker.js or /src/... The built React app lives in
+# shyft-v3.html (which IS public) — the JSX source and templates are pre-build only.
+
+# Server-side code
+_worker.js
+src/
+migrations/
+
+# Cloudflare / build config
+wrangler.jsonc
+.dev.vars
+.wrangler/
+
+# Frontend pre-build sources (shyft-v3.html is the runtime artifact)
+ShiftApp.v3.jsx
+templates/
+
+# Dev internals
+.git/
+.gitignore
+.assetsignore
+.claude/
+node_modules/
+
+# Project docs and binary assets — not secret, but no reason to publish
+CLAUDE.md
+*.md
+*.docx
+*.xlsx
+*.db
+*.db-*
+*.log
+
+# OS / Office junk
+.DS_Store
+~$*
+
+# Archived versions
+legacy/

@@ -147,6 +147,31 @@
         localStorage.setItem("shyft3_" + key, val);
       }
     };
+
+    // Cloud API helper. Same-origin fetch with the CSRF header the Worker requires.
+    // Phase A only — used by the cloud sign-in flow. localStorage is still source of truth.
+    window.api = {
+      async fetchJSON(path, opts = {}) {
+        const res = await fetch(path, {
+          ...opts,
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Requested-With": "shift",
+            ...(opts.headers || {}),
+          },
+        });
+        if (res.status === 204) return null;
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const e = new Error(body.error || ("HTTP " + res.status));
+          e.status = res.status;
+          e.body = body;
+          throw e;
+        }
+        return body;
+      },
+    };
   </script>
 
   <script type="text/babel" data-presets="react">
@@ -335,6 +360,18 @@ function ShiftApp() {
   const [addUserForm, setAddUserForm] = useState({ name:"", username:"", email:"", role:"provider", seniorityId:"" });
   const [newUserResult, setNewUserResult] = useState(null); // { name, username, tempPassword, email } — shown after admin creates a user
 
+  // ── Phase A backend (cloud auth, magic-link sign-in, owner invite links).
+  // Cloud session is purely additive: localStorage stays source of truth in Phase A.
+  // Being signed-in to the cloud only enables (a) invite-link claiming, (b) mirroring new
+  // groups to D1 so owners can issue cloud invite URLs. The local username/group-code flow
+  // is unchanged.
+  const [cloudUser, setCloudUser] = useState(null);          // { id, email, displayName, memberships: [...] } | null
+  const [pendingInvite, setPendingInvite] = useState(null);  // { token, groupId, groupName, role, expiresAt } | null
+  const [cloudEmail, setCloudEmail] = useState("");
+  const [magicLinkSent, setMagicLinkSent] = useState(false);
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [cloudError, setCloudError] = useState("");
+
   useEffect(() => {
     (async () => {
       // Root-level (cross-group): groups list + super-admin accounts
@@ -348,6 +385,34 @@ function ShiftApp() {
       setLoading(false);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Cloud-session bootstrap. Runs once on mount, independent of the local-session effect above.
+  // Parses ?invite=xxx out of the URL (and strips it from the address bar so refresh doesn't
+  // re-trigger), then asks the API who we are. Failures are silent — the local app works fine
+  // without a cloud session in Phase A.
+  useEffect(() => {
+    (async () => {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const inviteToken = params.get("invite");
+        if (inviteToken) {
+          // Strip ?invite= from the URL while preserving any other query params.
+          params.delete("invite");
+          const qs = params.toString();
+          const next = window.location.pathname + (qs ? "?" + qs : "") + window.location.hash;
+          window.history.replaceState({}, "", next);
+          try {
+            const inv = await window.api.fetchJSON("/api/invites/" + encodeURIComponent(inviteToken));
+            if (inv) setPendingInvite(inv);
+          } catch (e) { /* expired / used / not found — fall through silently */ }
+        }
+        try {
+          const meRes = await window.api.fetchJSON("/api/me");
+          if (meRes) setCloudUser(meRes);
+        } catch (e) { /* not signed in — expected */ }
+      } catch {}
+    })();
   }, []);
 
   const loadGroup = async (gid) => {
@@ -581,6 +646,60 @@ function ShiftApp() {
     setPage("home");
   };
 
+  /* ── Phase A cloud helpers ── */
+  // Request a magic-link email. Used by the auth-screen Cloud tab and the invite-claim flow.
+  const requestMagicLink = async (email, inviteToken) => {
+    setCloudBusy(true); setCloudError("");
+    try {
+      await window.api.fetchJSON("/api/auth/request", {
+        method: "POST",
+        body: JSON.stringify({ email: (email||"").trim().toLowerCase(), inviteToken: inviteToken || undefined }),
+      });
+      setMagicLinkSent(true);
+    } catch (e) {
+      setCloudError(e?.body?.error === "rate_limited"
+        ? "Too many requests. Try again in an hour."
+        : (e?.body?.error === "invalid_invite"
+          ? "Invite link is invalid or expired."
+          : "Couldn't send the link. Try again."));
+    } finally { setCloudBusy(false); }
+  };
+  const signOutCloud = async () => {
+    try { await window.api.fetchJSON("/api/auth/logout", { method: "POST" }); } catch {}
+    setCloudUser(null);
+  };
+  // Owner-only: mint an invite URL for a cloud-mirrored group, copy to clipboard.
+  const createCloudInvite = async (cloudGroupId) => {
+    try {
+      const r = await window.api.fetchJSON("/api/groups/" + encodeURIComponent(cloudGroupId) + "/invites", {
+        method: "POST",
+        body: JSON.stringify({ role: "provider" }),
+      });
+      try { await navigator.clipboard.writeText(r.url); } catch {}
+      flash("✅ Invite link copied to clipboard");
+      return r.url;
+    } catch (e) {
+      flash("⚠️ Couldn't create invite link");
+      return null;
+    }
+  };
+
+  // Phase B: append-only event log helper. Fire-and-forget. No-op when the user isn't
+  // cloud-signed-in or the active group hasn't been mirrored to D1. Errors are swallowed
+  // — localStorage is still source of truth, so a failed log only loses ML signal.
+  const trackEvent = (type, payload, opts = {}) => {
+    if (!cloudUser || !currentGroup?.cloudGroupId) return;
+    const body = {
+      groupId: currentGroup.cloudGroupId,
+      type,
+      payload: payload || {},
+      localUid: me?.id || null,
+      blockId: opts.blockId ?? (currentBlock?.id != null ? String(currentBlock.id) : null),
+      clientTs: Date.now(),
+    };
+    window.api.fetchJSON("/api/events", { method: "POST", body: JSON.stringify(body) }).catch(()=>{});
+  };
+
   /* ── Super-admin helpers ── */
   const createGroup = async (name) => {
     const existingCodes = new Set(groups.flatMap(g=>[g.groupCode, g.adminCode]));
@@ -588,6 +707,21 @@ function ShiftApp() {
     do { gc = genCode(6); } while(existingCodes.has(gc));
     do { ac = genCode(6); } while(existingCodes.has(ac) || ac===gc);
     const ng = { id:Date.now(), name:name.trim()||"Untitled group", groupCode:gc, adminCode:ac, createdAt:Date.now() };
+    // If we have a cloud session, mirror the new group to D1 and stash its cloud id on the local
+    // group object so the owner can issue cloud invite links. Non-blocking: a failure here doesn't
+    // prevent the local group from being created — it just means no cloud invites for this group
+    // until we add a retry path in a later phase.
+    if (cloudUser) {
+      try {
+        const r = await window.api.fetchJSON("/api/groups", {
+          method: "POST",
+          body: JSON.stringify({ name: ng.name }),
+        });
+        if (r?.groupId) ng.cloudGroupId = r.groupId;
+        // Refresh memberships so the new group shows up in `cloudUser.memberships`.
+        try { const meRes = await window.api.fetchJSON("/api/me"); if (meRes) setCloudUser(meRes); } catch {}
+      } catch (e) { flash("⚠️ Group created locally, but cloud mirror failed"); }
+    }
     const next = [...groups, ng]; setGroups(next); await persistRoot("groups", next);
     flash(`✅ Group "${ng.name}" created`);
     return ng;
@@ -819,6 +953,7 @@ function ShiftApp() {
         setPreferences(pnext); await persist("prefs",pnext);
       }
     }
+    trackEvent("topOption.set", { dateKey, slotPref: sp, bid });
     flash(wasIn ? `Top Option updated · bid ${bid}` : `🎯 Top Option set · bid ${bid} pt${bid===1?"":"s"}`);
   };
 
@@ -833,6 +968,7 @@ function ShiftApp() {
     if(Object.keys(dayMap).length) nextTops[dateKey] = dayMap;
     else delete nextTops[dateKey];
     setTopOptions(nextTops); await persist("topOptions", nextTops);
+    trackEvent("topOption.clear", { dateKey });
     flash("Top Option removed");
   };
 
@@ -847,6 +983,7 @@ function ShiftApp() {
     const cur = topOptions[dateKey][me.id];
     const nextTops = {...topOptions, [dateKey]: {...topOptions[dateKey], [me.id]: {...cur, bid}}};
     setTopOptions(nextTops); await persist("topOptions", nextTops);
+    trackEvent("topOption.set", { dateKey, slotPref: cur.slotPref, bid });
   };
 
   // Update slot preference on the user's existing Top Option for a day.
@@ -858,6 +995,7 @@ function ShiftApp() {
     const cur = topOptions[dateKey][me.id];
     const nextTops = {...topOptions, [dateKey]: {...topOptions[dateKey], [me.id]: {...cur, slotPref: sp}}};
     setTopOptions(nextTops); await persist("topOptions", nextTops);
+    trackEvent("topOption.set", { dateKey, slotPref: sp, bid: cur.bid });
   };
 
   // Performs the actual block toggle without the cap check.
@@ -874,6 +1012,7 @@ function ShiftApp() {
       const pcur=preferences[me.id]||[];
       if(pcur.includes(k)){ const pnext={...preferences,[me.id]:pcur.filter(d=>d!==k)}; setPreferences(pnext); await persist("prefs",pnext); }
     }
+    trackEvent("unavail.toggle", { dateKey: k, blocked: !blocked });
   };
 
   const toggleUnavail = async k => {
@@ -919,6 +1058,7 @@ function ShiftApp() {
     }
     const next={...preferences,[me.id]:wanted?cur.filter(d=>d!==k):[...cur,k]};
     setPreferences(next); await persist("prefs",next);
+    trackEvent("preference.toggle", { dateKey: k, wanted: !wanted });
   };
 
   const setTargets = async (uid, targets) => await updateUser(uid, { targets });
@@ -1197,6 +1337,12 @@ function ShiftApp() {
     // Stash the deltas on the current block so "Reset block" can reverse them.
     // Phase advances to RECON — providers can no longer change availability/topOptions but can confirm/flag.
     await updateCurrentBlock({phase: PHASE.RECON, lastReconcileDeltas:deltas, pointsAtClose});
+    trackEvent("block.reconcile", {
+      blockId: currentBlock?.id != null ? String(currentBlock.id) : null,
+      awards: awarded,
+      autoCount,
+      deltas,
+    });
     flash(`✅ ${awarded.length} Top Option ${awarded.length===1?"award":"awards"} · ${autoCount} auto-filled · block now in Reconciliation`);
     setReconcilePreview(null);
     // Optional convenience: surface the block report immediately so admin can audit.
@@ -1232,6 +1378,7 @@ function ShiftApp() {
     const next = {...shifts};
     next[dateKey] = {...next[dateKey], [slotId]: {...entry, confirm: value, flagReason: value==="ok"?null:entry.flagReason}};
     setShifts(next); await persist("shifts", next);
+    if(value === "ok") trackEvent("shift.confirm", { dateKey, slotId });
   };
 
   // Returns ALL eligible swap candidates for a flagged shift, ranked by:
@@ -1321,6 +1468,7 @@ function ShiftApp() {
     next[dateKey] = {...next[dateKey], [slotId]: {...entry, confirm: "flagged", flagReason: reason || null}};
     setShifts(next); await persist("shifts", next);
     await _postListing(dateKey, slotId, 0, { autoPosted: true, flagReason: reason || null });
+    trackEvent("shift.flag", { dateKey, slotId, reason: reason || null });
     flash("⚠️ Flagged · admin notified, also posted to marketplace");
     setFlagDraft(null);
   };
@@ -1357,7 +1505,10 @@ function ShiftApp() {
     const cap = Math.max(0, Math.floor(me.points || 0));
     const inc = Math.max(0, Math.min(cap, parseInt(incentivePts)||0));
     const listing = await _postListing(dateKey, slotId, inc, {});
-    if(listing) flash(`📣 Listed${inc>0?` · ${inc} pt incentive`:""}`);
+    if(listing) {
+      trackEvent("marketplace.post", { dateKey, slotId, incentivePts: inc, listingId: listing.id });
+      flash(`📣 Listed${inc>0?` · ${inc} pt incentive`:""}`);
+    }
     setListDraft(null);
   };
 
@@ -1407,6 +1558,12 @@ function ShiftApp() {
       tradeOffers: (l.tradeOffers||[]).map(o => o.status==="pending" ? {...o, status:"stale"} : o),
     } : l);
     setMarketplace(nm); await persist("marketplace", nm);
+    trackEvent("marketplace.take", {
+      dateKey: listing.dateKey,
+      slotId: listing.slotId,
+      listingId,
+      incentivePts: listing.incentivePts,
+    });
     flash(`✅ Shift taken${listing.incentivePts>0?` · +${listing.incentivePts} pt${listing.incentivePts===1?"":"s"}`:""}`);
   };
 
@@ -1422,6 +1579,7 @@ function ShiftApp() {
       tradeOffers: (l.tradeOffers||[]).map(o => o.status==="pending" ? {...o, status:"stale"} : o),
     } : l);
     setMarketplace(nm); await persist("marketplace", nm);
+    trackEvent("marketplace.cancel", { listingId });
     flash("Listing cancelled");
   };
 
@@ -1687,23 +1845,62 @@ function ShiftApp() {
   /* ══ AUTH SCREEN ══ */
   if(!session||!me){
     const noGroupsYet = groups.length===0;
+    const cloudHelper = authMode==="cloud"
+      ? (pendingInvite
+          ? `Sign in with email to accept your invite to ${pendingInvite.groupName}.`
+          : "Sign in with email — we'll send you a one-time link.")
+      : null;
     return(
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 w-full max-w-sm p-7">
           <div className="mb-1 flex justify-center">
             <ShiftLogoStacked height={140}/>
           </div>
+          {pendingInvite && authMode!=="cloud" && (
+            <div className="mb-4 px-3 py-2.5 rounded-lg bg-blue-50 border border-blue-200 text-sm">
+              <div className="font-medium text-blue-900">You've been invited to <span className="font-semibold">{pendingInvite.groupName}</span></div>
+              <div className="text-xs text-blue-700 mt-0.5">Use the <button className="underline font-medium" onClick={()=>{setAuthMode("cloud");setAuthError("");setCloudError("");}}>Cloud</button> tab to accept.</div>
+            </div>
+          )}
           <p className="text-sm text-slate-500 mb-5">
-            {authMode==="super"?"Create a new owner account. Existing owners sign in via the Sign in tab.":(noGroupsYet?"No groups yet — an owner must create one first.":"Sign in or join your group.")}
+            {cloudHelper || (authMode==="super"?"Create a new owner account. Existing owners sign in via the Sign in tab.":(noGroupsYet?"No groups yet — an owner must create one first.":"Sign in or join your group."))}
           </p>
           <div className="flex bg-slate-100 rounded-lg p-1 mb-5">
-            {[["signin","Sign in"],["signup","Sign up"],["super","Owner"]].map(([m,l])=>(
-              <button key={m} onClick={()=>{setAuthMode(m);setAuthError("");}}
+            {[["signin","Sign in"],["signup","Sign up"],["super","Owner"],["cloud","Cloud"]].map(([m,l])=>(
+              <button key={m} onClick={()=>{setAuthMode(m);setAuthError("");setCloudError("");setMagicLinkSent(false);}}
                 className={`flex-1 py-2 text-xs font-medium rounded-md transition ${authMode===m?"bg-white shadow text-slate-900":"text-slate-500"}`}>
                 {l}
               </button>
             ))}
           </div>
+          {authMode==="cloud"?(
+            magicLinkSent ? (
+              <div className="space-y-3 text-sm">
+                <div className="px-3 py-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800">
+                  Check your inbox — we sent a sign-in link to <span className="font-medium">{cloudEmail}</span>.
+                </div>
+                <p className="text-xs text-slate-500">The link expires in 15 minutes and can only be used once. You can close this tab.</p>
+                <button onClick={()=>{setMagicLinkSent(false);setCloudError("");}}
+                  className="w-full text-xs font-medium text-slate-600 hover:text-slate-800 py-2">Send to a different email</button>
+              </div>
+            ) : (
+              <>
+                <Field label="Email"><input type="email" value={cloudEmail} autoComplete="email" autoCapitalize="none"
+                  onChange={e=>setCloudEmail(e.target.value)}
+                  onKeyDown={e=>e.key==="Enter"&&cloudEmail.trim()&&!cloudBusy&&requestMagicLink(cloudEmail, pendingInvite?.token)}
+                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500" placeholder="you@example.com"/></Field>
+                {cloudError&&<div className="text-xs text-red-600 mb-3">{cloudError}</div>}
+                <button onClick={()=>requestMagicLink(cloudEmail, pendingInvite?.token)}
+                  disabled={cloudBusy||!cloudEmail.trim()}
+                  className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium text-base transition disabled:bg-slate-300">
+                  {cloudBusy?"Sending…":(pendingInvite?"Accept invite":"Send magic link")}
+                </button>
+                <p className="text-xs text-slate-400 mt-4 text-center">
+                  Cloud sign-in is independent of your local account — both keep working.
+                </p>
+              </>
+            )
+          ):(<>
           {authMode==="signup"&&(<>
             <Field label="Group code"><input type="text" value={authForm.groupCode} autoCapitalize="characters"
               onChange={e=>setAuthForm({...authForm,groupCode:e.target.value.toUpperCase()})}
@@ -1735,6 +1932,7 @@ function ShiftApp() {
           </button>
           {authMode==="signup"&&<p className="text-xs text-slate-400 mt-4 text-center">Group and admin codes come from your group's owner.</p>}
           {authMode==="super"&&<p className="text-xs text-slate-400 mt-4 text-center">An owner bootstrap code is required to create an owner account.</p>}
+          </>)}
         </div>
         {toast&&<Toast msg={toast}/>}
       </div>
@@ -2216,7 +2414,7 @@ function ShiftApp() {
           </ul>
           <div className="flex gap-2">
             <button onClick={()=>setConfirmLock(false)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
-            <button onClick={async()=>{ await updateCurrentBlock({phase:PHASE.LOCKED}); setConfirmLock(false); flash("🔒 Block locked"); }}
+            <button onClick={async()=>{ await updateCurrentBlock({phase:PHASE.LOCKED}); trackEvent("block.lock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null }); setConfirmLock(false); flash("🔒 Block locked"); }}
               className="flex-1 py-2.5 text-sm bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-medium">Lock block</button>
           </div>
         </div>
@@ -2894,7 +3092,7 @@ function ShiftApp() {
               </button>
             );
             return (
-              <button onClick={()=>updateCurrentBlock({phase:PHASE.RECON})}
+              <button onClick={()=>{ updateCurrentBlock({phase:PHASE.RECON}); trackEvent("block.unlock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null }); }}
                 className="py-2.5 text-sm font-medium rounded-lg bg-amber-600 text-white hover:bg-amber-700">
                 🔓 Unlock (back to Reconciliation)
               </button>
@@ -4130,7 +4328,20 @@ function ShiftApp() {
         <h1 className="text-2xl font-semibold">People</h1>
         <p className="text-sm text-slate-500">Assign seniority and adjust points.</p>
       </div>
-      {me.role==="admin"&&<button onClick={()=>{setAddUserForm({name:"",username:"",email:"",role:"provider",seniorityId:""});setAddUserOpen(true);}} className="flex-shrink-0 bg-blue-600 text-white text-sm font-medium px-3 py-2 rounded-lg hover:bg-blue-700">+ Add user</button>}
+      {me.role==="admin"&&(
+        <div className="flex-shrink-0 flex items-center gap-2">
+          {/* Phase A cloud invite. Visible only when admin is signed in to cloud AND this group
+              has been mirrored to D1 (cloudGroupId set at create-time). API enforces that the
+              caller is the cloud-owner of the group; if not, flash() reports the failure. */}
+          {cloudUser&&currentGroup?.cloudGroupId&&(
+            <button onClick={()=>createCloudInvite(currentGroup.cloudGroupId)}
+              className="text-sm font-medium px-3 py-2 rounded-lg border border-blue-600 text-blue-700 hover:bg-blue-50">
+              + Invite link
+            </button>
+          )}
+          <button onClick={()=>{setAddUserForm({name:"",username:"",email:"",role:"provider",seniorityId:""});setAddUserOpen(true);}} className="bg-blue-600 text-white text-sm font-medium px-3 py-2 rounded-lg hover:bg-blue-700">+ Add user</button>
+        </div>
+      )}
     </div>
     <div className="mb-4"></div>
     <div className="space-y-2">
@@ -4282,6 +4493,13 @@ function ShiftApp() {
           <button onClick={signOut} className="text-xs sm:text-sm px-3 py-1.5 border border-slate-300 rounded-lg hover:bg-slate-50">Sign out</button>
         </div>
       </nav>
+      {/* Phase A: cloud-account strip. Visible only when signed in via magic link. */}
+      {cloudUser&&(
+        <div className="bg-blue-50 border-b border-blue-200 px-4 sm:px-6 py-1.5 flex items-center justify-between text-xs">
+          <span className="text-blue-800">Cloud: <span className="font-medium">{cloudUser.user.email}</span></span>
+          <button onClick={signOutCloud} className="text-blue-700 hover:text-blue-900 font-medium">Sign out (cloud)</button>
+        </div>
+      )}
       <main className="p-4 sm:p-6 max-w-3xl mx-auto">
         <h1 className="text-2xl font-semibold mb-1">Groups</h1>
         <p className="text-sm text-slate-500 mb-4">Every group has its own users, calendar, and settings. Share the codes with the group's members.</p>

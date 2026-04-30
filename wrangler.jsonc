@@ -1,13 +1,42 @@
-// Cloudflare Workers config for serving SHIFT as a static-asset site.
-// No server-side code — Cloudflare just serves the HTML/CSS/JS files from this
-// directory directly to visitors. Visiting the root URL hits index.html, which
-// redirects to shyft-v3.html.
+// Cloudflare Worker that fronts the static-assets binding for SHIFT.
+// Worker code (in _worker.js + ./src) handles /api/*. Everything else is served
+// straight from the directory below via the ASSETS binding (index.html → shyft-v3.html).
 //
-// Docs: https://developers.cloudflare.com/workers/static-assets/
+// Bindings:
+//   ASSETS — static files (this directory).
+//   DB     — D1 database "shift-db" (Phase A: auth + memberships).
+//   R2     — R2 bucket "shift-events" (reserved for Phase B event log; not written yet).
+//
+// Secrets (set via `wrangler secret put`):
+//   RESEND_API_KEY  — magic-link sender.
+//   SESSION_PEPPER  — random ≥32 bytes; pepper for SHA-256 over login + session tokens.
+//
+// Vars (non-secret):
+//   APP_URL    — origin used in magic-link URLs and redirects. Match your Pages subdomain.
+//   DEV_EMAIL  — set to "console" in .dev.vars to log magic links instead of sending.
 {
-  "name": "shyft",
-  "compatibility_date": "2025-04-01",
-  "assets": {
-    "directory": "./"
-  }
+	"name": "shyft",
+	"main": "_worker.js",
+	"compatibility_date": "2025-04-01",
+	"assets": {
+		"directory": "./",
+		"binding": "ASSETS"
+	},
+	"vars": {
+		"APP_URL": "https://shyft.dfurfaro13.workers.dev",
+		"DEV_EMAIL": ""
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "shift-db",
+			"database_id": "cae40c64-d63a-4351-85d8-16918d3560cd"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "R2",
+			"bucket_name": "shift-events"
+		}
+	]
 }

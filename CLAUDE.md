@@ -104,10 +104,38 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | `templates/shyft_tail.v3.html` | Runtime postamble. Just `<ReactDOM>.render()`. Don't touch. |
 | `shyft-v3.html` | Built artifact. **Never edit by hand** — gets overwritten. Cloudflare Pages serves this. |
 | `index.html` | Tiny redirect to `shyft-v3.html` so the root URL of the deployed site loads the app. |
-| `wrangler.jsonc` | Cloudflare Workers static-assets config. Used by the GitHub-Pages deploy pipeline. |
+| `wrangler.jsonc` | Cloudflare Worker config. Now also binds the API Worker (`_worker.js`), D1 (`DB`), and R2 (`R2`). |
+| `_worker.js` | Worker entrypoint. Routes `/api/*` to the API; everything else falls through to static assets via `env.ASSETS.fetch`. |
+| `src/api/` | API handlers (`auth.js`, `groups.js`) + `router.js`. Phase A only — no event/snapshot endpoints yet. |
+| `src/lib/` | Backend helpers (`db`, `session`, `cookies`, `email`, `csrf`, `ids`, `ratelimit`, `http`). |
+| `migrations/0001_init.sql` | D1 schema for Phase A: `users`, `groups`, `memberships`, `invites`, `login_tokens`, `sessions`. |
+| `migrations/0002_events.sql` | Phase B append-only event log (`events` table). |
 | `Phases for Shyft and Rules for shift assignment.docx` | The spec. Source of truth for behavior. Re-read when in doubt. |
 | `legacy/` | Archived v1/v2 source + built HTML, plus v1-era assignment-algorithm simulators (`simulate.js`, `simulate.py`). **Do not read or grep into.** |
 | `~/.claude/plans/*.md` | Planning artifacts. Look for the most recent one for context on the latest change. |
+
+---
+
+## Backend (Phase A)
+
+Phase A added a Cloudflare Worker + D1 backend for **magic-link auth and owner-issued invite links** — nothing more. localStorage is still source of truth for all scheduling data; the cloud session is purely additive.
+
+- **Deploy:** `npx wrangler deploy` (after `wrangler login`, `d1 create shift-db`, paste id into `wrangler.jsonc`, `d1 execute shift-db --remote --file=migrations/0001_init.sql`, `r2 bucket create shift-events`, and `wrangler secret put RESEND_API_KEY` + `SESSION_PEPPER`).
+- **Local dev:** `npx wrangler dev`. Create `.dev.vars` (gitignored) with `RESEND_API_KEY=...` and `DEV_EMAIL=console` to log magic links instead of sending.
+- **Email sender:** Until a custom domain is added, FROM is `onboarding@resend.dev` and only the email tied to the Resend account receives real magic links. To unblock multi-user, set `EMAIL_FROM` once a verified domain is configured.
+- **CSRF:** every state-changing API call must send `X-Requested-With: shift`. The `window.api.fetchJSON` shim in `templates/shyft_head.v3.html` adds it automatically.
+- **Sessions:** opaque `shift_sid` cookie. Server stores `SHA-256(SESSION_PEPPER + raw)`; raw value never persisted.
+- **Frontend integration points:** the cloud session lives in the `cloudUser` state alongside the existing local `session`. The Auth screen has a 4th "Cloud" tab; the SuperDashboard shows a cloud-account strip and an "Invite link" button per cloud-mirrored group. Local username/group-code login is unchanged.
+
+Phase C (snapshot sync) is not implemented.
+
+### Phase B — append-only event log
+
+Every meaningful state mutation also fires a `POST /api/events` to D1 — the primary ML training corpus. localStorage is still source of truth; the event log is parallel, fire-and-forget, and silently no-ops when the user isn't cloud-signed-in or the active group hasn't been mirrored. The component-local helper `trackEvent(type, payload, opts?)` (in `ShiftApp.v3.jsx`, near the cloud helpers) is the only call surface — search for `trackEvent(` to find every wired call site.
+
+Currently logged event types: `topOption.set`, `topOption.clear`, `preference.toggle`, `unavail.toggle`, `block.reconcile`, `block.lock`, `block.unlock`, `shift.confirm`, `shift.flag`, `marketplace.post`, `marketplace.take`, `marketplace.cancel`. The Worker rejects unknown types — to add a new event type, append to `ALLOWED_TYPES` in `src/api/events.js` first.
+
+R2 archival of the event log (originally part of the Phase B plan) is deferred — D1 is queryable directly and we'll dump monthly archives to R2 only when the corpus gets large enough to need it.
 
 ---
 
