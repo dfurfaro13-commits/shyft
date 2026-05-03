@@ -163,7 +163,37 @@ The admin "+ Add user" modal in PeoplePage now creates BOTH a local user (existi
 - **Cloud-owner bridge.** The `me` useMemo in `ShiftApp.v3.jsx` (~line 343) now derives `me.role === "super"` from `cloudUser.memberships.some(m => m.role === "owner")` when no local session is present. The auth-screen guard (~line 2154) was changed from `if(!session||!me)` to `if(!me)` so a cloud-only owner reaches SuperDashboard. Precedence is: impersonation > local session > cloud-owner bridge — a local sign-in always wins so signing in as a test user works mid-cloud-session.
 - **Owner impersonation.** Each group card in SuperDashboard has a **"👁 View as"** button → `ImpersonatePickerModal` lists admins+providers for that group (read directly from localStorage via `readGroupKey`, no group-load required) → `startImpersonate(gid, localUid)` awaits `loadGroup` then sets the `impersonate` state. State shape: `{groupId, localUid}`, persisted in `sessionStorage` under `shyft3_impersonate` so it survives reloads in the same tab. While impersonating, an amber sticky banner at the top of the main app shows "👤 Impersonating <name> · Stop" — Stop calls `stopImpersonate` which clears state, clears group context, and returns to SuperDashboard via the cloud bridge. Component-local helpers, no head-template mirror needed. **Caveat:** events fired during impersonation hit `/api/events` as if from the impersonated user — fine for test groups, revisit if real users get onboarded pre-D.3.
 
-**D.3 (deferred — ready to ship).** With D.2.5 in place, deleting the local Owner tab no longer locks the owner out (cloud-owner bridge replaces it) and deleting the local Sign in tab doesn't break test-user-switching (impersonation replaces it). D.3 itself is the cleanup pass: delete the `SUPER_BOOTSTRAP` constant (JSX preamble + `templates/shyft_head.v3.html`), the `supers` state + persistence, the `if(session?.superId)` branch in the `me` useMemo, the local-auth `super` signup paths, the Sign in / Sign up / Owner tabs from the auth screen (leaving only Cloud), and the "X owner accounts" footer line in SuperDashboard. Open question to decide before starting: whether D.3 also deletes local provider/admin sign-in entirely, or leaves it for future-Claude as a fallback. Current default = "delete only the super tab + supers, leave provider/admin local sign-in alone since impersonation already covers testing."
+**D.3 (deferred — design fixed, implementation pending).** Revised plan: do NOT delete the Sign in / Sign up tabs — instead, **rewire them to be cloud-backed** so the auth UX feels like any normal SaaS. The local Owner tab + `SUPER_BOOTSTRAP` are deleted; their replacement is an "Owner code" field on the Sign up form. Magic link survives as a secondary "email me a sign-in link" option on the Sign in tab.
+
+Confirmed design decisions (David, this session):
+
+- **Sign in identifier:** email *or* username + password. Single field accepts either.
+- **Sign in fallback:** "Or email me a sign-in link instead" link below the password field — magic-link as backup. The standalone Cloud tab goes away.
+- **Sign up:** self-service. Anyone can register with name + email + username + password. No email verification (revisit when real users onboard).
+- **Group-creation gate:** sign-up form has an optional **"Owner code"** field. Correct code → user can create groups (their `can_create_groups` flag is true). Empty/wrong code → regular user; can only join groups via invite link or group code. The owner code is a Cloudflare Worker secret (e.g. `OWNER_BOOTSTRAP_CODE`) set via `wrangler secret put`, NOT hard-coded.
+- **Owner status itself stays per-group:** the cloud-owner bridge already grants SuperDashboard access to anyone with `memberships.role = 'owner'` on at least one group. Creating a group as a `can_create_groups` user inserts that owner membership (existing flow in `src/api/groups.js:27`).
+- **Existing cloud test users preserved.** They have `password_hash` and synthetic emails — they sign in via the new Sign in tab using those emails as the identifier. Username NULL is fine; the field is nullable.
+
+Backend work (next session):
+
+- New migration `0005_users_username_owner.sql`: add `users.username TEXT` (nullable, unique-when-not-null via filtered index) and `users.can_create_groups INTEGER NOT NULL DEFAULT 0`. The existing `kind` column (`real`/`test`) stays orthogonal — `kind` is about email validity, `can_create_groups` is about authorization.
+- Update `POST /api/auth/password` to look up user by `email OR username` rather than just email. Rate-limit key still keyed off the lookup result's id+ip to avoid bypass.
+- New `POST /api/auth/signup` endpoint: validates name/email/username/password format, checks username uniqueness, hashes password (PBKDF2 same params as D.1), optionally validates `ownerCode` against `env.OWNER_BOOTSTRAP_CODE` and sets `can_create_groups`, inserts user, issues session immediately (no verification email). Rate-limited per-ip.
+- Server-side enforcement: `POST /api/groups` rejects with 403 unless caller's `can_create_groups = 1`. `POST /api/groups/:gid/migrate` likewise.
+
+Frontend work (next session):
+
+- Auth screen: 2 tabs (Sign in, Sign up) instead of 4. Both call cloud APIs.
+- Sign in: single "Email or username" field + password + "Or email me a sign-in link" anchor.
+- Sign up: name + email + username + password + "Owner code (optional)" field. On success, immediate session.
+- Delete `SUPER_BOOTSTRAP` constant (JSX preamble line ~94 + `templates/shyft_head.v3.html` line ~295).
+- Delete `supers` state + persistence + hydration + `setSupers` calls.
+- Delete `if(session?.superId)` branch in the `me` useMemo (the cloud-owner bridge replaces it; no super local-account ever exists).
+- Delete the local-auth `super` signup paths in `handleAuth` (~line 444–456) and the unused `superBootstrap` field on `authForm`.
+- Delete the "X owner accounts" footer line in SuperDashboard (~line 5205) — irrelevant once supers don't exist.
+- Local provider/admin sign-in via local Sign in tab is **also gone** under this plan since the tab gets rewired. Existing localStorage user records become inert — they don't auto-clean but the new Sign in form won't read from localStorage anymore. Cleanup of stale localStorage is a separate, future task.
+
+Open question to revisit before coding: how `cloudUser.memberships` are populated for a brand-new user who signs up but hasn't joined any group yet — `/api/me` should return `memberships: []`, and the auth screen should show a "Enter group code or accept invite" state since `me` would be null (no owner role, no local session). Need to add a third post-auth state to render that prompt.
 
 **Concurrency control.** `POST /api/snapshots` accepts `If-Match: <serverTs>` and returns 409 with the current serverTs when stale. The frontend doesn't yet send `If-Match` — backwards-compatible last-write-wins is preserved during D.1/D.2; D.3 will make it mandatory.
 
