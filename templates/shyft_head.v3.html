@@ -230,11 +230,12 @@
         { id: 2, name: "Junior", minShifts: 3 },
       ],
       // Two distinct availability rules: (1) must PREFER ≥N days, (2) may BLOCK ≤N days. Falling
-      // short on (1) costs preferredShortfallPenalty; going over on (2) costs blockOverLimitPenalty/day,
-      // and once totalPts would dip below zero, additional blocks are forbidden.
+      // short on (1) costs preferredShortfallPenalty; going over on (2) costs blockOverLimitPenalty/day.
+      // Penalties are previewed live but only deducted when admin runs Close & assign — providers
+      // can keep editing their availability up to that moment without being gated out of bidding.
       minPreferredDays: 6, minPreferredWeekendDays: 2, preferredShortfallPenalty: 1,
       maxBlockedDays: 14, maxBlockedWeekendDays: 4, blockOverLimitPenalty: 1,
-      involuntaryBonus: 1, nonPreferredBonus: 1,
+      nonPreferredBonus: 1,
     };
 
     async function sha256(s) {

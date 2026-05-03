@@ -230,11 +230,12 @@
         { id: 2, name: "Junior", minShifts: 3 },
       ],
       // Two distinct availability rules: (1) must PREFER ≥N days, (2) may BLOCK ≤N days. Falling
-      // short on (1) costs preferredShortfallPenalty; going over on (2) costs blockOverLimitPenalty/day,
-      // and once totalPts would dip below zero, additional blocks are forbidden.
+      // short on (1) costs preferredShortfallPenalty; going over on (2) costs blockOverLimitPenalty/day.
+      // Penalties are previewed live but only deducted when admin runs Close & assign — providers
+      // can keep editing their availability up to that moment without being gated out of bidding.
       minPreferredDays: 6, minPreferredWeekendDays: 2, preferredShortfallPenalty: 1,
       maxBlockedDays: 14, maxBlockedWeekendDays: 4, blockOverLimitPenalty: 1,
-      involuntaryBonus: 1, nonPreferredBonus: 1,
+      nonPreferredBonus: 1,
     };
 
     async function sha256(s) {
@@ -328,6 +329,12 @@ function ShiftApp() {
   // the current user is offering one of their shifts in exchange for someone else's listing.
   const [tradeDraft, setTradeDraft] = useState(null);
   const [session, setSession] = useState(null);
+  // Phase D: owner impersonation. {groupId, localUid} when an owner is viewing-as a local user;
+  // null otherwise. Persisted in sessionStorage so it survives reloads in the same tab. Wins
+  // over both the local session and the cloud-owner bridge in the `me` derivation below.
+  const [impersonate, setImpersonate] = useState(null);
+  // Picker UI state: {gid, gname} when the SuperDashboard's "View as user" picker is open.
+  const [impersonatePicker, setImpersonatePicker] = useState(null);
   const [authMode, setAuthMode] = useState("signin");
   const [authForm, setAuthForm] = useState({ username:"", password:"", name:"", groupCode:"", adminCode:"", superBootstrap:"" });
   const [authError, setAuthError] = useState("");
@@ -397,6 +404,11 @@ function ShiftApp() {
       try { const s = sessionStorage.getItem("shift_session"); if(s) sess = JSON.parse(s); } catch{}
       if(sess) setSession(sess);
       if(sess?.groupId){ await loadGroup(sess.groupId); }
+      // Phase D: restore impersonation. If set, also load that group's data — overrides any
+      // local-session group above because impersonation wins in the `me` derivation.
+      let imp = null;
+      try { const s = sessionStorage.getItem("shyft3_impersonate"); if(s) imp = JSON.parse(s); } catch{}
+      if(imp){ setImpersonate(imp); await loadGroup(imp.groupId); }
       setLoading(false);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -543,11 +555,29 @@ function ShiftApp() {
 
   const flash = msg => { setToast(msg); setTimeout(()=>setToast(""),2800); };
   const me = useMemo(() => {
-    if(!session) return null;
-    if(session.superId){ const s = supers.find(x=>x.id===session.superId); return s?{...s, role:"super"}:null; }
-    if(session.userId){ return users.find(u=>u.id===session.userId) || null; }
+    // Phase D: owner impersonation wins over everything. Only resolves once the matching
+    // local user is loaded (loadGroup is async); startImpersonate awaits loadGroup before
+    // setting the impersonate state, but we guard here too in case of races.
+    if(impersonate && impersonate.groupId === groupId){
+      const u = users.find(x => x.id === impersonate.localUid);
+      if(u) return {...u, impersonating: true};
+    }
+    // Local-session paths run before the cloud bridge. A local sign-in is an explicit,
+    // current action and wins over the long-lived cloud identity.
+    if(session?.superId){ const s = supers.find(x=>x.id===session.superId); if(s) return {...s, role:"super"}; }
+    if(session?.userId){ const u = users.find(u=>u.id===session.userId); if(u) return u; }
+    // Phase D bridge: fall back to cloud-owner. If signed in to cloud and own at least one
+    // cloud group, render as super. After D.3 this becomes the only path to SuperDashboard.
+    if(cloudUser?.memberships?.some(m => m.role === "owner")){
+      return {
+        id: cloudUser.user.id,
+        name: cloudUser.user.displayName || cloudUser.user.email,
+        role: "super",
+        cloudOwner: true,
+      };
+    }
     return null;
-  }, [session, users, supers]);
+  }, [session, users, supers, cloudUser, impersonate, groupId]);
   const currentGroup = useMemo(() => groupId?groups.find(g=>g.id===groupId):null, [groupId, groups]);
   const mySeniority = useMemo(() => me?.seniorityId ? config.seniorityLevels.find(l=>l.id===me.seniorityId) : null, [me, config]);
 
@@ -660,6 +690,24 @@ function ShiftApp() {
 
   const signOut = () => {
     setSession(null); sessionStorage.removeItem("shift_session");
+    setGroupId(null); setUsers([]); setConfig(DEFAULT_CONFIG); setShifts({}); setUnavailability({}); setPreferences({});
+    setPage("home");
+  };
+
+  // Phase D: owner impersonation. View-as a local user. The picker modal in SuperDashboard
+  // calls startImpersonate; the persistent banner in the main app calls stopImpersonate.
+  const startImpersonate = async (gid, localUid) => {
+    await loadGroup(gid);  // ensure users[] is populated for that group before flipping me
+    const next = {groupId: gid, localUid};
+    setImpersonate(next);
+    try { sessionStorage.setItem("shyft3_impersonate", JSON.stringify(next)); } catch {}
+    setImpersonatePicker(null);
+    setPage("home");
+  };
+  const stopImpersonate = () => {
+    setImpersonate(null);
+    try { sessionStorage.removeItem("shyft3_impersonate"); } catch {}
+    // Clear group context — the cloud-owner bridge will then put us back on SuperDashboard.
     setGroupId(null); setUsers([]); setConfig(DEFAULT_CONFIG); setShifts({}); setUnavailability({}); setPreferences({});
     setPage("home");
   };
@@ -986,10 +1034,7 @@ function ShiftApp() {
         if(getUid(entry)===uid){
           const slot=config.shiftSlots.find(s=>s.id===parseInt(sid));
           t += base*(slot?.credit||1);
-          if(isAuto(entry)){
-            t += (config.involuntaryBonus||0);
-            if(!wasPref) t += (config.nonPreferredBonus||0);
-          }
+          if(isAuto(entry) && !wasPref) t += (config.nonPreferredBonus||0);
         }
       });
     });
@@ -1041,9 +1086,12 @@ function ShiftApp() {
 
   // Capacity check used before letting a provider block another day.
   // Returns one of:
-  //   { kind:"ok" }                                — under the limit (no penalty)
-  //   { kind:"over", penalty, projected }          — over the limit, penalty would still leave totalPts ≥ 0
-  //   { kind:"forbidden", penalty, projected }     — over the limit AND totalPts would dip below 0 → block disallowed
+  //   { kind:"ok" }                                — under the limit (no extra penalty)
+  //   { kind:"over", penalty, projected }          — over the limit; surfaces the projected
+  //                                                  point cost so the caller can confirm.
+  //                                                  `projected` may be negative — we no longer
+  //                                                  forbid the action, since the penalty isn't
+  //                                                  realized until Close & assign.
   const checkBlockCapacity = (uid, dateKey) => {
     const isWk = isWeekend(dateKey);
     const a = getAvailInfo(uid);
@@ -1056,25 +1104,30 @@ function ShiftApp() {
     const extraWkOver = newWkOver - a.blockWkOver;
     const extraPenalty = (extraOver + extraWkOver) * (config.blockOverLimitPenalty||0);
     if (extraPenalty <= 0) return { kind:"ok", penalty:0 };
-    const currentTotal = totalPts(uid);
-    const projected = currentTotal - extraPenalty;
-    if (projected < 0) return { kind:"forbidden", penalty:extraPenalty, projected };
+    // Projection is informational: total bank pts minus all pending penalty (existing + this one).
+    const projected = totalPts(uid) - (a.penalty + extraPenalty);
     return { kind:"over", penalty:extraPenalty, projected };
   };
 
-  // Spendable / tiebreak points = bank balance minus availability penalties.
-  // Crucially, this does NOT include points "earned" from awards in the current block — those
-  // aren't credited until the block is locked (Phase 3 close in the spec). Until then, the user
-  // can only bid what they actually have. `getPtsEarned` is still available as a projection
-  // ("you'd earn N pts if everything sticks") and is used for display, not for bidding.
+  // Spendable / tiebreak points = the user's actual bank balance.
+  // The availability penalty is NOT subtracted here — during the Availability phase that would
+  // gate providers out of bidding before they've had a chance to mark their preferences. The
+  // penalty is instead applied as a real deduction at Close & assign (see applyReconcile), so
+  // by the time we're past AVAIL the user's points already reflect it.
+  // This also does NOT include points "earned" from awards in the current block — those aren't
+  // credited until the block is locked (Phase 3 close in the spec). `getPtsEarned` is the
+  // projection ("you'd earn N pts if everything sticks") used for display, not for bidding.
   const totalPts = uid => {
     const u = users.find(x=>x.id===uid);
-    return (u?.points||0) - getAvailInfo(uid).penalty;
+    return (u?.points||0);
   };
   // Snapshot of users.points captured at the moment signup closes, stored on the block as
   // `block.pointsAtClose = {uid: pts}`. computeReconcile uses this as the base for tiebreaks
   // so a re-reconcile (after admin reset+reclose) still ranks against entering-block points.
   // Falls back to live users.points when no snapshot exists (open signup, or legacy blocks).
+  // The pending availability penalty IS subtracted here — at the moment of reconcile we're
+  // about to apply it, so capping bid charges and ranking against the post-penalty balance
+  // ensures the deduction stays affordable (final points won't dip below 0).
   const snapshotPtsForReconcile = uid => {
     const u = users.find(x=>x.id===uid);
     const snap = currentBlock?.pointsAtClose;
@@ -1089,7 +1142,10 @@ function ShiftApp() {
   const getBlockReport = () => {
     const provs = users.filter(u => u.role === "provider");
     const totalSlots = blockDays.length * config.shiftSlots.length;
-    const SOURCES = ["pool","cascade","preferred-auto","available-auto","admin","unknown-auto","unknown-manual"];
+    // pool / pool-solo / cascade are all Top Option awards (contested winner / solo winner /
+    // cascaded into a non-preferred slot). The report folds them into a single "Top Choice"
+    // bucket — the split is internal mechanics, not something admins need to see.
+    const SOURCES = ["pool","pool-solo","cascade","preferred-auto","available-auto","admin","unknown-auto","unknown-manual"];
     const bySource = Object.fromEntries(SOURCES.map(s=>[s,0]));
     let openSlots = 0, pendingPool = 0;
     const perUser = {};
@@ -1136,6 +1192,33 @@ function ShiftApp() {
   const getDayTopOptioners = dateKey => topOptions[dateKey] || {};
   const getDayBid = (dateKey, uid) => topOptions[dateKey]?.[uid]?.bid ?? 0;
   const getDaySlotPref = (dateKey, uid) => topOptions[dateKey]?.[uid]?.slotPref ?? null;
+  // Linked Top Options — chain consecutive Top-Optioned days into one all-or-nothing group.
+  // Members of one chain share an opaque `linkId` on their topOptions entries.
+  const getLinkId = (dateKey, uid) => topOptions[dateKey]?.[uid]?.linkId || null;
+  const dayKeyOffset = (dateKey, n) => {
+    const d = parseDk(dateKey); d.setDate(d.getDate() + n);
+    return dk(d.getFullYear(), d.getMonth(), d.getDate());
+  };
+  const isLinkedToPrev = (dateKey, uid) => {
+    const lid = getLinkId(dateKey, uid);
+    return !!lid && getLinkId(dayKeyOffset(dateKey, -1), uid) === lid;
+  };
+  const isLinkedToNext = (dateKey, uid) => {
+    const lid = getLinkId(dateKey, uid);
+    return !!lid && getLinkId(dayKeyOffset(dateKey, 1), uid) === lid;
+  };
+  // Walk consecutive days sharing this user's linkId. Returns sorted dateKey array (incl this day).
+  const getLinkChain = (dateKey, uid) => {
+    const lid = getLinkId(dateKey, uid);
+    if(!lid) return [];
+    const out = [dateKey];
+    let p = dayKeyOffset(dateKey, -1);
+    while(getLinkId(p, uid) === lid){ out.unshift(p); p = dayKeyOffset(p, -1); }
+    let n = dayKeyOffset(dateKey, 1);
+    while(getLinkId(n, uid) === lid){ out.push(n); n = dayKeyOffset(n, 1); }
+    return out;
+  };
+  const newLinkId = () => `link_${Math.random().toString(36).slice(2, 8)}`;
 
   // Post-reconcile admin insight: flag days that were hard to cover.
   //   hasAuto     — at least one slot was auto-assigned (nobody volunteered for it)
@@ -1191,15 +1274,38 @@ function ShiftApp() {
   };
 
   // Walks the user away from a Top Option commitment for a day. Doesn't touch preference state.
+  // If the day was part of a link chain, fix up the remainder: end-removal leaves the rest linked;
+  // middle-removal splits into two halves (each gets a fresh linkId; size-1 halves drop linkId).
   const clearTopOption = async (dateKey) => {
     if(!me || me.role !== "provider") return;
     if(!isAvailabilityOpen(currentBlock)) { flash("⚠️ Availability is closed for this block"); return; }
     if(!inTopOption(dateKey, me.id)) return;
+    const lid = getLinkId(dateKey, me.id);
+    const chain = lid ? getLinkChain(dateKey, me.id) : [];
     const dayMap = {...(topOptions[dateKey]||{})};
     delete dayMap[me.id];
     const nextTops = {...topOptions};
     if(Object.keys(dayMap).length) nextTops[dateKey] = dayMap;
     else delete nextTops[dateKey];
+    if(chain.length){
+      const idx = chain.indexOf(dateKey);
+      const left = chain.slice(0, idx);
+      const right = chain.slice(idx + 1);
+      const leftLid = left.length >= 2 ? lid : null;
+      const rightLid = right.length >= 2 ? newLinkId() : null;
+      const stamp = (dk, newLid) => {
+        const e = nextTops[dk]?.[me.id];
+        if(!e) return;
+        if(newLid){
+          nextTops[dk] = {...nextTops[dk], [me.id]: {...e, linkId: newLid}};
+        } else {
+          const {linkId: _drop, ...rest} = e;
+          nextTops[dk] = {...nextTops[dk], [me.id]: rest};
+        }
+      };
+      for(const d of left) stamp(d, leftLid);
+      for(const d of right) stamp(d, rightLid);
+    }
     setTopOptions(nextTops); await persist("topOptions", nextTops);
     trackEvent("topOption.clear", { dateKey });
     flash("Top Option removed");
@@ -1231,6 +1337,74 @@ function ShiftApp() {
     trackEvent("topOption.set", { dateKey, slotPref: sp, bid: cur.bid });
   };
 
+  // Link `dateKey` with the next day into one all-or-nothing chain. Both must already
+  // be Top-Optioned by `me`. If either side already has a linkId, the chain absorbs
+  // the other side; if both sides have different linkIds (two existing chains), they unify
+  // under the left side's id.
+  const linkToNextDay = async (dateKey) => {
+    if(!me || me.role !== "provider") return;
+    if(!isAvailabilityOpen(currentBlock)) { flash("⚠️ Availability is closed for this block"); return; }
+    const nextKey = dayKeyOffset(dateKey, 1);
+    if(!inTopOption(dateKey, me.id) || !inTopOption(nextKey, me.id)){
+      flash("⚠️ Both days must be Top Options first"); return;
+    }
+    const aLid = getLinkId(dateKey, me.id);
+    const bLid = getLinkId(nextKey, me.id);
+    if(aLid && aLid === bLid) return;  // already linked
+    const linkId = aLid || bLid || newLinkId();
+    const nextTops = {...topOptions};
+    // Unify any existing chains on either side under the chosen id.
+    for(const dk of Object.keys(nextTops)){
+      const e = nextTops[dk]?.[me.id];
+      if(!e || !e.linkId) continue;
+      if(e.linkId === aLid || e.linkId === bLid){
+        nextTops[dk] = {...nextTops[dk], [me.id]: {...e, linkId}};
+      }
+    }
+    // Stamp the two endpoints if they weren't already in a chain.
+    for(const dk of [dateKey, nextKey]){
+      const e = nextTops[dk]?.[me.id];
+      if(!e || e.linkId === linkId) continue;
+      nextTops[dk] = {...nextTops[dk], [me.id]: {...e, linkId}};
+    }
+    setTopOptions(nextTops); await persist("topOptions", nextTops);
+    trackEvent("topOption.link", { dateKey, withDateKey: nextKey, linkId });
+    flash("🔗 Linked — all or nothing");
+  };
+
+  // Split a chain at the gap between `dateKey` and the next day. Each remaining half
+  // keeps its members linked; halves of size 1 drop linkId entirely.
+  const unlinkFromNextDay = async (dateKey) => {
+    if(!me || me.role !== "provider") return;
+    if(!isAvailabilityOpen(currentBlock)) { flash("⚠️ Availability is closed for this block"); return; }
+    const lid = getLinkId(dateKey, me.id);
+    const nextKey = dayKeyOffset(dateKey, 1);
+    if(!lid || getLinkId(nextKey, me.id) !== lid) return;
+    const chain = getLinkChain(dateKey, me.id);
+    const idx = chain.indexOf(nextKey);
+    if(idx < 1) return;
+    const left = chain.slice(0, idx);
+    const right = chain.slice(idx);
+    const leftLid = left.length >= 2 ? lid : null;
+    const rightLid = right.length >= 2 ? newLinkId() : null;
+    const nextTops = {...topOptions};
+    const stamp = (dk, newLid) => {
+      const e = nextTops[dk]?.[me.id];
+      if(!e) return;
+      if(newLid){
+        nextTops[dk] = {...nextTops[dk], [me.id]: {...e, linkId: newLid}};
+      } else {
+        const {linkId: _drop, ...rest} = e;
+        nextTops[dk] = {...nextTops[dk], [me.id]: rest};
+      }
+    };
+    for(const d of left) stamp(d, leftLid);
+    for(const d of right) stamp(d, rightLid);
+    setTopOptions(nextTops); await persist("topOptions", nextTops);
+    trackEvent("topOption.unlink", { dateKey, splitAtNext: true });
+    flash("Unlinked");
+  };
+
   // Performs the actual block toggle without the cap check.
   // Used by toggleUnavail (pre-checked) and by the confirm-modal "Continue" button.
   const _applyToggleUnavail = async k => {
@@ -1256,12 +1430,9 @@ function ShiftApp() {
       const hasWin=Object.values(shifts[k]||{}).some(e=>getUid(e)===me.id);
       if(hasWin){flash("⚠️ You're already awarded a shift this day");return;}
       if(inTopOption(k, me.id)){flash("⚠️ Drop your Top Option for this day first");return;}
-      // Cap check — blocking past the configured limit needs confirmation, or is forbidden if user is broke.
+      // Cap check — blocking past the configured limit needs confirmation. We no longer forbid:
+      // the penalty isn't realized until Close & assign, so going over just queues a future cost.
       const cap = checkBlockCapacity(me.id, k);
-      if (cap.kind === "forbidden") {
-        flash(`⚠️ No points left to spend — can't block past the limit (max ${config.maxBlockedDays} day${config.maxBlockedDays===1?"":"s"})`);
-        return;
-      }
       if (cap.kind === "over") {
         // Defer to confirm modal — actual mutation happens when the user clicks Continue.
         setConfirmBlockOver({ dateKey:k, penalty:cap.penalty, projected:cap.projected });
@@ -1301,7 +1472,7 @@ function ShiftApp() {
      Per the spec rules, runs in TWO ordered passes after pools are reconciled:
        Pass 1 — fill any open slot whose date is PREFERRED by some eligible provider.
        Pass 2 — fill any remaining open slot from providers who are AVAILABLE (not blocked, not
-                preferred either — non-preferred picks up the involuntary + non-preferred bonuses).
+                preferred either — these picks up the non-preferred bonus).
      Both passes respect the hard MAX cap: at-max providers are filtered out entirely (they don't
      just rank last — they're ineligible). Within each pass, slots iterate by date.
      Each new award is tagged `source: "preferred-auto" | "available-auto"`. */
@@ -1446,74 +1617,57 @@ function ShiftApp() {
     };
     const isAtMax = uid => { const m=maxOf(uid); return m>0 && (perUserShifts[uid]||0) >= m; };
 
-    // Build day queue: each day that has Top-Optioners and at least one open slot.
-    // Cleaning: drop Top-Optioners who are now blocked or already won another slot that day.
-    // Each item carries headlineBid = max bid among its candidates, used for ordering.
-    const queue = [];
-    for(const dateKey of blockDays){
+    // Linked Top Options that fail to sweep their full chain are revoked at the end of reconcile.
+    // We track revoked link ids here so the re-auction (after revoke) excludes the broken link's
+    // candidates without affecting that user's other (still-intact) chains or unlinked Top Options.
+    const revokedLinks = new Set();
+
+    // Run the per-day auction for one date. Idempotent on a given (result, deltas, perUserShifts)
+    // state: re-running on the same day after a revoke will only consider currently-open slots.
+    const auctionDay = (dateKey) => {
       const dayTops = topOptions[dateKey];
-      if(!dayTops || !Object.keys(dayTops).length) continue;
-      const day = result[dateKey] || {};
+      if(!dayTops || !Object.keys(dayTops).length) return;
+      const day = result[dateKey] = result[dateKey] || {};
       const cleaned = Object.entries(dayTops)
-        .map(([uidStr, info]) => ({uid: parseInt(uidStr), bid: info.bid|0, slotPref: info.slotPref ?? null}))
+        .map(([uidStr, info]) => ({
+          uid: parseInt(uidStr),
+          bid: info.bid|0,
+          slotPref: info.slotPref ?? null,
+          linkId: info.linkId || null,
+        }))
         .filter(c =>
           !isUnavail(c.uid, dateKey) &&
-          !Object.values(day).some(e => getUid(e) === c.uid)  // not already awarded a slot today
+          !(c.linkId && revokedLinks.has(c.linkId)) &&
+          !Object.values(day).some(e => getUid(e) === c.uid)
         );
-      if(!cleaned.length) continue;
+      if(!cleaned.length) return;
       const openSlots = config.shiftSlots.filter(s => !getUid(day[s.id]));
-      if(!openSlots.length) continue;
-      const headlineBid = cleaned.reduce((m, c) => Math.max(m, c.bid), 0);
-      queue.push({dateKey, cleaned, openSlotsCount: openSlots.length, headlineBid});
-    }
-    // Process highest-bid days FIRST. The user's strongest bid signals their highest-priority
-    // commitment, so we let them win that day before the at-max cap closes them out of others.
-    // Ties broken by contested-count desc (more candidates = more fairness pressure), then date asc.
-    queue.sort((a,b) =>
-      (b.headlineBid - a.headlineBid) ||
-      (b.cleaned.length - a.cleaned.length) ||
-      a.dateKey.localeCompare(b.dateKey)
-    );
-
-    for(const item of queue){
-      const { dateKey } = item;
-      const day = result[dateKey] = result[dateKey] || {};
-      // Re-evaluate open slots inside the loop in case admin pre-awarded changed things mid-day.
-      const openSlots = config.shiftSlots.filter(s => !getUid(day[s.id]));
-      if(!openSlots.length) continue;
-      // Filter at-max + already-on-day, then sort by (bid desc, effPts desc, uid asc).
-      const candidates = item.cleaned.filter(c =>
-        !isAtMax(c.uid) &&
-        !Object.values(day).some(e => getUid(e) === c.uid)
-      ).sort((a,b) => {
+      if(!openSlots.length) return;
+      const candidates = cleaned.filter(c => !isAtMax(c.uid)).sort((a,b) => {
         if(a.bid !== b.bid) return b.bid - a.bid;
         const ap = effPts(a.uid), bp = effPts(b.uid);
         if(ap !== bp) return bp - ap;
         return a.uid - b.uid;
       });
-      if(!candidates.length) continue;
-      const contested = item.cleaned.length > 1;
+      if(!candidates.length) return;
+      const contested = cleaned.length > 1;
       // Vickrey-style pricing: the top bidder pays one more than the *second-highest* bid (capped
-      // by their own bid and remaining points). Solo bidders pay 1 (the floor — there's no
-      // second-highest to outbid). This means a 7-pt bid against a 2-pt bid costs the winner 3 pts,
-      // not 7 — they pay just enough to outbid the runner-up. Encourages honest bidding without
-      // overspending.
+      // by their own bid and remaining points). A 7-pt bid against a 2-pt bid costs the winner
+      // 3 pts, not 7 — they pay just enough to outbid the runner-up. Solo bidders pay 0 — there's
+      // no one to outbid, so the bid is just a placeholder commitment.
       const secondHighestBid = candidates[1]?.bid ?? 0;
       let openLeft = [...openSlots];
-      let firstWinner = true;  // only the top bidder pays; cascaded losers (later iterations) pay 0
-      const allUids = item.cleaned.map(c => c.uid);
+      let firstWinner = true;
+      const allUids = cleaned.map(c => c.uid);
       for(const c of candidates){
         if(!openLeft.length) break;
         if(isAtMax(c.uid)) continue;
-        // Place in preferred slot if open, else first open slot (lenient cascade).
         let target = openLeft.find(s => s.id === c.slotPref);
         const cascadedSlot = !target;
         if(!target) target = openLeft[0];
         const source = cascadedSlot ? "cascade" : (contested ? "pool" : "pool-solo");
-        // Vickrey charge applies only to the highest-bid winner. Subsequent winners (filling other
-        // open slots cascade-style) pay 0 — they didn't outbid anyone.
         let charge = 0;
-        if(firstWinner){
+        if(firstWinner && contested){
           charge = Math.max(0, Math.min(secondHighestBid + 1, c.bid, Math.floor(effPts(c.uid))));
         }
         day[target.id] = {
@@ -1530,7 +1684,67 @@ function ShiftApp() {
         openLeft = openLeft.filter(s => s !== target);
         firstWinner = false;
       }
+    };
+
+    // Build initial day queue and process highest-bid days FIRST. The user's strongest bid signals
+    // their highest-priority commitment, so we let them win that day before the at-max cap closes
+    // them out of others. Ties broken by contested-count desc, then date asc.
+    const queue = [];
+    for(const dateKey of blockDays){
+      const dayTops = topOptions[dateKey];
+      if(!dayTops || !Object.keys(dayTops).length) continue;
+      const headlineBid = Object.values(dayTops).reduce((m, info) => Math.max(m, info.bid|0), 0);
+      queue.push({dateKey, headlineBid, contestedCount: Object.keys(dayTops).length});
     }
+    queue.sort((a,b) =>
+      (b.headlineBid - a.headlineBid) ||
+      (b.contestedCount - a.contestedCount) ||
+      a.dateKey.localeCompare(b.dateKey)
+    );
+    for(const item of queue) auctionDay(item.dateKey);
+
+    // Revoke pass: enforce all-or-nothing for linked chains. A chain is intact iff every member day
+    // was awarded to its uid in this reconcile pass. Broken chains have all their wins revoked
+    // (bids refunded), the freed slots get re-auctioned with that link excluded, and we iterate
+    // until no further revocations happen (cap at 5 to bound any pathological cascade).
+    const MAX_REVOKE_ITERS = 5;
+    for(let iter = 0; iter < MAX_REVOKE_ITERS; iter++){
+      // Group every chain in topOptions by linkId and count how many members were awarded.
+      const linkState = {};
+      for(const dk of Object.keys(topOptions)){
+        for(const [uidStr, info] of Object.entries(topOptions[dk]||{})){
+          if(!info.linkId || revokedLinks.has(info.linkId)) continue;
+          const uid = parseInt(uidStr);
+          const ls = linkState[info.linkId] ||= {uid, required:new Set(), wonSlots:[]};
+          ls.required.add(dk);
+          const dayShifts = result[dk] || {};
+          for(const [slotId, entry] of Object.entries(dayShifts)){
+            if(entry && entry.uid === uid){ ls.wonSlots.push({dateKey: dk, slotId}); }
+          }
+        }
+      }
+      let revokedAny = false;
+      const reAuctionDays = new Set();
+      for(const [linkId, ls] of Object.entries(linkState)){
+        const wonDays = new Set(ls.wonSlots.map(s => s.dateKey));
+        if(wonDays.size === ls.required.size) continue;  // chain intact
+        for(const {dateKey: dk, slotId} of ls.wonSlots){
+          const entry = result[dk]?.[slotId];
+          if(!entry) continue;
+          if(entry.bid){ deltas[ls.uid] = (deltas[ls.uid]||0) + entry.bid; }
+          delete result[dk][slotId];
+          const aIdx = awarded.findIndex(a => a.dateKey===dk && a.slot.id===parseInt(slotId) && a.winner===ls.uid);
+          if(aIdx>=0) awarded.splice(aIdx, 1);
+          if(perUserShifts[ls.uid]) perUserShifts[ls.uid]--;
+          reAuctionDays.add(dk);
+          revokedAny = true;
+        }
+        revokedLinks.add(linkId);
+      }
+      if(!revokedAny) break;
+      for(const dk of reAuctionDays) auctionDay(dk);
+    }
+
     // Sweep: any day that ended up with no entries gets pruned.
     for(const dateKey of Object.keys(result)){
       if(!Object.keys(result[dateKey]).length) delete result[dateKey];
@@ -1549,27 +1763,41 @@ function ShiftApp() {
     const finalShifts = auto.result;
     const autoCount = auto.newAssignments.length;
     setShifts(finalShifts); await persist("shifts",finalShifts);
-    // Top Options have served their purpose — clear them so the next round (after a reset) starts clean.
-    if(Object.keys(topOptions).length){ setTopOptions({}); await persist("topOptions", {}); }
+    // Snapshot the availability penalty for every provider BEFORE clearing topOptions —
+    // getAvailInfo unions topOptions into the preferred-day count, so we have to read the
+    // pending penalty while topOptions is still set. This is the moment the penalty becomes
+    // real: providers had the whole AVAIL phase to clear it; now it bites.
+    const availPenalties = {};
+    users.forEach(u => {
+      if(u.role!=="provider") return;
+      const p = getAvailInfo(u.id).penalty || 0;
+      if(p > 0) availPenalties[u.id] = p;
+    });
+    // Top Options are kept intact through close so an admin reset returns to the same provider
+    // input. computeReconcile is idempotent against an already-awarded day (it skips slots that
+    // are already filled), so leaving them set doesn't double-award if admin re-closes without
+    // resetting first — it just means the second close sees nothing left to do.
     // Snapshot pointsAtClose for every provider BEFORE deducting bid spend, so future re-reconciles
     // (e.g. after admin reset+reclose) tiebreak against the same entering-block balance.
     const pointsAtClose = {};
     users.forEach(u => { if(u.role==="provider") pointsAtClose[u.id] = u.points || 0; });
     // Collect open-shift incentive credits for any newly-awarded slots.
     const { credits: incCredits, nextOpenIncentives, mutated: incMutated } = collectIncentiveCredits(finalShifts);
-    if(Object.keys(deltas).length || Object.keys(incCredits).length){
+    if(Object.keys(deltas).length || Object.keys(incCredits).length || Object.keys(availPenalties).length){
       const nu = users.map(u => {
         const bidDelta = deltas[u.id] || 0;
         const incBonus = incCredits[u.id] || 0;
-        if(bidDelta === 0 && incBonus === 0) return u;
-        return {...u, points: Math.max(0, (u.points||0) + bidDelta + incBonus)};
+        const penalty = availPenalties[u.id] || 0;
+        if(bidDelta === 0 && incBonus === 0 && penalty === 0) return u;
+        return {...u, points: Math.max(0, (u.points||0) + bidDelta + incBonus - penalty)};
       });
       setUsers(nu); await persist("users",nu);
     }
     if(incMutated){ setOpenIncentives(nextOpenIncentives); await persist("openIncentives", nextOpenIncentives); }
-    // Stash the deltas on the current block so "Reset block" can reverse them.
+    // Stash the deltas on the current block so "Reset block" can reverse them. availPenalties is
+    // tracked separately so reset can restore it (and so the block report can attribute the cost).
     // Phase advances to RECON — providers can no longer change availability/topOptions but can confirm/flag.
-    await updateCurrentBlock({phase: PHASE.RECON, lastReconcileDeltas:deltas, pointsAtClose});
+    await updateCurrentBlock({phase: PHASE.RECON, lastReconcileDeltas:deltas, pointsAtClose, availPenalties});
     trackEvent("block.reconcile", {
       blockId: currentBlock?.id != null ? String(currentBlock.id) : null,
       awards: awarded,
@@ -1584,19 +1812,28 @@ function ShiftApp() {
 
   const resetBlock = async () => {
     // Clear all shifts within the current block, send phase back to availability, and
-    // reverse the last reconcile's tie-break point penalties.
+    // reverse the last reconcile's bid charges + availability penalty deductions.
     const nextShifts = {...shifts};
     let cleared = 0;
     for(const k of blockDays){ if(nextShifts[k]){ cleared += Object.keys(nextShifts[k]).length; delete nextShifts[k]; } }
     setShifts(nextShifts); await persist("shifts",nextShifts);
     const restored = currentBlock?.lastReconcileDeltas || {};
-    if(Object.keys(restored).length){
-      const nu = users.map(u=>restored[u.id]?{...u,points:Math.max(0,(u.points||0)-restored[u.id])}:u);
+    const restoredPenalties = currentBlock?.availPenalties || {};
+    const touchedUids = new Set([...Object.keys(restored), ...Object.keys(restoredPenalties)]);
+    if(touchedUids.size){
+      const nu = users.map(u => {
+        if(!touchedUids.has(String(u.id))) return u;
+        // bid deltas are stored as negative (charges), so subtracting reverses them.
+        // availPenalties are stored as positive amounts that were subtracted at close — add them back.
+        const bidDelta = restored[u.id] || 0;
+        const penalty = restoredPenalties[u.id] || 0;
+        return {...u, points: Math.max(0, (u.points||0) - bidDelta + penalty)};
+      });
       setUsers(nu); await persist("users",nu);
     }
     // Reverting to availability invalidates the entering-pts snapshot — a fresh snapshot is taken
     // when assignment runs again. Also clears the phase back to AVAIL so providers can edit.
-    await updateCurrentBlock({phase: PHASE.AVAIL, lastReconcileDeltas:{}, pointsAtClose:null});
+    await updateCurrentBlock({phase: PHASE.AVAIL, lastReconcileDeltas:{}, pointsAtClose:null, availPenalties:{}});
     setConfirmReset(false);
     flash(`↺ Block reset · ${cleared} slot${cleared===1?"":"s"} cleared · back to Availability`);
   };
@@ -1618,8 +1855,10 @@ function ShiftApp() {
   //   1. preferred-date status (preferred > available > non-preferred non-available)
   //   2. snapshot points (entering balance)
   //   3. lowest uid for determinism
-  // Eligibility: provider with seniority, not blocked, below max, not already on this day, not the
-  // current assignee. Used by the admin Flagged-shifts panel for one-click reassignment.
+  // Eligibility: provider with seniority, not blocked, not already on this day, not the current
+  // assignee. Max-cap is NOT a hard filter — at-max candidates are surfaced with an `atMax`
+  // flag so the admin can see them (especially preferred-day candidates) and override when
+  // appropriate. Used by the admin Flagged-shifts panel for one-click reassignment.
   const findSwapCandidates = (dateKey, originalUid) => {
     const liveCount = {};
     users.forEach(u => { if(u.role==="provider") liveCount[u.id] = 0; });
@@ -1631,16 +1870,20 @@ function ShiftApp() {
       if(u.role !== "provider" || !u.seniorityId) return false;
       if(u.id === originalUid) return false;
       if(isUnavail(u.id, dateKey)) return false;
-      const max = u.targets?.max || 0;
-      if(max > 0 && liveCount[u.id] >= max) return false;
       if(Object.values(shifts[dateKey]||{}).some(e => getUid(e) === u.id)) return false;
       return true;
-    }).map(u => ({
-      user: u,
-      preferred: isWanted(u.id, dateKey),
-      currentCount: liveCount[u.id] || 0,
-      snapshotPts: snapshotPtsForReconcile(u.id),
-    }));
+    }).map(u => {
+      const max = u.targets?.max || 0;
+      const currentCount = liveCount[u.id] || 0;
+      return {
+        user: u,
+        preferred: isWanted(u.id, dateKey),
+        currentCount,
+        snapshotPts: snapshotPtsForReconcile(u.id),
+        atMax: max > 0 && currentCount >= max,
+        maxTarget: max,
+      };
+    });
     candidates.sort((a,b) => {
       // Preferred providers ranked above non-preferred.
       if(a.preferred !== b.preferred) return a.preferred ? -1 : 1;
@@ -1649,6 +1892,50 @@ function ShiftApp() {
       return a.user.id - b.user.id;
     });
     return candidates;
+  };
+
+  // Returns trade suggestions for a flagged shift. A trade fits when the flagger preferred
+  // some other day in the block AND another provider currently working that other day preferred
+  // the flagged date — so swapping the two shifts lands each side on a day they wanted.
+  // Each result: { partner, partnerDateKey, partnerSlotId, partnerSlot, partnerSnapshotPts,
+  //   partnerTopOption, flaggerTopOption } where the *TopOption flags signal the strongest
+  // version of "wanted that day" (a 🎯 commitment, not just a ⭐ preference).
+  // Ranked by combined Top Option signal, then partner snapshot points, then uid.
+  const findTradeCandidates = (flaggedDateKey, originalUid) => {
+    const out = [];
+    for(const k of blockDays){
+      if(k === flaggedDateKey) continue;
+      if(!isWanted(originalUid, k)) continue;
+      // Flagger can't take partner's day if they're already working another slot there.
+      if(Object.values(shifts[k] || {}).some(e => getUid(e) === originalUid)) continue;
+      const day = shifts[k] || {};
+      for(const [sidStr, e] of Object.entries(day)){
+        const sid = parseInt(sidStr);
+        const partnerUid = getUid(e);
+        if(partnerUid == null || partnerUid === originalUid) continue;
+        const partner = users.find(u => u.id === partnerUid);
+        if(!partner || partner.role !== "provider") continue;
+        if(!isWanted(partnerUid, flaggedDateKey)) continue;
+        const slot = config.shiftSlots.find(s => s.id === sid);
+        out.push({
+          partner,
+          partnerDateKey: k,
+          partnerSlotId: sid,
+          partnerSlot: slot,
+          partnerSnapshotPts: snapshotPtsForReconcile(partnerUid),
+          partnerTopOption: inTopOption(flaggedDateKey, partnerUid),
+          flaggerTopOption: inTopOption(k, originalUid),
+        });
+      }
+    }
+    out.sort((a, b) => {
+      const aSig = (a.partnerTopOption?1:0) + (a.flaggerTopOption?1:0);
+      const bSig = (b.partnerTopOption?1:0) + (b.flaggerTopOption?1:0);
+      if(aSig !== bSig) return bSig - aSig;
+      if(a.partnerSnapshotPts !== b.partnerSnapshotPts) return b.partnerSnapshotPts - a.partnerSnapshotPts;
+      return a.partner.id - b.partner.id;
+    });
+    return out;
   };
 
   // Admin reassigns a flagged shift to a candidate. Lifts the flag, stamps source "admin-swap",
@@ -1678,6 +1965,36 @@ function ShiftApp() {
     if(nm.some((l,i) => l !== marketplace[i])){ setMarketplace(nm); await persist("marketplace", nm); }
     const newUser = users.find(u => u.id === candidateUid);
     flash(`✅ Reassigned to ${newUser?.name?.split(" ")[0] || "provider"}`);
+  };
+
+  // Admin executes a two-sided trade between the flagged shift's holder and a partner. Flips
+  // both shifts atomically, stamps source "auto-trade" on each side, clears the flag.
+  const acceptTradeCandidate = async (flaggedDateKey, flaggedSlotId, partnerDateKey, partnerSlotId) => {
+    if(!me || me.role !== "admin") { flash("⚠️ Admin only"); return; }
+    const aEntry = shifts[flaggedDateKey]?.[flaggedSlotId];
+    const bEntry = shifts[partnerDateKey]?.[partnerSlotId];
+    if(!aEntry || !bEntry) { flash("⚠️ Shift moved — refresh"); return; }
+    const flaggerUid = getUid(aEntry);
+    const partnerUid = getUid(bEntry);
+    if(flaggerUid == null || partnerUid == null || flaggerUid === partnerUid) return;
+    const ns = {...shifts};
+    ns[flaggedDateKey] = {...ns[flaggedDateKey], [flaggedSlotId]: {
+      ...aEntry, uid: partnerUid, source: "auto-trade", swappedFrom: flaggerUid, confirm: null, flagReason: null,
+    }};
+    ns[partnerDateKey] = {...ns[partnerDateKey], [partnerSlotId]: {
+      ...bEntry, uid: flaggerUid, source: "auto-trade", swappedFrom: partnerUid, confirm: null, flagReason: null,
+    }};
+    setShifts(ns); await persist("shifts", ns);
+    // Close any auto-posted listing on the flagged shift — the trade settled it.
+    const nm = marketplace.map(l =>
+      (l.dateKey === flaggedDateKey && l.slotId === flaggedSlotId && l.status === "open" && l.autoPosted)
+        ? {...l, status:"cancelled", tradeOffers:(l.tradeOffers||[]).map(o => o.status==="pending" ? {...o, status:"stale"} : o)}
+        : l
+    );
+    if(nm.some((l,i) => l !== marketplace[i])){ setMarketplace(nm); await persist("marketplace", nm); }
+    const flagger = users.find(u => u.id === flaggerUid);
+    const partner = users.find(u => u.id === partnerUid);
+    flash(`🔁 Traded · ${flagger?.name?.split(" ")[0]||"flagger"} ↔ ${partner?.name?.split(" ")[0]||"partner"}`);
   };
 
   // Admin clears a flag without swapping (e.g. provider talked to them out of band).
@@ -1752,16 +2069,12 @@ function ShiftApp() {
     if(listing.sellerId === me.id) { flash("⚠️ Can't take your own listing"); return; }
     if(me.role !== "provider") { flash("⚠️ Only providers can take shifts"); return; }
     if(!me.seniorityId) { flash("⚠️ Seniority not assigned"); return; }
-    if(isUnavail(me.id, listing.dateKey)) { flash("⚠️ You blocked this day"); return; }
+    // Note: in Reconciliation+ (the only phase where listings exist), blocked-day and max-shift
+    // caps are intentionally NOT enforced — the user is actively choosing to take this shift.
     // Already on this day? (Each provider gets at most one slot per date.)
     if(Object.values(shifts[listing.dateKey]||{}).some(e => getUid(e) === me.id)) {
       flash("⚠️ You already have a shift this day"); return;
     }
-    // Max-shift cap.
-    let myCount = 0;
-    Object.values(shifts).forEach(day => Object.values(day).forEach(e => { if(getUid(e) === me.id) myCount++; }));
-    const myMax = me.targets?.max || 0;
-    if(myMax > 0 && myCount >= myMax) { flash(`⚠️ Would exceed your max (${myMax})`); return; }
     // Verify the shift is still owned by the seller.
     const entry = shifts[listing.dateKey]?.[listing.slotId];
     if(!entry || getUid(entry) !== listing.sellerId) {
@@ -1825,7 +2138,8 @@ function ShiftApp() {
     const u = users.find(x => x.id === uid);
     if(!u || u.role !== "provider") return { ok:false, why:"Not a provider" };
     if(!u.seniorityId) return { ok:false, why:"No seniority assigned" };
-    if(isUnavail(uid, dateKey)) return { ok:false, why:"Blocked that day" };
+    // Note: blocked-day check intentionally omitted — trades happen in Reconciliation+ where the
+    // user is actively choosing to take the shift, overriding their earlier availability prefs.
     // Already on this day in another slot? (Skipping the slot they may be vacating.)
     const dayS = shifts[dateKey] || {};
     const conflict = Object.entries(dayS).some(([sidStr, e]) => {
@@ -2076,7 +2390,10 @@ function ShiftApp() {
   if(loading) return <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500">Loading…</div>;
 
   /* ══ AUTH SCREEN ══ */
-  if(!session||!me){
+  // Phase D bridge: render auth screen only when there's no `me` at all. Pre-D.3 this was
+  // `!session||!me` because `me` was always derived from `session`. Now `me` may come from
+  // a cloud-owner with no local session — checking `!session` would lock them out.
+  if(!me){
     const noGroupsYet = groups.length===0;
     const cloudHelper = authMode==="cloud"
       ? (pendingInvite
@@ -2302,7 +2619,7 @@ function ShiftApp() {
                     <div className="flex items-center justify-between gap-2">
                       <div className="min-w-0">
                         <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-brand-700">Bid</div>
-                        <div className="text-[10px] text-ink-500 mt-0.5">Max you'd spend · actual cost = next-highest bid + 1 (cap <span className="font-bold tabular-nums">{cap}</span> pt{cap===1?"":"s"})</div>
+                        <div className="text-[10px] text-ink-500 mt-0.5">Max you'd spend if contested · solo days cost 0 · actual contested cost = next-highest bid + 1 (cap <span className="font-bold tabular-nums">{cap}</span> pt{cap===1?"":"s"})</div>
                       </div>
                       <div className="flex items-center gap-1 flex-shrink-0">
                         <button type="button" onClick={()=>setBid(editingDay, myBid-1)} disabled={myBid<=0}
@@ -2319,6 +2636,51 @@ function ShiftApp() {
                         {dayTopOptCount-1} other provider{dayTopOptCount===2?"":"s"} also Top-Optioned this day.
                       </div>
                     )}
+                    {/* Link controls — bundle adjacent Top-Optioned days into all-or-nothing chains. */}
+                    {(()=>{
+                      const prevKey = dayKeyOffset(editingDay, -1);
+                      const nextKey = dayKeyOffset(editingDay, 1);
+                      const prevTopOpt = inBlock(prevKey, config) && inTopOption(prevKey, me.id);
+                      const nextTopOpt = inBlock(nextKey, config) && inTopOption(nextKey, me.id);
+                      const linkPrev = isLinkedToPrev(editingDay, me.id);
+                      const linkNext = isLinkedToNext(editingDay, me.id);
+                      const chain = (linkPrev || linkNext) ? getLinkChain(editingDay, me.id) : [];
+                      return (
+                        <div className="border-t border-brand-200 pt-2.5 space-y-1.5">
+                          <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-brand-700">🔗 All-or-nothing link</div>
+                          {chain.length > 0 && (()=>{
+                            const first = parseDk(chain[0]), last = parseDk(chain[chain.length-1]);
+                            const fmt = d => `${MONTHS_SHORT[d.getMonth()]} ${d.getDate()}`;
+                            return (
+                              <div className="text-[11px] text-brand-900 font-semibold">
+                                Linked: {fmt(first)} → {fmt(last)} · {chain.length} day{chain.length===1?"":"s"}, all or none
+                              </div>
+                            );
+                          })()}
+                          {!prevTopOpt && !nextTopOpt && (
+                            <div className="text-[10px] text-ink-500 italic">Top-Option an adjacent day to link them.</div>
+                          )}
+                          {(prevTopOpt || nextTopOpt) && (
+                            <div className="flex flex-wrap gap-1.5">
+                              {prevTopOpt && (
+                                <button type="button"
+                                  onClick={()=>linkPrev ? unlinkFromNextDay(prevKey) : linkToNextDay(prevKey)}
+                                  className={`text-[11px] font-bold px-2.5 py-1 rounded-lg border transition ${linkPrev ? "bg-brand-100 border-brand-300 text-brand-800 hover:bg-brand-200" : "bg-white border-brand-200 text-brand-700 hover:bg-brand-50"}`}>
+                                  {linkPrev ? "× Unlink prev day" : "🔗 Link with prev day"}
+                                </button>
+                              )}
+                              {nextTopOpt && (
+                                <button type="button"
+                                  onClick={()=>linkNext ? unlinkFromNextDay(editingDay) : linkToNextDay(editingDay)}
+                                  className={`text-[11px] font-bold px-2.5 py-1 rounded-lg border transition ${linkNext ? "bg-brand-100 border-brand-300 text-brand-800 hover:bg-brand-200" : "bg-white border-brand-200 text-brand-700 hover:bg-brand-50"}`}>
+                                  {linkNext ? "× Unlink next day" : "🔗 Link with next day"}
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
                 );
               })()}
@@ -2347,7 +2709,7 @@ function ShiftApp() {
                       </div>
                       <div className="text-xs text-slate-500">
                         {slot.credit}× · {earned.toFixed(earned%1?2:0)} pts
-                        {auto&&(()=>{ const wasPref=winnerUid&&(preferences[winnerUid]||[]).includes(editingDay); const b1=config.involuntaryBonus||0, b2=wasPref?0:(config.nonPreferredBonus||0); return (b1+b2)>0?<span className="text-blue-600"> + {b1+b2} bonus{b2>0?<span className="text-[10px]"> ({b1}+{b2} non-pref)</span>:null}</span>:null; })()}
+                        {auto&&(()=>{ const wasPref=winnerUid&&(preferences[winnerUid]||[]).includes(editingDay); const b=wasPref?0:(config.nonPreferredBonus||0); return b>0?<span className="text-blue-600"> + {b} non-pref bonus</span>:null; })()}
                       </div>
                     </div>
                     {winner?(
@@ -2493,8 +2855,8 @@ function ShiftApp() {
   };
 
   // Confirm modal shown when the provider is about to block past their allowed limit.
-  // The cap check (checkBlockCapacity) already verified totalPts wouldn't go below 0;
-  // this modal lets them choose to "spend" a point on this extra block.
+  // The penalty isn't realized until the admin runs Close & assign — this modal previews the
+  // cost so the provider can opt in knowingly. Bidding is unaffected up to that moment.
   const ConfirmBlockOverModal = () => {
     if(!confirmBlockOver) return null;
     const { dateKey, penalty, projected } = confirmBlockOver;
@@ -2511,14 +2873,14 @@ function ShiftApp() {
             Blocking <span className="font-semibold">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}</span> will exceed your {limitLabel} limit of <span className="font-semibold">{limitVal}</span> day{limitVal===1?"":"s"}.
           </p>
           <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-4">
-            <div className="text-xs font-bold uppercase tracking-wider text-amber-800 mb-1">Cost</div>
+            <div className="text-xs font-bold uppercase tracking-wider text-amber-800 mb-1">Will deduct at close</div>
             <div className="text-sm text-amber-900">
-              <span className="font-bold">−{penalty}</span> point{penalty===1?"":"s"} · your total would drop to <span className="font-bold tabular-nums">{projected.toFixed(1)}</span>
+              <span className="font-bold">−{penalty}</span> point{penalty===1?"":"s"} when admin runs Close &amp; assign · your total would land at <span className="font-bold tabular-nums">{projected.toFixed(1)}</span>
             </div>
           </div>
           <div className="flex gap-2">
             <button onClick={()=>setConfirmBlockOver(null)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-semibold text-ink-700">Cancel</button>
-            <button onClick={async ()=>{ const k = confirmBlockOver.dateKey; setConfirmBlockOver(null); await _applyToggleUnavail(k); }} className="flex-1 py-2.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-semibold">Continue & spend point</button>
+            <button onClick={async ()=>{ const k = confirmBlockOver.dateKey; setConfirmBlockOver(null); await _applyToggleUnavail(k); }} className="flex-1 py-2.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-semibold">Continue, accept cost</button>
           </div>
         </div>
       </div>
@@ -2526,7 +2888,7 @@ function ShiftApp() {
   };
 
   // Block Report — admin-facing breakdown of how every slot in the active block was filled,
-  // bucketed by source (pool / cascade / preferred-auto / available-auto / admin / open / pool-pending),
+  // bucketed by source (Top Choice [pool/pool-solo/cascade] / preferred-auto / available-auto / admin / open / pool-pending),
   // plus a per-provider table comparing each provider's total against their min / ideal / max targets.
   // Pure read of current state — safe to open at any phase.
   const BlockReportModal = () => {
@@ -2534,13 +2896,14 @@ function ShiftApp() {
     const r = getBlockReport();
     const { totalSlots, bySource, openSlots, pendingPool, perUserRows } = r;
     const filledCount = totalSlots - openSlots - pendingPool;
-    // Source labels + colors. Order = display order.
+    // Source labels + colors. Order = display order. Top Choice rolls up pool/pool-solo/cascade
+    // (all three are Top Option awards).
+    const topChoiceCount = (bySource["pool"]||0) + (bySource["pool-solo"]||0) + (bySource["cascade"]||0);
     const SRC_META = [
-      { key:"pool",            label:"Filled from pools",        color:"text-blue-700",   bg:"bg-blue-50",   border:"border-blue-100" },
-      { key:"cascade",         label:"Filled by cascade",        color:"text-indigo-700", bg:"bg-indigo-50", border:"border-indigo-100" },
-      { key:"preferred-auto",  label:"Auto-filled (preferred)",  color:"text-emerald-700",bg:"bg-emerald-50",border:"border-emerald-100" },
-      { key:"available-auto",  label:"Auto-filled (available)",  color:"text-amber-700",  bg:"bg-amber-50",  border:"border-amber-100" },
-      { key:"admin",           label:"Filled by admin",          color:"text-slate-700",  bg:"bg-slate-100", border:"border-slate-200" },
+      { key:"top-choice",      label:"Filled by Top Choice",     count: topChoiceCount,                color:"text-blue-700",   bg:"bg-blue-50",   border:"border-blue-100" },
+      { key:"preferred-auto",  label:"Auto-filled (preferred)",  count: bySource["preferred-auto"]||0, color:"text-emerald-700",bg:"bg-emerald-50",border:"border-emerald-100" },
+      { key:"available-auto",  label:"Auto-filled (available)",  count: bySource["available-auto"]||0, color:"text-amber-700",  bg:"bg-amber-50",  border:"border-amber-100" },
+      { key:"admin",           label:"Filled by admin",          count: bySource["admin"]||0,          color:"text-slate-700",  bg:"bg-slate-100", border:"border-slate-200" },
     ];
     const unknownTotal = (bySource["unknown-auto"]||0) + (bySource["unknown-manual"]||0);
     return(
@@ -2562,7 +2925,7 @@ function ShiftApp() {
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                 {SRC_META.map(m => (
                   <div key={m.key} className={`${m.bg} ${m.border} border rounded-xl p-3`}>
-                    <div className={`text-2xl font-extrabold tabular-nums ${m.color}`}>{bySource[m.key]||0}</div>
+                    <div className={`text-2xl font-extrabold tabular-nums ${m.color}`}>{m.count}</div>
                     <div className="text-[11px] text-ink-700 leading-tight mt-0.5">{m.label}</div>
                   </div>
                 ))}
@@ -2596,8 +2959,7 @@ function ShiftApp() {
                         <th className="text-left py-2 px-2">Provider</th>
                         <th className="text-right py-2 px-1.5" title="Total awarded shifts">Total</th>
                         <th className="text-right py-2 px-1.5" title="Min / Ideal / Max">M / I / Mx</th>
-                        <th className="text-right py-2 px-1.5" title="Top Option wins">Top</th>
-                        <th className="text-right py-2 px-1.5" title="Cascaded into other slot">Casc</th>
+                        <th className="text-right py-2 px-1.5" title="Top Choice wins (contested, solo, and cascaded)">Top</th>
                         <th className="text-right py-2 px-1.5" title="Preferred-day auto">Pref</th>
                         <th className="text-right py-2 px-1.5" title="Available-day auto">Avail</th>
                         <th className="text-right py-2 px-1.5" title="Admin manual">Adm</th>
@@ -2615,8 +2977,7 @@ function ShiftApp() {
                               <span className={belowMin ? "text-red-600" : atMax ? "text-amber-600" : aboveIdeal ? "text-emerald-700" : "text-ink-900"}>{row.total}</span>
                             </td>
                             <td className="py-2 px-1.5 text-right tabular-nums text-[11px] text-ink-500">{row.min}/{row.ideal||"—"}/{row.max||"—"}</td>
-                            <td className="py-2 px-1.5 text-right tabular-nums text-blue-700">{row.pool||0}</td>
-                            <td className="py-2 px-1.5 text-right tabular-nums text-indigo-700">{row.cascade||0}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-blue-700">{(row.pool||0) + (row["pool-solo"]||0) + (row.cascade||0)}</td>
                             <td className="py-2 px-1.5 text-right tabular-nums text-emerald-700">{row["preferred-auto"]||0}</td>
                             <td className="py-2 px-1.5 text-right tabular-nums text-amber-700">{row["available-auto"]||0}</td>
                             <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{row.admin||0}</td>
@@ -2650,7 +3011,7 @@ function ShiftApp() {
         if(getUid(e)) slotCount++;
       }
     }
-    // Count days with active Top Options (will be cleared on reset).
+    // Count days with active Top Options — these are kept on reset so providers don't have to re-enter.
     const poolCount = Object.keys(topOptions).filter(k => blockDays.includes(k) && Object.keys(topOptions[k]||{}).length > 0).length;
     const deltaCount = Object.keys(config.lastReconcileDeltas||{}).length;
     return(
@@ -2661,9 +3022,8 @@ function ShiftApp() {
           <p className="text-sm text-slate-600 mb-3">This will clear everything on the calendar for the current block and reopen signup so you can run assignments again.</p>
           <ul className="text-sm text-slate-700 space-y-1 mb-4 list-disc list-inside">
             <li><span className="font-medium">{slotCount}</span> awarded slot{slotCount===1?"":"s"} will be cleared.</li>
-            <li><span className="font-medium">{poolCount}</span> pending Top Option date{poolCount===1?"":"s"} will be cleared.</li>
             <li>{deltaCount>0?<><span className="font-medium">{deltaCount}</span> user{deltaCount===1?"":"s"} will have winning bids refunded.</>:"No winning bids to refund."}</li>
-            <li>Availability, preferences, and targets are <span className="font-medium">kept</span>.</li>
+            <li>Availability, preferences, targets, and <span className="font-medium">{poolCount} Top Option choice{poolCount===1?"":"s"}</span> are <span className="font-medium">kept</span>.</li>
           </ul>
           <div className="flex gap-2">
             <button onClick={()=>setConfirmReset(false)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
@@ -2725,10 +3085,6 @@ function ShiftApp() {
             {preferredCount>0 ? <> ({preferredCount} provider{preferredCount===1?"":"s"} preferred this date and {preferredCount===1?"is":"are"} below max)</> : candidates.length>0 ? <> ({candidates.length} eligible provider{candidates.length===1?"":"s"} below max)</> : <> (no obvious swap candidates — admin will need to handle manually)</>},
             and your shift is posted to the marketplace so anyone eligible can take it.
           </div>
-          <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider block mb-1.5">Reason (optional)</label>
-          <textarea value={reasonState} onChange={e=>setReasonState(e.target.value)} rows={2}
-            placeholder="Conflict, sickness, etc."
-            className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white mb-4 resize-none focus:outline-none focus:border-brand-400"/>
           <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider block mb-1.5">Reason (optional)</label>
           <textarea value={reasonState} onChange={e=>setReasonState(e.target.value)} rows={2}
             placeholder="Conflict, sickness, etc."
@@ -3064,7 +3420,7 @@ function ShiftApp() {
             <p><span className="font-semibold text-slate-900">2. Mark preferred dates to work.</span> On the Availability page, star any days you'd prefer. Auto-assign uses this to fill leftover slots.</p>
             <p><span className="font-semibold text-slate-900">3. Set Top Options for the days you really want.</span> On the Schedule page, pick <span className="font-semibold text-slate-900">🎯 Top Option</span> for any day you're committing to. You'll choose a slot preference (Primary / Backup / Either) and a bid — defaults to <span className="font-semibold text-slate-900">1 point</span>, but you can bid higher (up to your current points) to outweigh other Top-Optioners on the same day.</p>
             <p><span className="font-semibold text-slate-900">4. Block what you can't.</span> Optionally classify (Working, Vacation, Conference, Personal Conflict). You may block up to {config.maxBlockedDays} days ({config.maxBlockedWeekendDays} weekend) — going over costs a point per extra day. You also need to prefer at least {config.minPreferredDays} days ({config.minPreferredWeekendDays} weekend) or lose points.</p>
-            <p><span className="font-semibold text-slate-900">5. Settled at close.</span> When the admin closes the window, contested days go to the <span className="font-semibold text-slate-900">highest bidder</span> (ties fall to highest current points). The winner pays the <span className="font-semibold text-slate-900">next-highest bid + 1</span> — never their full bid. So bidding 7 against a 2 costs you 3, not 7. Solo Top Options cost 1.</p>
+            <p><span className="font-semibold text-slate-900">5. Settled at close.</span> When the admin closes the window, contested days go to the <span className="font-semibold text-slate-900">highest bidder</span> (ties fall to highest current points). The winner pays the <span className="font-semibold text-slate-900">next-highest bid + 1</span> — never their full bid. So bidding 7 against a 2 costs you 3, not 7. Solo Top Options cost 0.</p>
           </div>
           <button onClick={()=>setShowOnboarding(false)} className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium">Got it</button>
         </div>
@@ -3146,7 +3502,9 @@ function ShiftApp() {
             // When filter is on, check if the selected user is on this day (awarded or has Top Option).
             const filterHit=filterUid?awarded.some(x=>x.uid===filterUid)||inTopOption(key, filterUid):false;
             const dimmed=filterUid&&inB&&!filterHit;
-            const bg=!inB?"bg-slate-50":myUn?"bg-red-100":hol?"bg-green-100":pts===0?"bg-blue-50":pts===1?"bg-blue-100":pts===2?"bg-amber-100":pts===3?"bg-amber-200":"bg-amber-300";
+            // v3.1: simplified palette — red=blocked, green=preferred/top-option, orange=available.
+            // Points are no longer encoded in the cell bg; they appear as a number in the top-right corner.
+            const bg=!inB?"bg-slate-50":myUn?"bg-red-100":(myWant||myTop)?"bg-emerald-100":"bg-orange-100";
             const insights = dayInsights(key);
             const adminChallenging = !!insights?.challenging;
             const adminHasAuto = !!insights?.hasAuto;
@@ -3161,29 +3519,44 @@ function ShiftApp() {
                   <span className="font-semibold text-slate-700 text-xs flex items-center gap-0.5 min-w-0">
                     {adminChallenging&&<span className="text-orange-600" title="Hard to fill — nobody preferred, most blocked, all slots auto-assigned">⚠</span>}
                     <span>{d}</span>
-                    {/* v3.1 inline state markers: 🎯 Top Option (blue) > ⭐ Preferred (emerald) > ✕ Blocked (red).
-                        These are read-only indicators — tap the cell to open DaySheet for changes. */}
-                    {me.role==="provider"&&inB&&availPhase&&(
-                      myTopRaw ? <span className="leading-none text-[12px] sm:text-[13px] text-blue-600" title="Top Option · tap to edit">🎯</span>
-                      : myWantRaw ? <span className="leading-none text-[12px] sm:text-[13px] text-emerald-500" title="Preferred · tap to edit">★</span>
-                      : myUnRaw ? <span className="leading-none text-[10px] sm:text-[11px] font-bold text-red-600" title="Blocked · tap to edit">✕</span>
-                      : null
-                    )}
                   </span>
                   <span className="flex items-center gap-0.5 flex-shrink-0">
                     {adminHasAuto&&!adminChallenging&&<span className="text-[9px] text-amber-600" title="Contains auto-assigned slots">⚙</span>}
                     {availPhase && me.role==="admin" && dayTopCount>0 && <span className="text-[9px] text-blue-600 font-bold" title={`${dayTopCount} Top Option${dayTopCount===1?"":"s"}`}>🎯{dayTopCount}</span>}
-                    {pts>0&&<span className="text-[9px] text-slate-500">+{pts}</span>}
+                    {pts>0&&<span className="text-xs sm:text-sm font-semibold text-slate-700 tabular-nums">+{pts}</span>}
                   </span>
                 </div>
                 {hol&&<div className="text-[8px] text-green-800 truncate leading-tight mt-0.5">{hol}</div>}
-                {!inB?null:myUn?(
+                {!inB ? null : (me.role==="provider" && availPhase) ? (
+                  // v3.1 inline pickers — providers set state directly from the calendar.
+                  // 🎯 opens DaySheet (needs bid + slot pref); ★ and ✕ toggle in place.
+                  // Tap an active icon to clear back to Available (no icon = default state).
+                  <div className="flex-1 flex items-center justify-center gap-1 sm:gap-1.5">
+                    <button type="button"
+                      onClick={(e)=>{e.stopPropagation(); setEditingDay(key);}}
+                      title={myTopRaw?"Top Option · tap to edit or clear":"Tap to set as Top Option"}
+                      className={`w-5 h-5 sm:w-7 sm:h-7 rounded-full flex items-center justify-center text-[10px] sm:text-[14px] leading-none transition ${myTopRaw?"bg-blue-100 text-blue-600 ring-1 ring-blue-300":"text-slate-300 hover:text-slate-600 hover:bg-white/60"}`}>
+                      🎯
+                    </button>
+                    <button type="button"
+                      onClick={async(e)=>{e.stopPropagation(); if(myWantRaw){ await togglePreference(key);} else { if(myTopRaw) await clearTopOption(key); if(myUnRaw) await toggleUnavail(key); await togglePreference(key);} }}
+                      title={myWantRaw?"Preferred · tap to clear":"Tap to mark Preferred"}
+                      className={`w-5 h-5 sm:w-7 sm:h-7 rounded-full flex items-center justify-center text-[12px] sm:text-[15px] leading-none transition ${myWantRaw?"bg-amber-100 text-amber-500 ring-1 ring-amber-300":"text-slate-300 hover:text-slate-600 hover:bg-white/60"}`}>
+                      ★
+                    </button>
+                    <button type="button"
+                      onClick={async(e)=>{e.stopPropagation(); if(myUnRaw){ await toggleUnavail(key);} else { if(myTopRaw) await clearTopOption(key); if(myWantRaw) await togglePreference(key); await toggleUnavail(key);} }}
+                      title={myUnRaw?"Blocked · tap to clear":"Tap to mark Blocked"}
+                      className={`w-5 h-5 sm:w-7 sm:h-7 rounded-full flex items-center justify-center text-[10px] sm:text-[13px] font-bold leading-none transition ${myUnRaw?"bg-red-100 text-red-600 ring-1 ring-red-300":"text-slate-300 hover:text-slate-600 hover:bg-white/60"}`}>
+                      ✕
+                    </button>
+                  </div>
+                ) : myUn ? (
                   <div className="flex-1 flex items-center justify-center">
                     <span className="text-[10px] sm:text-[11px] font-bold text-red-700">✕ BLOCKED</span>
                   </div>
-                ):(
-                  // Read-only per-slot chips. The "Open" chip is no longer a join button —
-                  // Top Option commitment lives at the day level and is set via DaySheet (or list view).
+                ) : (
+                  // Awarded shifts (recon/locked) or admin-view open-slot labels.
                   <div className="flex-1 flex flex-col justify-center w-full gap-0.5 overflow-hidden py-0.5">
                     {config.shiftSlots.map(s=>{
                       const entry=dayS[s.id];
@@ -3212,10 +3585,10 @@ function ShiftApp() {
           })}
         </div>
         <div className="flex flex-wrap gap-x-3 gap-y-1 mt-3 text-[11px] text-slate-500">
-          <Legend color="bg-blue-50" label="0 pts"/><Legend color="bg-blue-100" label="+1"/>
-          <Legend color="bg-amber-100" label="+2"/><Legend color="bg-amber-200" label="+3"/><Legend color="bg-amber-300" label="+4"/>
+          <Legend color="bg-orange-100" label="Available"/>
+          {me.role==="provider"&&<Legend color="bg-emerald-100" label="Preferred / Top Option"/>}
           {me.role==="provider"&&<Legend color="bg-red-100" label="Blocked"/>}
-          {me.role==="provider"&&<span className="flex items-center gap-1"><span className="text-emerald-500">⭐</span>Preferred</span>}
+          {me.role==="provider"&&<span className="flex items-center gap-1"><span className="text-amber-500">★</span>Preferred</span>}
           {me.role==="provider"&&<span className="flex items-center gap-1"><span className="text-blue-600">🎯</span>Top Option</span>}
           {me.role==="provider"&&<Legend ring="ring-2 ring-blue-400" label="Your Top Option"/>}
           <Legend ring="ring-2 ring-green-500" label="Awarded"/>
@@ -3246,7 +3619,7 @@ function ShiftApp() {
           const myShift=me.role==="provider"&&Object.values(dayS).some(e=>getUid(e)===me.id);
           const filled=Object.values(dayS).filter(e=>getUid(e)).length, total=config.shiftSlots.length;
           const myWant=me.role==="provider"&&isWanted(me.id,k);
-          const pillBg=base===0?"bg-slate-100 text-slate-600":base===1?"bg-blue-100 text-blue-700":base===2?"bg-amber-100 text-amber-800":base===3?"bg-amber-200 text-amber-900":"bg-amber-300 text-amber-900";
+          const pillBg="bg-slate-100 text-slate-700";
           const insights=dayInsights(k);
           const adminChallenging=!!insights?.challenging;
           const adminHasAuto=!!insights?.hasAuto;
@@ -3260,7 +3633,7 @@ function ShiftApp() {
               <div className="flex-1 min-w-0">
                 <div className="flex flex-wrap items-center gap-1.5 mb-0.5">
                   <span className="font-medium text-sm">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}{myWant?<span className="text-emerald-500 ml-0.5">⭐</span>:""}</span>
-                  {base>0&&<span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${pillBg}`}>+{base}</span>}
+                  {base>0&&<span className={`text-[11px] px-1.5 py-0.5 rounded-full font-semibold tabular-nums ${pillBg}`}>+{base}</span>}
                   {hol&&<span className="text-[10px] bg-green-100 text-green-800 px-1.5 py-0.5 rounded-full truncate">{hol}</span>}
                   {myUn&&<span className="text-[10px] bg-red-200 text-red-900 px-1.5 py-0.5 rounded-full font-semibold">✕ Blocked</span>}
                   {adminChallenging&&(
@@ -3307,21 +3680,26 @@ function ShiftApp() {
   /* ══ PAGES ══ */
   const ProviderHome = () => {
     const earned=getPtsEarned(me.id), count=getShiftCount(me.id), autoC=getAutoCount(me.id);
-    const avail=getAvailInfo(me.id), total=me.points+earned-avail.penalty;
+    const avail=getAvailInfo(me.id);
+    // Penalty is only a forecast during AVAIL — once we're past Close & assign it's already
+    // been deducted from me.points, so don't double-subtract.
+    const pendingPenalty = isAvailabilityOpen(currentBlock) ? avail.penalty : 0;
+    const total = me.points + earned - pendingPenalty;
     const min=mySeniority?.minShifts||0, rem=Math.max(0,min-count);
     return(<>
       <h1 className="text-2xl font-semibold mb-1">Hi, {me.name.split(" ")[0]}</h1>
       <p className="text-sm text-slate-500 mb-5">
         {mySeniority?<>Set as <span className="font-medium text-slate-700">{mySeniority.name}</span> · min {min} shifts</>:<span className="text-amber-600">Waiting for admin to assign your seniority.</span>}
       </p>
-      {autoC>0&&(()=>{ const npc=getAutoNonPrefCount(me.id); const autoBonus=autoC*(config.involuntaryBonus||0), npBonus=npc*(config.nonPreferredBonus||0); return (
+      {autoC>0&&(()=>{ const npc=getAutoNonPrefCount(me.id); const npBonus=npc*(config.nonPreferredBonus||0); return (
         <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 mb-3 text-sm">
           <span className="font-medium text-blue-900">⚙ {autoC} auto-assigned shift{autoC>1?"s":""}</span>
-          <span className="text-blue-700"> (+{autoBonus+npBonus} bonus pts{npc>0?<span className="text-[11px]"> · {autoBonus} auto + {npBonus} non-pref</span>:null})</span>
+          {npBonus>0&&<span className="text-blue-700"> (+{npBonus} non-pref bonus pts)</span>}
         </div>
       );})()}
-      {/* Provider alert: preferred-day shortfall. Cleaner card frame with prominent header,
-          warning glyph, and a red callout for the specifics. Matches the admin Alerts aesthetic. */}
+      {/* Provider alert: preferred-day shortfall. The penalty is a forecast while the block is
+          still in Availability — admin's Close & assign is what realizes it. After that we keep
+          the alert visible but reframe it as historical info. */}
       {!avail.meets&&currentBlock&&(
         <div className="bg-surface rounded-2xl shadow-card border border-slate-200/70 p-5 sm:p-6 mb-3">
           <div className="flex items-start gap-3">
@@ -3331,7 +3709,7 @@ function ShiftApp() {
               <div className="mt-2 bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-900 space-y-1">
                 {avail.dayShort>0&&<div>Need <span className="font-bold tabular-nums">{avail.dayShort}</span> more Top Option{avail.dayShort===1?"":"s"} or preferred day{avail.dayShort===1?"":"s"}.</div>}
                 {avail.wkShort>0&&<div>Need <span className="font-bold tabular-nums">{avail.wkShort}</span> more weekend day{avail.wkShort===1?"":"s"}.</div>}
-                <div className="pt-1 font-bold">Current penalty: −{avail.penalty} pt{avail.penalty===1?"":"s"}</div>
+                <div className="pt-1 font-bold">{isAvailabilityOpen(currentBlock)?"Will deduct at close":"Deducted at close"}: −{avail.penalty} pt{avail.penalty===1?"":"s"}</div>
               </div>
             </div>
           </div>
@@ -3466,7 +3844,7 @@ function ShiftApp() {
             <button onClick={()=>setConfirmReset(true)} className="w-full py-2 text-xs font-medium rounded-lg border border-red-200 text-red-700 hover:bg-red-50">
               ↺ Reset block
             </button>
-            <p className="text-[11px] text-slate-500 mt-1.5">Clears all awards and Top Options for this block and reopens signup. Refunds any winning bids charged in the last assignment. Keeps availability, preferences, and targets.</p>
+            <p className="text-[11px] text-slate-500 mt-1.5">Clears all awards for this block and reopens signup. Refunds any winning bids charged in the last assignment. Keeps availability, preferences, targets, and Top Option choices.</p>
           </div>
         )}
       </div>
@@ -3489,6 +3867,7 @@ function ShiftApp() {
               {failingAvail.length>0&&(
                 <div className="bg-red-50 border border-red-200 rounded-xl p-3">
                   <div className="font-semibold text-red-900 text-sm mb-1">{failingAvail.length} not meeting availability requirements</div>
+                  <div className="text-[11px] text-red-700/80 mb-1">{isAvailabilityOpen(currentBlock)?"Penalties below will be deducted at Close & assign.":"Penalties below were deducted at Close & assign."}</div>
                   <ul className="text-xs text-red-800 space-y-0.5">{failingAvail.map(u=>{
                     const a=getAvailInfo(u.id);
                     const parts=[];
@@ -3525,7 +3904,9 @@ function ShiftApp() {
             <div className="space-y-3">{flagged.map(({dateKey, slotId, slot, entry, originalUid})=>{
               const date = parseDk(dateKey);
               const original = users.find(u => u.id === originalUid);
+              const trades = findTradeCandidates(dateKey, originalUid).slice(0, 4);
               const candidates = findSwapCandidates(dateKey, originalUid).slice(0, 5);
+              const flaggerFirst = original?.name?.split(" ")[0] || "flagger";
               return (
                 <div key={`${dateKey}_${slotId}`} className="bg-red-50/60 border border-red-200 rounded-xl p-3">
                   <div className="flex items-start justify-between gap-2 mb-2">
@@ -3542,9 +3923,43 @@ function ShiftApp() {
                       Clear flag
                     </button>
                   </div>
-                  {candidates.length === 0
-                    ? <div className="bg-white border border-slate-200 rounded-lg p-2.5 text-xs text-slate-600">No eligible swap candidates. The shift is on the marketplace — admin or provider must reassign manually.</div>
-                    : <div className="space-y-1">
+                  {/* Suggested trades — both sides land on a day they wanted. */}
+                  {trades.length > 0 && (
+                    <div className="space-y-1 mb-2">
+                      <div className="text-[10px] font-bold text-blue-700 uppercase tracking-wider mb-1">🔁 Suggested trades</div>
+                      {trades.map(t => {
+                        const tDate = parseDk(t.partnerDateKey);
+                        const partnerFirst = t.partner.name?.split(" ")[0] || "partner";
+                        return (
+                          <div key={`${t.partner.id}_${t.partnerDateKey}_${t.partnerSlotId}`} className="bg-white border border-blue-200 rounded-lg p-2.5 flex items-center gap-2.5">
+                            <div className="w-9 h-9 rounded-full text-white flex items-center justify-center text-xs font-semibold flex-shrink-0" style={{background:COLORS[t.partner.id%COLORS.length]}}>{initials(t.partner.name)}</div>
+                            <div className="flex-1 min-w-0">
+                              <div className="text-xs font-medium text-ink-900 truncate">{t.partner.name}</div>
+                              <div className="text-[10px] text-slate-600 mt-0.5 leading-snug">
+                                {partnerFirst} takes <span className="font-semibold">{slot?.name} {MONTHS_SHORT[date.getMonth()]} {date.getDate()}</span>, {flaggerFirst} takes <span className="font-semibold">{t.partnerSlot?.name} {MONTHS_SHORT[tDate.getMonth()]} {tDate.getDate()}</span>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500 mt-1">
+                                {t.flaggerTopOption
+                                  ? <span className="bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-bold" title={`${flaggerFirst} marked this day 🎯 Top Option`}>{flaggerFirst} 🎯</span>
+                                  : <span className="bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded font-bold">{flaggerFirst} ⭐</span>}
+                                {t.partnerTopOption
+                                  ? <span className="bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-bold" title={`${partnerFirst} marked the flagged day 🎯 Top Option`}>{partnerFirst} 🎯</span>
+                                  : <span className="bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded font-bold">{partnerFirst} ⭐</span>}
+                                <span>{t.partnerSnapshotPts} pts</span>
+                              </div>
+                            </div>
+                            <button onClick={()=>acceptTradeCandidate(dateKey, slotId, t.partnerDateKey, t.partnerSlotId)}
+                              className="text-[11px] font-bold px-2.5 py-1.5 bg-blue-600 text-white rounded-md hover:bg-blue-700 flex-shrink-0">
+                              🔁 Trade
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {candidates.length === 0 && trades.length === 0
+                    ? <div className="bg-white border border-slate-200 rounded-lg p-2.5 text-xs text-slate-600">No eligible swap or trade candidates. The shift is on the marketplace — admin or provider must reassign manually.</div>
+                    : candidates.length > 0 && <div className="space-y-1">
                         <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider mb-1">Recommended swaps</div>
                         {candidates.map(c => {
                           const max = c.user.targets?.max || 0;
@@ -3555,6 +3970,7 @@ function ShiftApp() {
                                 <div className="text-xs font-medium text-ink-900 truncate">{c.user.name}</div>
                                 <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500 mt-0.5">
                                   {c.preferred && <span className="bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded font-bold">⭐ Preferred</span>}
+                                  {c.atMax && <span className="bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded font-bold border border-amber-200" title={c.preferred ? "Preferred this day but already at their max" : "Already at their max-shift target"}>⚠ At max ({c.maxTarget})</span>}
                                   <span>{c.currentCount}{max>0?`/${max}`:""} shifts · {c.snapshotPts} pts</span>
                                 </div>
                               </div>
@@ -3645,7 +4061,7 @@ function ShiftApp() {
           </div>
           {avail.penalty>0 && (
             <div className="text-right">
-              <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-amber-700">Penalty</div>
+              <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-amber-700 leading-tight">{isAvailabilityOpen(currentBlock)?"Will deduct at close":"Deducted at close"}</div>
               <div className="text-3xl sm:text-4xl font-extrabold tabular-nums text-amber-700 leading-none mt-0.5">−{avail.penalty}</div>
             </div>
           )}
@@ -3702,6 +4118,9 @@ function ShiftApp() {
           <div className="bg-slate-50 rounded-xl px-4 py-3 border border-slate-200/70">
             <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-500">Spendable points</div>
             <div className={`text-2xl sm:text-3xl font-extrabold tabular-nums mt-0.5 leading-none ${myPoints<0?"text-red-600":"text-brand-700"}`}>{myPoints.toFixed(1)}</div>
+            {isAvailabilityOpen(currentBlock)&&avail.penalty>0 ? (
+              <div className="text-[10px] text-amber-700 font-semibold mt-1 leading-tight">−{avail.penalty} pending at close · effective {(myPoints-avail.penalty).toFixed(1)}</div>
+            ) : null}
             <div className="text-[10px] text-ink-400 mt-1 leading-tight">Cap on your bids. Shifts you win this block don't credit pts until the block locks.</div>
           </div>
           <div className="bg-slate-50 rounded-xl px-4 py-3 border border-slate-200/70">
@@ -3876,8 +4295,8 @@ function ShiftApp() {
         if(wantedRaw) await togglePreference(k);
         if(!blockedRaw) await toggleUnavail(k);
       };
-      // Point pill — deeper amber as pts climb; brand-blue for 1pt weekdays; neutral for 0-pt.
-      const pillBg = pts===0?"bg-slate-100 text-ink-500":pts===1?"bg-brand-50 text-brand-700":pts===2?"bg-amber-100 text-amber-800":pts===3?"bg-amber-200 text-amber-900":"bg-amber-300 text-amber-900";
+      // Point pill — flat neutral style (v3.1 simplification: no points-tier gradient).
+      const pillBg = "bg-slate-100 text-slate-700";
       const cardFrame = blocked
         ? "bg-red-50/60 border-red-200"
         : hasShift
@@ -3903,8 +4322,11 @@ function ShiftApp() {
               <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
                 <span className="font-semibold text-sm text-ink-900">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}</span>
                 {meTopOpt && <span className="text-blue-600 text-sm leading-none" title="Top Option">🎯</span>}
+                {meTopOpt && (isLinkedToPrev(k, me.id) || isLinkedToNext(k, me.id)) && (
+                  <span className="text-blue-600 text-xs leading-none" title="Linked with adjacent day(s) — all or nothing">🔗</span>
+                )}
                 {wanted && !meTopOpt && <span className="text-emerald-500 text-sm leading-none" title="Preferred">⭐</span>}
-                {pts>0 && <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold ${pillBg}`}>+{pts} pt{pts>1?"s":""}</span>}
+                {pts>0 && <span className={`text-[11px] px-2 py-0.5 rounded-full font-semibold tabular-nums ${pillBg}`}>+{pts} pt{pts>1?"s":""}</span>}
                 {isWk && <span className="text-[10px] bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded-full font-medium">Weekend</span>}
                 {hol && <span className="text-[10px] bg-emerald-50 text-emerald-800 border border-emerald-200 px-2 py-0.5 rounded-full font-medium">{hol}</span>}
                 {blocked && <span className="text-[10px] bg-red-100 text-red-800 border border-red-200 px-2 py-0.5 rounded-full font-bold">✕ Blocked{reason?` · ${reason}`:""}</span>}
@@ -4004,6 +4426,35 @@ function ShiftApp() {
                       {dayTopCount-1} other provider{dayTopCount===2?"":"s"} also Top-Optioned this day.
                     </div>
                   )}
+                  {/* Inline link controls — bundle adjacent Top-Optioned days into all-or-nothing chains. */}
+                  {(()=>{
+                    const prevKey = dayKeyOffset(k, -1);
+                    const nextKey = dayKeyOffset(k, 1);
+                    const prevTopOpt = inBlock(prevKey, config) && inTopOption(prevKey, me.id);
+                    const nextTopOpt = inBlock(nextKey, config) && inTopOption(nextKey, me.id);
+                    const linkPrev = isLinkedToPrev(k, me.id);
+                    const linkNext = isLinkedToNext(k, me.id);
+                    if(!prevTopOpt && !nextTopOpt) return null;
+                    return (
+                      <div className="border-t border-blue-200 pt-2 flex flex-wrap items-center gap-1.5">
+                        <span className="text-[10px] font-bold uppercase tracking-[0.12em] text-blue-700">🔗 All-or-nothing</span>
+                        {prevTopOpt && (
+                          <button type="button"
+                            onClick={()=>linkPrev ? unlinkFromNextDay(prevKey) : linkToNextDay(prevKey)}
+                            className={`text-[11px] font-bold px-2 py-0.5 rounded-md border transition ${linkPrev ? "bg-blue-100 border-blue-300 text-blue-800 hover:bg-blue-200" : "bg-white border-blue-200 text-blue-700 hover:bg-blue-50"}`}>
+                            {linkPrev ? "× Unlink prev" : "🔗 Link prev"}
+                          </button>
+                        )}
+                        {nextTopOpt && (
+                          <button type="button"
+                            onClick={()=>linkNext ? unlinkFromNextDay(k) : linkToNextDay(k)}
+                            className={`text-[11px] font-bold px-2 py-0.5 rounded-md border transition ${linkNext ? "bg-blue-100 border-blue-300 text-blue-800 hover:bg-blue-200" : "bg-white border-blue-200 text-blue-700 hover:bg-blue-50"}`}>
+                            {linkNext ? "× Unlink next" : "🔗 Link next"}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
               );
             })()}
@@ -4108,7 +4559,7 @@ function ShiftApp() {
           const flagged = conf === "flagged";
           const confirmed = conf === "ok";
           const listing = openListings[`${m.k}_${m.sid}`];
-          const earnedPts = (m.pts + (m.auto?(config.involuntaryBonus||0):0) + (m.nonPref?(config.nonPreferredBonus||0):0));
+          const earnedPts = (m.pts + (m.auto && m.nonPref ? (config.nonPreferredBonus||0) : 0));
           // Frame color reflects confirm state in Recon+, neutral in Avail.
           const frame = !reconOrLater
             ? "bg-white border-slate-200"
@@ -4127,7 +4578,7 @@ function ShiftApp() {
                   <div className="font-medium text-sm">{MONTHS_SHORT[m.date.getMonth()]} {m.date.getDate()}, {m.date.getFullYear()}</div>
                   <div className="flex flex-wrap items-center gap-1.5 text-xs mt-0.5">
                     <span className="font-medium" style={{color:m.slot?.color}}>{m.slot?.name}</span>
-                    {m.auto&&<span className="bg-blue-100 text-blue-700 text-[10px] font-medium px-1.5 py-0.5 rounded">Auto +{(config.involuntaryBonus||0)+(m.nonPref?(config.nonPreferredBonus||0):0)}</span>}
+                    {m.auto&&(()=>{ const b=m.nonPref?(config.nonPreferredBonus||0):0; return <span className="bg-blue-100 text-blue-700 text-[10px] font-medium px-1.5 py-0.5 rounded">Auto{b>0?` +${b}`:""}</span>; })()}
                     {confirmed && <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-1.5 py-0.5 rounded">✓ Confirmed</span>}
                     {flagged && <span className="bg-red-100 text-red-800 text-[10px] font-bold px-1.5 py-0.5 rounded">⚠ Flagged</span>}
                     {listing && <span className="bg-amber-100 text-amber-800 text-[10px] font-bold px-1.5 py-0.5 rounded">📣 Listed{listing.incentivePts>0?` · +${listing.incentivePts}`:""}</span>}
@@ -4175,12 +4626,9 @@ function ShiftApp() {
       if(me.role !== "provider") return { ok:false, why:"Admin can't take shifts" };
       if(l.sellerId === me.id) return { ok:false, why:"This is yours" };
       if(!me.seniorityId) return { ok:false, why:"No seniority assigned" };
-      if(isUnavail(me.id, l.dateKey)) return { ok:false, why:"You blocked this day" };
+      // Blocked-day and max-shift caps intentionally NOT enforced in Reconciliation+ — the user
+      // is actively choosing to take this shift.
       if(Object.values(shifts[l.dateKey]||{}).some(e => getUid(e) === me.id)) return { ok:false, why:"Already on this day" };
-      let myCount = 0;
-      Object.values(shifts).forEach(day => Object.values(day).forEach(e => { if(getUid(e) === me.id) myCount++; }));
-      const myMax = me.targets?.max || 0;
-      if(myMax > 0 && myCount >= myMax) return { ok:false, why:`At max (${myMax})` };
       return { ok:true };
     };
     // Eligibility for offering a trade — viewer must own at least one OTHER awarded shift in the
@@ -4191,7 +4639,7 @@ function ShiftApp() {
       if(me.role !== "provider") return { ok:false, why:"Admin can't offer trades" };
       if(l.sellerId === me.id) return { ok:false, why:"This is yours" };
       if(!me.seniorityId) return { ok:false, why:"No seniority assigned" };
-      if(isUnavail(me.id, l.dateKey)) return { ok:false, why:"You blocked this day" };
+      // Blocked-day cap intentionally NOT enforced — see canTake.
       if(Object.values(shifts[l.dateKey]||{}).some(e => getUid(e) === me.id)) return { ok:false, why:"Already on this day" };
       // At least one tradeable shift the user owns (not on the listing's date).
       let hasTradeableShift = false;
@@ -4335,32 +4783,42 @@ function ShiftApp() {
     </>);
   };
 
-  const StandingsPage = () => (<>
-    <h1 className="text-2xl font-semibold mb-1">Standings</h1>
-    <p className="text-sm text-slate-500 mb-4">Higher spendable points = bid ceiling and tiebreak priority. Projected pts credit when the block locks.</p>
-    <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-      {[...users].filter(u=>u.role==="provider")
-        .map(u=>({...u,total:totalPts(u.id),earned:getPtsEarned(u.id),penalty:getAvailInfo(u.id).penalty}))
-        .sort((a,b)=>b.total-a.total)
-        .map((u,i)=>{
-          const lvl=config.seniorityLevels.find(l=>l.id===u.seniorityId);
-          return(
-            <div key={u.id} className={`flex items-center gap-3 p-3 border-b border-slate-100 last:border-0 ${u.id===me.id?"bg-blue-50":""}`}>
-              <div className="w-7 text-center text-sm font-bold text-slate-400">#{i+1}</div>
-              <div className="w-9 h-9 rounded-full text-white flex items-center justify-center text-xs font-semibold flex-shrink-0" style={{background:COLORS[u.id%COLORS.length]}}>{initials(u.name)}</div>
-              <div className="flex-1 min-w-0">
-                <div className="font-medium text-sm truncate">{u.name}{u.id===me.id?" (you)":""}</div>
-                <div className="text-xs text-slate-500">{lvl?.name||"Unassigned"}</div>
+  const StandingsPage = () => {
+    // During AVAIL the penalty is a forecast — bake it into the displayed total so the ranking
+    // reflects effective bid ceiling. After Close & assign it's already in u.points, so we
+    // don't subtract it again (or we'd double-count).
+    const isAvail = isAvailabilityOpen(currentBlock);
+    const rows = [...users].filter(u=>u.role==="provider")
+      .map(u=>{
+        const penalty = getAvailInfo(u.id).penalty;
+        const bank = totalPts(u.id);
+        return {...u, bank, penalty, pending: isAvail?penalty:0, total: isAvail?(bank-penalty):bank, earned: getPtsEarned(u.id)};
+      })
+      .sort((a,b)=>b.total-a.total);
+    return (<>
+      <h1 className="text-2xl font-semibold mb-1">Standings</h1>
+      <p className="text-sm text-slate-500 mb-4">Higher spendable points = bid ceiling and tiebreak priority. Projected pts credit when the block locks.</p>
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        {rows.map((u,i)=>{
+            const lvl=config.seniorityLevels.find(l=>l.id===u.seniorityId);
+            return(
+              <div key={u.id} className={`flex items-center gap-3 p-3 border-b border-slate-100 last:border-0 ${u.id===me.id?"bg-blue-50":""}`}>
+                <div className="w-7 text-center text-sm font-bold text-slate-400">#{i+1}</div>
+                <div className="w-9 h-9 rounded-full text-white flex items-center justify-center text-xs font-semibold flex-shrink-0" style={{background:COLORS[u.id%COLORS.length]}}>{initials(u.name)}</div>
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium text-sm truncate">{u.name}{u.id===me.id?" (you)":""}</div>
+                  <div className="text-xs text-slate-500">{lvl?.name||"Unassigned"}</div>
+                </div>
+                <div className="text-right">
+                  <div className={`font-bold ${u.total<0?"text-red-600":"text-amber-600"}`}>{u.total.toFixed(1)}</div>
+                  <div className="text-[10px] text-slate-400">{u.bank} bank{u.pending>0?` − ${u.pending} pending`:""}{u.earned>0?` · +${u.earned.toFixed(1)} earning`:""}</div>
+                </div>
               </div>
-              <div className="text-right">
-                <div className={`font-bold ${u.total<0?"text-red-600":"text-amber-600"}`}>{u.total.toFixed(1)}</div>
-                <div className="text-[10px] text-slate-400">{u.points} bank{u.penalty>0?` − ${u.penalty}`:""}{u.earned>0?` · +${u.earned.toFixed(1)} pending`:""}</div>
-              </div>
-            </div>
-          );
-        })}
-    </div>
-  </>);
+            );
+          })}
+      </div>
+    </>);
+  };
 
   // v3 SetupPage — modular card windows matching SchedulePage aesthetic.
   // Each settings group lives in its own bg-surface rounded-2xl shadow-card panel with
@@ -4618,30 +5076,22 @@ function ShiftApp() {
                 ))}
               </div>
               <p className="text-[11px] text-ink-500 mt-2 italic leading-relaxed">
-                Providers are warned and can spend a point per extra block. Once their running total would dip below zero, additional blocks are forbidden.
+                Providers are warned and can opt to over-block at the listed cost per extra day. The deduction is applied when you run Close &amp; assign, so it doesn't gate bidding.
               </p>
             </div>
           </div>
         </SetupCard>
 
-        <SetupCard icon="🎁" title="Scoring bonuses" subtitle="Extra points for involuntary and non-preferred shifts. Contested slots are settled by user-set bids.">
+        <SetupCard icon="🎁" title="Scoring bonuses" subtitle="Extra points when a provider gets auto-assigned to a date they didn't star. Contested slots are settled by user-set bids.">
           <div className="space-y-3">
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <div className="text-[10px] font-bold text-ink-500 uppercase tracking-[0.12em] mb-1.5">Auto-assigned bonus</div>
-                <input type="number" min="0" step="0.5" value={config.involuntaryBonus}
-                  onChange={e=>updateConfig({involuntaryBonus:parseFloat(e.target.value)||0})}
-                  className="w-full px-3 py-2 border border-slate-200 rounded-lg text-lg font-bold tabular-nums text-center bg-white text-ink-900"/>
-              </div>
-              <div>
-                <div className="text-[10px] font-bold text-ink-500 uppercase tracking-[0.12em] mb-1.5">Non-preferred bonus</div>
-                <input type="number" min="0" step="0.5" value={config.nonPreferredBonus??1}
-                  onChange={e=>updateConfig({nonPreferredBonus:parseFloat(e.target.value)||0})}
-                  className="w-full px-3 py-2 border border-slate-200 rounded-lg text-lg font-bold tabular-nums text-center bg-white text-ink-900"/>
-              </div>
+            <div>
+              <div className="text-[10px] font-bold text-ink-500 uppercase tracking-[0.12em] mb-1.5">Non-preferred bonus</div>
+              <input type="number" min="0" step="0.5" value={config.nonPreferredBonus??1}
+                onChange={e=>updateConfig({nonPreferredBonus:parseFloat(e.target.value)||0})}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-lg font-bold tabular-nums text-center bg-white text-ink-900"/>
             </div>
             <p className="text-[11px] text-ink-500 leading-relaxed bg-slate-50 rounded-xl p-3 border border-slate-200">
-              Auto-assign bonus applies to every auto-filled shift. Non-preferred bonus is <span className="font-semibold text-ink-700">added on top</span> when the user didn't star that date. Contested slots are decided by <span className="font-semibold text-ink-700">user bids</span> — winners pay the points they bid (default <span className="font-semibold text-ink-700">1 pt</span>, capped at their current total).
+              Awarded only when a provider is auto-assigned to a date they hadn't marked preferred — compensation for picking up a shift they didn't ask for. Contested Top Option slots are decided by <span className="font-semibold text-ink-700">user bids</span> — winners pay next-highest bid + 1, solo wins are free.
             </p>
           </div>
         </SetupCard>
@@ -4721,7 +5171,7 @@ function ShiftApp() {
                   <button onClick={()=>adjustPoints(u.id,1)} className="w-8 h-8 border border-slate-300 rounded hover:bg-slate-50">+</button>
                 </div>
                 <div className="text-xs text-slate-500" style={{paddingLeft:"5.5rem"}}>
-                  Spendable <span className="font-semibold">{totalPts(u.id).toFixed(1)}</span>{a?.penalty>0?<span className="text-red-600"> (−{a.penalty} penalty)</span>:""} · Projected this block: <span className="text-emerald-700 font-medium">+{earned.toFixed(1)}</span>
+                  Spendable <span className="font-semibold">{totalPts(u.id).toFixed(1)}</span>{a?.penalty>0?<span className="text-amber-700"> ({isAvailabilityOpen(currentBlock)?"−"+a.penalty+" pending at close":"−"+a.penalty+" deducted at close"})</span>:""} · Projected this block: <span className="text-emerald-700 font-medium">+{earned.toFixed(1)}</span>
                 </div>
                 <div className="text-xs text-slate-500" style={{paddingLeft:"5.5rem"}}>
                   Targets: <span className="font-medium">{(u.targets?.min)||0}/{(u.targets?.ideal)||0}/{(u.targets?.max)||0}</span> min/ideal/max · <span className="text-emerald-600 font-medium">{wantedCount(u.id)} preferred</span>
@@ -4926,6 +5376,7 @@ function ShiftApp() {
                   </div>
                   {!renaming&&(
                     <div className="flex items-center flex-shrink-0">
+                      <button onClick={()=>setImpersonatePicker({gid: g.id, gname: g.name})} className="text-slate-700 hover:text-slate-900 text-xs font-medium px-2 py-1">👁 View as</button>
                       <button onClick={()=>{ setRenameValue(g.name); setRenamingGid(g.id); }} className="text-slate-600 hover:text-slate-900 text-xs font-medium px-2 py-1">Rename</button>
                       <button onClick={()=>rollGroupCodes(g.id)} className="text-slate-600 hover:text-slate-900 text-xs font-medium px-2 py-1">Roll codes</button>
                       {!g.cloudGroupId && cloudUser && (
@@ -4994,8 +5445,48 @@ function ShiftApp() {
         </div>
       </main>
       {migrateState && <MigrateModal/>}
+      {impersonatePicker && <ImpersonatePickerModal/>}
       {toast&&<Toast msg={toast}/>}
     </div>
+    );
+  };
+
+  // Phase D: "View as user" picker. Opened from a group card in SuperDashboard. Reads users
+  // for that group from localStorage (the group may not be loaded into state yet) and lists
+  // admins first, then providers, alpha by name. Click a user → startImpersonate.
+  const ImpersonatePickerModal = () => {
+    if (!impersonatePicker) return null;
+    const { gid, gname } = impersonatePicker;
+    const gusers = readGroupKey(gid, "users", []);
+    const sorted = gusers.slice().sort((a,b) => {
+      if (a.role !== b.role) return a.role === "admin" ? -1 : 1;
+      return (a.name||"").localeCompare(b.name||"");
+    });
+    return (
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setImpersonatePicker(null)}>
+        <div className="bg-white rounded-2xl max-w-md w-full p-5 max-h-[90vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
+          <div className="text-2xl mb-1">👁</div>
+          <div className="font-semibold text-xl mb-1">View as user</div>
+          <p className="text-sm text-slate-500 mb-3">Pick a user from <span className="font-medium">{gname}</span> to view the app as them. Use this to test functionality. Stop anytime via the banner at the top.</p>
+          {sorted.length === 0 ? (
+            <div className="text-sm text-slate-500 italic py-4 text-center">No users in this group yet.</div>
+          ) : (
+            <div className="space-y-1.5 mb-3">
+              {sorted.map(u => (
+                <button key={u.id} onClick={()=>startImpersonate(gid, u.id)}
+                  className="w-full text-left px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50 hover:border-slate-300 flex items-center justify-between gap-2">
+                  <div>
+                    <div className="font-medium text-sm text-slate-900">{u.name}</div>
+                    <div className="text-[10px] uppercase tracking-wide text-slate-500">{u.role}</div>
+                  </div>
+                  <div className="text-xs text-blue-600 font-medium">View →</div>
+                </button>
+              ))}
+            </div>
+          )}
+          <button onClick={()=>setImpersonatePicker(null)} className="w-full py-2 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
+        </div>
+      </div>
     );
   };
 
@@ -5094,6 +5585,18 @@ function ShiftApp() {
     ? `${MONTHS_SHORT[parseDk(currentBlock.start).getMonth()]} ${parseDk(currentBlock.start).getDate()} – ${MONTHS_SHORT[parseDk(currentBlock.end).getMonth()]} ${parseDk(currentBlock.end).getDate()}`
     : "Dates not set";
   return(
+    <>
+    {/* Phase D: persistent impersonation banner. Sticky at viewport top so it's always visible
+        as the owner navigates the impersonated user's view. Click Stop → return to SuperDashboard. */}
+    {me.impersonating && (
+      <div className="bg-amber-100 border-b border-amber-300 px-4 py-2 flex items-center justify-between gap-2 sticky top-0 z-50">
+        <div className="text-xs text-amber-900 truncate">
+          <span className="font-semibold">👤 Impersonating</span> <span className="font-medium">{me.name}</span>
+          <span className="text-amber-700 ml-2 hidden sm:inline">— actions are recorded as this user</span>
+        </div>
+        <button onClick={stopImpersonate} className="text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white px-3 py-1 rounded-lg flex-shrink-0">Stop</button>
+      </div>
+    )}
     <div className="min-h-screen bg-canvas text-ink-900 lg:flex pb-20 lg:pb-0">
       {/* Phase C cloud-sync banner — fires when /api/snapshots/:gid/latest reports a clientTs
           newer than this device's last persist. User clicks "Sync now" to overwrite local
@@ -5187,6 +5690,7 @@ function ShiftApp() {
       {DaySheet()}{Onboarding()}{AutoAssignModal()}{ReconcileModal()}{ConfirmResetModal()}{ConfirmLockModal()}{ConfirmBlockOverModal()}{BlockReportModal()}{FlagDraftModal()}{ListDraftModal()}{TradeDraftModal()}{AddUserModal()}{NewUserInfoModal()}
       {toast&&<Toast msg={toast}/>}
     </div>
+    </>
   );
 }
 

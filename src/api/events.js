@@ -7,6 +7,8 @@ import { noContent, err, readJson } from "../lib/http.js";
 const ALLOWED_TYPES = new Set([
   "topOption.set",
   "topOption.clear",
+  "topOption.link",
+  "topOption.unlink",
   "preference.toggle",
   "unavail.toggle",
   "block.reconcile",

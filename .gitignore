@@ -26,3 +26,6 @@ node_modules/
 # Test credentials. Remove this line if you decide to share them publicly,
 # but DO review the file first to make sure no real passwords are in it.
 Test logins.xlsx
+
+# D1/R2 backups — contain user records and password hashes. Never commit.
+backups/
