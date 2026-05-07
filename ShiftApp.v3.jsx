@@ -582,8 +582,15 @@ export default function ShiftApp() {
     }
   };
 
-  const signOut = () => {
+  // D.3: a single sign-out clears both the cloud session (the only real auth post-D.3) and any
+  // local session/group state left over from impersonation. Calling /api/auth/logout is best-
+  // effort — even if it fails (e.g. offline), we still wipe local state so the user lands on the
+  // auth screen.
+  const signOut = async () => {
+    try { await window.api.fetchJSON("/api/auth/logout", { method: "POST" }); } catch {}
+    setCloudUser(null);
     setSession(null); sessionStorage.removeItem("shift_session");
+    setImpersonate(null); sessionStorage.removeItem("shyft3_impersonate");
     setGroupId(null); setUsers([]); setConfig(DEFAULT_CONFIG); setShifts({}); setUnavailability({}); setPreferences({});
     setPage("home");
   };
@@ -623,10 +630,6 @@ export default function ShiftApp() {
           ? "Invite link is invalid or expired."
           : "Couldn't send the link. Try again."));
     } finally { setCloudBusy(false); }
-  };
-  const signOutCloud = async () => {
-    try { await window.api.fetchJSON("/api/auth/logout", { method: "POST" }); } catch {}
-    setCloudUser(null);
   };
   // Owner-only: mint an invite URL for a cloud-mirrored group, copy to clipboard.
   const createCloudInvite = async (cloudGroupId) => {
@@ -2290,8 +2293,8 @@ export default function ShiftApp() {
             unclaimed group can be restored from its latest /api/snapshots payload. */}
         {cloudUser && (
           <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-2.5 flex items-center justify-between">
-            <span className="text-xs text-blue-800">Cloud: <span className="font-medium">{cloudUser.user.email}</span></span>
-            <button onClick={signOutCloud} className="text-xs text-blue-700 hover:text-blue-900 font-medium">Sign out</button>
+            <span className="text-xs text-blue-800">Signed in as <span className="font-medium">{cloudUser.user.email}</span></span>
+            <button onClick={signOut} className="text-xs text-blue-700 hover:text-blue-900 font-medium">Sign out</button>
           </div>
         )}
         {cloudUser && unclaimedCloudGroups.length>0 && (
@@ -5180,13 +5183,6 @@ export default function ShiftApp() {
           <button onClick={signOut} className="text-xs sm:text-sm px-3 py-1.5 border border-slate-300 rounded-lg hover:bg-slate-50">Sign out</button>
         </div>
       </nav>
-      {/* Phase A: cloud-account strip. Visible only when signed in via magic link. */}
-      {cloudUser&&(
-        <div className="bg-blue-50 border-b border-blue-200 px-4 sm:px-6 py-1.5 flex items-center justify-between text-xs">
-          <span className="text-blue-800">Cloud: <span className="font-medium">{cloudUser.user.email}</span></span>
-          <button onClick={signOutCloud} className="text-blue-700 hover:text-blue-900 font-medium">Sign out (cloud)</button>
-        </div>
-      )}
       <main className="p-4 sm:p-6 max-w-3xl mx-auto">
         <h1 className="text-2xl font-semibold mb-1">Groups</h1>
         <p className="text-sm text-slate-500 mb-4">Every group has its own users, calendar, and settings. Share the codes with the group's members.</p>
