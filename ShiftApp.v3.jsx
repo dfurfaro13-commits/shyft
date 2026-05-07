@@ -130,6 +130,13 @@ export default function ShiftApp() {
   const [impersonate, setImpersonate] = useState(null);
   // Picker UI state: {gid, gname} when the SuperDashboard's "View as user" picker is open.
   const [impersonatePicker, setImpersonatePicker] = useState(null);
+  // D.3 follow-up: SuperDashboard tabs + Accounts page state. Owner-only — list users in caller's
+  // owned groups, edit email/password, or delete (which tombstones if no other memberships remain).
+  // Edit + Delete still use modal action surfaces; the list itself lives inline on the Accounts tab.
+  const [superDashTab, setSuperDashTab] = useState("groups"); // "groups" | "accounts"
+  const [accounts, setAccounts] = useState({ list: null, loading: false, error: "" });
+  const [accountsEdit, setAccountsEdit] = useState(null);   // { uid, name, email, password, busy, error } or null
+  const [accountsDelete, setAccountsDelete] = useState(null); // { uid, name, busy, error } or null
   const [authMode, setAuthMode] = useState("signin");
   // D.3: cloud-backed auth. `emailOrUsername` accepts either on Sign in; signup uses email,
   // username, displayName, plus optional groupCode/adminCode/ownerCode. Local-only fields
@@ -631,6 +638,77 @@ export default function ShiftApp() {
           : "Couldn't send the link. Try again."));
     } finally { setCloudBusy(false); }
   };
+  // D.3 follow-up: load the Accounts list. Called on first switch to the Accounts tab and again
+  // after every successful edit/delete. Errors stay inline so the user can retry without losing
+  // context (no toast).
+  const loadAccounts = async () => {
+    setAccounts(s => ({ ...s, loading: true, error: "" }));
+    try {
+      const r = await window.api.fetchJSON("/api/owner/users");
+      setAccounts({ list: r?.users || [], loading: false, error: "" });
+    } catch (e) {
+      setAccounts(s => ({ ...s, loading: false, error: "Couldn't load accounts. Try again." }));
+    }
+  };
+  // Tab switcher. Loads the accounts list lazily — once per switch into the tab.
+  const switchSuperDashTab = (tab) => {
+    setSuperDashTab(tab);
+    if (tab === "accounts") loadAccounts();
+  };
+  // Owner-only: PATCH email and/or password. Empty values are skipped.
+  const submitAccountsEdit = async () => {
+    if (!accountsEdit) return;
+    const body = {};
+    const newEmail = (accountsEdit.email || "").trim().toLowerCase();
+    const newPw = accountsEdit.password || "";
+    if (newEmail) body.email = newEmail;
+    if (newPw) body.password = newPw;
+    if (!body.email && !body.password) {
+      setAccountsEdit(s => ({ ...s, error: "Enter a new email or password." }));
+      return;
+    }
+    setAccountsEdit(s => ({ ...s, busy: true, error: "" }));
+    try {
+      await window.api.fetchJSON("/api/owner/users/" + encodeURIComponent(accountsEdit.uid), {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      });
+      setAccountsEdit(null);
+      flash("✅ Account updated");
+      await loadAccounts();
+    } catch (e) {
+      const msg = ({
+        email_taken: "That email is already in use.",
+        invalid_email: "Invalid email format.",
+        password_too_short: "Password must be at least 8 characters.",
+        cannot_edit_self: "Can't edit your own account from here.",
+        forbidden: "You don't manage this account.",
+      })[e?.body?.error] || "Couldn't save changes.";
+      setAccountsEdit(s => ({ ...s, busy: false, error: msg }));
+    }
+  };
+  // Owner-only: DELETE membership in caller's groups. Server tombstones if no other memberships.
+  const submitAccountsDelete = async () => {
+    if (!accountsDelete) return;
+    setAccountsDelete(s => ({ ...s, busy: true, error: "" }));
+    try {
+      const r = await window.api.fetchJSON("/api/owner/users/" + encodeURIComponent(accountsDelete.uid), {
+        method: "DELETE",
+      });
+      setAccountsDelete(null);
+      flash(r?.fullyDeleted ? "🗑 Account deleted" : "🗑 Removed from your groups");
+      await loadAccounts();
+    } catch (e) {
+      const msg = ({
+        target_is_owner: "Can't delete an owner of another group.",
+        cannot_delete_self: "Can't delete your own account from here.",
+        forbidden: "You don't manage this account.",
+        not_found: "Account no longer exists.",
+      })[e?.body?.error] || "Couldn't delete.";
+      setAccountsDelete(s => ({ ...s, busy: false, error: msg }));
+    }
+  };
+
   // Owner-only: mint an invite URL for a cloud-mirrored group, copy to clipboard.
   const createCloudInvite = async (cloudGroupId) => {
     try {
@@ -5183,7 +5261,19 @@ export default function ShiftApp() {
           <button onClick={signOut} className="text-xs sm:text-sm px-3 py-1.5 border border-slate-300 rounded-lg hover:bg-slate-50">Sign out</button>
         </div>
       </nav>
+      {/* D.3 follow-up: top-level tabs for the owner dashboard. */}
+      <div className="bg-white border-b border-slate-200 px-4 sm:px-6">
+        <div className="max-w-3xl mx-auto flex gap-1">
+          {[["groups","Groups"],["accounts","Accounts"]].map(([key,label]) => (
+            <button key={key} onClick={()=>switchSuperDashTab(key)}
+              className={`px-4 py-2.5 text-sm font-medium border-b-2 transition ${superDashTab===key ? "border-blue-600 text-blue-700" : "border-transparent text-slate-500 hover:text-slate-700"}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
       <main className="p-4 sm:p-6 max-w-3xl mx-auto">
+      {superDashTab === "groups" && (<>
         <h1 className="text-2xl font-semibold mb-1">Groups</h1>
         <p className="text-sm text-slate-500 mb-4">Every group has its own users, calendar, and settings. Share the codes with the group's members.</p>
 
@@ -5325,9 +5415,61 @@ export default function ShiftApp() {
           })}</div>
         )}
 
+      </>)}
+      {superDashTab === "accounts" && (<>
+        <div className="flex items-start justify-between mb-1">
+          <h1 className="text-2xl font-semibold">Accounts</h1>
+          <button onClick={loadAccounts} disabled={accounts.loading}
+            className="text-xs text-slate-500 hover:text-slate-800 px-2 py-1 disabled:opacity-50">
+            {accounts.loading ? "Loading…" : "Refresh"}
+          </button>
+        </div>
+        <p className="text-sm text-slate-500 mb-4">Every user across the groups you own. Edit credentials or remove someone here.</p>
+        {accounts.error && (
+          <div className="mb-3 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700 flex items-center justify-between">
+            <span>{accounts.error}</span>
+            <button onClick={loadAccounts} className="text-xs font-semibold underline">Retry</button>
+          </div>
+        )}
+        {accounts.loading && !accounts.list ? (
+          <div className="py-10 text-center text-sm text-slate-500">Loading…</div>
+        ) : accounts.list && accounts.list.length === 0 ? (
+          <div className="py-10 text-center text-sm text-slate-500 italic">No other users in your groups yet.</div>
+        ) : accounts.list ? (
+          <div className="space-y-2">
+            {accounts.list.map(u => (
+              <div key={u.id} className="bg-white border border-slate-200 rounded-lg p-3 flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <div className="font-medium text-sm text-slate-900">{u.displayName || "(no name)"}</div>
+                    {u.kind === "test" && <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 font-semibold uppercase tracking-wide">Test</span>}
+                    {!u.hasPassword && <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 font-semibold uppercase tracking-wide">Magic-link only</span>}
+                  </div>
+                  <div className="text-xs text-slate-500 mt-0.5 break-all">{u.email}{u.username ? ` · ${u.username}` : ""}</div>
+                  <div className="mt-1.5 flex flex-wrap gap-1">
+                    {u.memberships.map(m => (
+                      <span key={m.groupId} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">
+                        {m.groupName} · <span className="font-semibold">{m.role}</span>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1.5 flex-shrink-0">
+                  <button onClick={()=>setAccountsEdit({ uid:u.id, name:u.displayName||u.email, email:"", password:"", busy:false, error:"" })}
+                    className="text-xs font-semibold px-2.5 py-1 border border-slate-200 rounded-lg hover:bg-slate-50">Edit</button>
+                  <button onClick={()=>setAccountsDelete({ uid:u.id, name:u.displayName||u.email, busy:false, error:"" })}
+                    className="text-xs font-semibold px-2.5 py-1 border border-red-200 text-red-700 rounded-lg hover:bg-red-50">Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </>)}
       </main>
       {migrateState && <MigrateModal/>}
       {impersonatePicker && <ImpersonatePickerModal/>}
+      {accountsEdit && <AccountsEditModal/>}
+      {accountsDelete && <AccountsDeleteModal/>}
       {toast&&<Toast msg={toast}/>}
     </div>
     );
@@ -5367,6 +5509,64 @@ export default function ShiftApp() {
             </div>
           )}
           <button onClick={()=>setImpersonatePicker(null)} className="w-full py-2 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
+        </div>
+      </div>
+    );
+  };
+
+  const AccountsEditModal = () => {
+    if (!accountsEdit) return null;
+    const { name, email, password, busy, error } = accountsEdit;
+    return (
+      <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60] p-4" onClick={()=>!busy&&setAccountsEdit(null)}>
+        <div className="bg-white rounded-2xl max-w-md w-full p-5" onClick={e=>e.stopPropagation()}>
+          <div className="font-semibold text-xl text-slate-900 mb-1">Edit {name}</div>
+          <p className="text-sm text-slate-500 mb-4">Leave a field blank to keep the current value. Either email or password is required.</p>
+          <Field label="New email">
+            <input type="email" value={email} autoComplete="off" autoCapitalize="none" disabled={busy}
+              onChange={e=>setAccountsEdit(s=>({...s, email:e.target.value, error:""}))}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"
+              placeholder="(leave blank to keep current)"/>
+          </Field>
+          <Field label="New password (8+ chars)">
+            <input type="password" value={password} autoComplete="new-password" disabled={busy}
+              onChange={e=>setAccountsEdit(s=>({...s, password:e.target.value, error:""}))}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"
+              placeholder="(leave blank to keep current)"/>
+          </Field>
+          {error && <div className="text-xs text-red-600 mb-3">{error}</div>}
+          <div className="flex gap-2 mt-2">
+            <button onClick={()=>setAccountsEdit(null)} disabled={busy}
+              className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium disabled:opacity-50">Cancel</button>
+            <button onClick={submitAccountsEdit} disabled={busy}
+              className="flex-1 py-2.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium disabled:bg-slate-300">{busy?"Saving…":"Save"}</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const AccountsDeleteModal = () => {
+    if (!accountsDelete) return null;
+    const { name, busy, error } = accountsDelete;
+    return (
+      <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60] p-4" onClick={()=>!busy&&setAccountsDelete(null)}>
+        <div className="bg-white rounded-2xl max-w-md w-full p-5" onClick={e=>e.stopPropagation()}>
+          <div className="text-2xl mb-1">🗑</div>
+          <div className="font-semibold text-xl text-slate-900 mb-1">Delete {name}?</div>
+          <p className="text-sm text-slate-500 mb-4">
+            Removes this person from every group you own. If they have no other memberships
+            anywhere, the account is fully tombstoned (sign-in disabled, name anonymized).
+            <br/><br/>
+            <span className="font-semibold text-slate-700">This cannot be undone.</span>
+          </p>
+          {error && <div className="text-xs text-red-600 mb-3">{error}</div>}
+          <div className="flex gap-2">
+            <button onClick={()=>setAccountsDelete(null)} disabled={busy}
+              className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium disabled:opacity-50">Cancel</button>
+            <button onClick={submitAccountsDelete} disabled={busy}
+              className="flex-1 py-2.5 text-sm bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium disabled:bg-slate-300">{busy?"Deleting…":"Delete"}</button>
+          </div>
         </div>
       </div>
     );

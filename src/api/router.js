@@ -5,25 +5,29 @@ import { authRequest, authVerify, authPassword, authLogout, me } from "./auth.js
 import { authSignup } from "./signup.js";
 import { createGroup, createInvite, getInvite, migrateGroup } from "./groups.js";
 import { createUser } from "./users.js";
+import { listOwnerUsers, updateOwnerUser, deleteOwnerUser } from "./owner.js";
 import { logEvent } from "./events.js";
 import { putSnapshot, getLatestSnapshot } from "./snapshots.js";
 import { err } from "../lib/http.js";
 
 const routes = [
-  ["POST", "/api/auth/request",                   authRequest],
-  ["GET",  "/api/auth/verify",                    authVerify],
-  ["POST", "/api/auth/password",                  authPassword],
-  ["POST", "/api/auth/signup",                    authSignup],
-  ["POST", "/api/auth/logout",                    authLogout],
-  ["GET",  "/api/me",                             me],
-  ["POST", "/api/groups",                         createGroup],
-  ["POST", "/api/groups/:gid/invites",            createInvite],
-  ["POST", "/api/groups/:gid/migrate",            migrateGroup],
-  ["GET",  "/api/invites/:token",                 getInvite],
-  ["POST", "/api/users",                          createUser],
-  ["POST", "/api/events",                         logEvent],
-  ["POST", "/api/snapshots",                      putSnapshot],
-  ["GET",  "/api/snapshots/:groupId/latest",      getLatestSnapshot],
+  ["POST",   "/api/auth/request",                 authRequest],
+  ["GET",    "/api/auth/verify",                  authVerify],
+  ["POST",   "/api/auth/password",                authPassword],
+  ["POST",   "/api/auth/signup",                  authSignup],
+  ["POST",   "/api/auth/logout",                  authLogout],
+  ["GET",    "/api/me",                           me],
+  ["POST",   "/api/groups",                       createGroup],
+  ["POST",   "/api/groups/:gid/invites",          createInvite],
+  ["POST",   "/api/groups/:gid/migrate",          migrateGroup],
+  ["GET",    "/api/invites/:token",               getInvite],
+  ["POST",   "/api/users",                        createUser],
+  ["GET",    "/api/owner/users",                  listOwnerUsers],
+  ["PATCH",  "/api/owner/users/:uid",             updateOwnerUser],
+  ["DELETE", "/api/owner/users/:uid",             deleteOwnerUser],
+  ["POST",   "/api/events",                       logEvent],
+  ["POST",   "/api/snapshots",                    putSnapshot],
+  ["GET",    "/api/snapshots/:groupId/latest",    getLatestSnapshot],
 ];
 
 export async function handleApi(req, env) {
