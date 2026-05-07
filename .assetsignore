@@ -18,11 +18,17 @@ ShiftApp.v3.jsx
 templates/
 
 # Dev internals
+.git
 .git/
 .gitignore
 .assetsignore
 .claude/
 node_modules/
+
+# Database backups, snapshots, and raw migration files (never publish)
+*.sql
+*.sqlite
+*.sqlite3
 
 # Project docs and binary assets — not secret, but no reason to publish
 CLAUDE.md
