@@ -292,7 +292,6 @@
     };
     const inBlock = (k, cfg) => { const b = currentBlockOf(cfg); return !!(b && k >= b.start && k <= b.end); };
 
-    const SUPER_BOOTSTRAP = "Shyft-Kai-Dave";
     const gKey = (gid, k) => `g${gid}_${k}`;
     const genCode = (len=6) => { const c="ABCDEFGHJKMNPQRSTUVWXYZ23456789"; let s=""; for(let i=0;i<len;i++) s+=c[Math.floor(Math.random()*c.length)]; return s; };
 
@@ -301,7 +300,6 @@
 function ShiftApp() {
   const [loading, setLoading] = useState(true);
   const [groups, setGroups] = useState([]);
-  const [supers, setSupers] = useState([]);
   const [groupId, setGroupId] = useState(null);
   const [users, setUsers] = useState([]);
   const [config, setConfig] = useState(DEFAULT_CONFIG);
@@ -336,7 +334,13 @@ function ShiftApp() {
   // Picker UI state: {gid, gname} when the SuperDashboard's "View as user" picker is open.
   const [impersonatePicker, setImpersonatePicker] = useState(null);
   const [authMode, setAuthMode] = useState("signin");
-  const [authForm, setAuthForm] = useState({ username:"", password:"", name:"", groupCode:"", adminCode:"", superBootstrap:"" });
+  // D.3: cloud-backed auth. `emailOrUsername` accepts either on Sign in; signup uses email,
+  // username, displayName, plus optional groupCode/adminCode/ownerCode. Local-only fields
+  // (superBootstrap) are gone — group-creation permission is now an OWNER_BOOTSTRAP_CODE secret.
+  const [authForm, setAuthForm] = useState({
+    emailOrUsername:"", password:"", displayName:"", email:"", username:"",
+    groupCode:"", adminCode:"", ownerCode:"",
+  });
   const [authError, setAuthError] = useState("");
   const [groupForm, setGroupForm] = useState({ name:"" });
   const [toast, setToast] = useState("");
@@ -377,8 +381,6 @@ function ShiftApp() {
   // is unchanged.
   const [cloudUser, setCloudUser] = useState(null);          // { id, email, displayName, memberships: [...] } | null
   const [pendingInvite, setPendingInvite] = useState(null);  // { token, groupId, groupName, role, expiresAt } | null
-  const [cloudEmail, setCloudEmail] = useState("");
-  const [cloudPassword, setCloudPassword] = useState("");
   const [magicLinkSent, setMagicLinkSent] = useState(false);
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudError, setCloudError] = useState("");
@@ -396,9 +398,8 @@ function ShiftApp() {
 
   useEffect(() => {
     (async () => {
-      // Root-level (cross-group): groups list + super-admin accounts
+      // Root-level (cross-group): groups list. Super-admin accounts moved to the cloud in D.3.
       try { const r = await window.storage.get("groups",true).catch(()=>null); if(r) setGroups(JSON.parse(r.value)); } catch{}
-      try { const r = await window.storage.get("supers",true).catch(()=>null); if(r) setSupers(JSON.parse(r.value)); } catch{}
       // Restore session
       let sess = null;
       try { const s = sessionStorage.getItem("shift_session"); if(s) sess = JSON.parse(s); } catch{}
@@ -555,20 +556,20 @@ function ShiftApp() {
 
   const flash = msg => { setToast(msg); setTimeout(()=>setToast(""),2800); };
   const me = useMemo(() => {
-    // Phase D: owner impersonation wins over everything. Only resolves once the matching
-    // local user is loaded (loadGroup is async); startImpersonate awaits loadGroup before
-    // setting the impersonate state, but we guard here too in case of races.
+    // Owner impersonation wins over everything. Only resolves once the matching local user
+    // is loaded (loadGroup is async); startImpersonate awaits loadGroup before setting the
+    // impersonate state, but we guard here too in case of races.
     if(impersonate && impersonate.groupId === groupId){
       const u = users.find(x => x.id === impersonate.localUid);
       if(u) return {...u, impersonating: true};
     }
-    // Local-session paths run before the cloud bridge. A local sign-in is an explicit,
-    // current action and wins over the long-lived cloud identity.
-    if(session?.superId){ const s = supers.find(x=>x.id===session.superId); if(s) return {...s, role:"super"}; }
+    // Local-session path: only set during impersonation (the local Sign in/Sign up tabs are
+    // gone in D.3). Kept for the impersonation hand-off.
     if(session?.userId){ const u = users.find(u=>u.id===session.userId); if(u) return u; }
-    // Phase D bridge: fall back to cloud-owner. If signed in to cloud and own at least one
-    // cloud group, render as super. After D.3 this becomes the only path to SuperDashboard.
-    if(cloudUser?.memberships?.some(m => m.role === "owner")){
+    // D.3: cloud bridge is the primary path to SuperDashboard. Triggers when the user owns
+    // at least one cloud group OR when they signed up with the OWNER_BOOTSTRAP_CODE but
+    // haven't yet created their first group (cold-start owner case).
+    if(cloudUser?.memberships?.some(m => m.role === "owner") || cloudUser?.user?.canCreateGroups){
       return {
         id: cloudUser.user.id,
         name: cloudUser.user.displayName || cloudUser.user.email,
@@ -577,7 +578,7 @@ function ShiftApp() {
       };
     }
     return null;
-  }, [session, users, supers, cloudUser, impersonate, groupId]);
+  }, [session, users, cloudUser, impersonate, groupId]);
   const currentGroup = useMemo(() => groupId?groups.find(g=>g.id===groupId):null, [groupId, groups]);
   const mySeniority = useMemo(() => me?.seniorityId ? config.seniorityLevels.find(l=>l.id===me.seniorityId) : null, [me, config]);
 
@@ -607,84 +608,180 @@ function ShiftApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me?.id, mySeniority?.minShifts]);
 
-  /* ── Auth ── */
-  const handleAuth = async () => {
-    setAuthError("");
-    const username = authForm.username.trim().toLowerCase();
-    const pw = authForm.password;
-    if (!username||!pw) { setAuthError("Username and password required"); return; }
-    const pwHash = await sha256(pw);
+  /* ── Auth (D.3: cloud-backed) ── */
+  // After a cloud sign-in or sign-up, if the user has a non-owner membership in a group, this
+  // helper makes sure the local mirror exists (groups[], users[gid][i], and an applied snapshot
+  // when one is available) and sets `session = {groupId, userId}` so the `me` useMemo resolves.
+  // For owner-only memberships this is a no-op — the cloud bridge handles SuperDashboard.
+  // For 2+ non-owner memberships we pick the first one (a group picker is future work).
+  const enterGroupAsCloudMember = async (memberships, fallbackCodes) => {
+    if (!Array.isArray(memberships) || memberships.length === 0) return false;
+    const m = memberships.find(x => x.role !== "owner");
+    if (!m) return false;
+    // Try to find an existing local group mirroring this cloud group.
+    let localGroup = groups.find(g => g.cloudGroupId === m.groupId);
+    let localGroups = groups;
+    if (!localGroup) {
+      // Pull the latest snapshot if one exists. Meta gives us name + codes; absent fields fall
+      // back to whatever the user typed in the form (or generated codes for the empty-group case).
+      let snap = null;
+      try { snap = await window.api.fetchJSON("/api/snapshots/" + encodeURIComponent(m.groupId) + "/latest"); } catch {}
+      const meta = snap?.payload?.meta || {};
+      localGroup = {
+        id: Date.now(),
+        name: meta.name || m.groupName || "Group",
+        groupCode: meta.groupCode || (fallbackCodes?.groupCode || genCode(6)),
+        adminCode: meta.adminCode || (fallbackCodes?.adminCode || genCode(6)),
+        cloudGroupId: m.groupId,
+        createdAt: meta.createdAt || Date.now(),
+      };
+      localGroups = [...groups, localGroup];
+      setGroups(localGroups);
+      await persistRoot("groups", localGroups);
+      if (snap?.payload) await applySnapshot(localGroup.id, snap.payload);
+      try { if (snap?.clientTs) localStorage.setItem(`shyft3_g${localGroup.id}_lastModified`, String(snap.clientTs)); } catch {}
+    }
+    // Read (or initialize) the local user roster for this group, then ensure THIS person has a
+    // local user record. The id is freshly generated; cloudUserId links back to the cloud row.
+    let localUsers = [];
+    try { const r = await window.storage.get(gKey(localGroup.id,"users"),true).catch(()=>null); localUsers = r?JSON.parse(r.value):[]; } catch {}
+    // Prefer membership.localUid (set by D.2 migration). Fall back to cloudUserId for
+    // post-D.3 signups whose memberships don't yet have a localUid.
+    let localUser = null;
+    if (m.localUid != null) {
+      // localUid in D1 is a string; existing local rows compare via == to allow numeric ids.
+      // eslint-disable-next-line eqeqeq
+      localUser = localUsers.find(u => u.id == m.localUid);
+    }
+    if (!localUser) {
+      localUser = localUsers.find(u => u.cloudUserId && cloudUser?.user?.id && u.cloudUserId === cloudUser.user.id);
+    }
+    if (!localUser) {
+      localUser = {
+        id: Date.now() + 1,
+        cloudUserId: cloudUser?.user?.id || null,
+        name: cloudUser?.user?.displayName || cloudUser?.user?.email || "Member",
+        username: cloudUser?.user?.username || null,
+        role: m.role,
+        seniorityId: null,
+        points: 0,
+        targets: { min:0, ideal:0, max:0 },
+        createdAt: Date.now(),
+      };
+      localUsers = [...localUsers, localUser];
+      await window.storage.set(gKey(localGroup.id,"users"), JSON.stringify(localUsers), true).catch(()=>{});
+    }
+    await loadGroup(localGroup.id);
+    setUsers(localUsers);
+    const sess = { groupId: localGroup.id, userId: localUser.id };
+    setSession(sess);
+    sessionStorage.setItem("shift_session", JSON.stringify(sess));
+    return true;
+  };
 
-    if (authMode==="signin") {
-      // Search: first all groups' user rosters, then the super pool.
-      for(const g of groups){
-        try {
-          const r = await window.storage.get(gKey(g.id,"users"),true).catch(()=>null);
-          const list = r?JSON.parse(r.value):[];
-          const u = list.find(x=>x.username===username);
-          if(u){
-            if(u.passwordHash!==pwHash){ setAuthError("Wrong password"); return; }
-            await loadGroup(g.id);
-            const sess = {groupId:g.id, userId:u.id}; setSession(sess); sessionStorage.setItem("shift_session",JSON.stringify(sess));
-            setAuthForm({username:"",password:"",name:"",groupCode:"",adminCode:"",superBootstrap:""}); setPage("home");
-            return;
-          }
-        } catch{}
+
+  // Reset to the empty form shape after a successful sign in or sign up.
+  const resetAuthForm = () => setAuthForm({
+    emailOrUsername:"", password:"", displayName:"", email:"", username:"",
+    groupCode:"", adminCode:"", ownerCode:"",
+  });
+
+  // Friendly error message for backend codes, falling back to a generic message.
+  const authErrorMessage = (code) => ({
+    invalid_credentials: "Email/username or password is incorrect.",
+    rate_limited: "Too many attempts. Try again in an hour.",
+    invalid_email: "Please enter a valid email address.",
+    invalid_username: "Username must be 3–32 chars, lowercase letters, numbers, or underscores.",
+    invalid_display_name: "Please enter your name.",
+    password_too_short: "Password must be at least 8 characters.",
+    invalid_group_code: "Invalid group code.",
+    invalid_admin_code: "Invalid admin code.",
+    invalid_owner_code: "Invalid owner code.",
+    group_code_required: "Group code is required (or supply an owner code).",
+    email_taken: "An account with that email already exists.",
+    username_taken: "That username is taken.",
+  }[code] || "Something went wrong. Try again.");
+
+  // Sign in via /api/auth/password. Identifier may be email or username.
+  const signInCloud = async (emailOrUsername, password) => {
+    setAuthError(""); setCloudError(""); setCloudBusy(true);
+    try {
+      await window.api.fetchJSON("/api/auth/password", {
+        method: "POST",
+        body: JSON.stringify({ emailOrUsername: (emailOrUsername||"").trim().toLowerCase(), password }),
+      });
+      // Refresh /api/me so cloudUser reflects the fresh session immediately.
+      let meRes = null;
+      try { meRes = await window.api.fetchJSON("/api/me"); if (meRes) setCloudUser(meRes); } catch {}
+      // Auto-enter the group when the user has a non-owner membership. Owners land on
+      // SuperDashboard via the cloud bridge.
+      if (meRes?.memberships?.length) await enterGroupAsCloudMember(meRes.memberships);
+      resetAuthForm();
+      setPage("home");
+    } catch (e) {
+      setAuthError(authErrorMessage(e?.body?.error));
+    } finally { setCloudBusy(false); }
+  };
+
+  // Sign up via /api/auth/signup. groupCode is optional only when ownerCode is valid (cold-start).
+  const signUpCloud = async ({ displayName, email, username, password, groupCode, adminCode, ownerCode }) => {
+    setAuthError(""); setCloudError(""); setCloudBusy(true);
+    try {
+      const res = await window.api.fetchJSON("/api/auth/signup", {
+        method: "POST",
+        body: JSON.stringify({
+          displayName: (displayName||"").trim(),
+          email: (email||"").trim().toLowerCase(),
+          username: (username||"").trim().toLowerCase(),
+          password,
+          groupCode: (groupCode||"").trim().toUpperCase(),
+          adminCode: (adminCode||"").trim().toUpperCase() || undefined,
+          ownerCode: ownerCode || undefined,
+        }),
+      });
+      // Server response has the same shape as /api/me — drop straight into cloudUser.
+      if (res) setCloudUser(res);
+      // Auto-enter the group for non-owner signups. Pass the form's codes as fallbacks for the
+      // case where this is the first member and there's no snapshot yet.
+      if (res?.memberships?.length) {
+        await enterGroupAsCloudMember(res.memberships, {
+          groupCode: (groupCode||"").trim().toUpperCase(),
+          adminCode: (adminCode||"").trim().toUpperCase(),
+        });
       }
-      const sup = supers.find(s=>s.username===username);
-      if(sup){
-        if(sup.passwordHash!==pwHash){ setAuthError("Wrong password"); return; }
-        const sess = {superId:sup.id}; setSession(sess); sessionStorage.setItem("shift_session",JSON.stringify(sess));
-        setAuthForm({username:"",password:"",name:"",groupCode:"",adminCode:"",superBootstrap:""}); setPage("home");
+      resetAuthForm();
+      setPage("home");
+      const m = res?.memberships?.[0];
+      if (m) {
+        flash(m.role === "admin" ? `👑 Admin of ${m.groupName}` : `✅ Joined ${m.groupName}`);
+        if (m.role === "provider") setShowOnboarding(true);
+      } else if (res?.user?.canCreateGroups) {
+        flash(`🛠 Owner account created`);
+      }
+    } catch (e) {
+      setAuthError(authErrorMessage(e?.body?.error));
+    } finally { setCloudBusy(false); }
+  };
+
+  // Thin dispatcher kept so the auth screen's Enter-key + button handlers stay simple.
+  const handleAuth = async () => {
+    if (authMode === "signin") {
+      const id = authForm.emailOrUsername.trim();
+      if (!id || !authForm.password) { setAuthError("Email/username and password required"); return; }
+      return signInCloud(id, authForm.password);
+    }
+    if (authMode === "signup") {
+      const f = authForm;
+      // Client-side mirror of the server-side rule so users see the right error inline.
+      if (!f.displayName.trim()) { setAuthError("Please enter your name"); return; }
+      if (!f.email.trim()) { setAuthError("Email required"); return; }
+      if (!f.username.trim()) { setAuthError("Username required"); return; }
+      if (f.password.length < 8) { setAuthError("Password must be at least 8 characters"); return; }
+      if (!f.groupCode.trim() && !f.ownerCode.trim()) {
+        setAuthError("Group code is required (or supply an owner code)");
         return;
       }
-      setAuthError("No account found with that username"); return;
-    }
-
-    if (authMode==="signup") {
-      const gCode = authForm.groupCode.trim().toUpperCase();
-      if(!gCode){ setAuthError("Group code required"); return; }
-      const group = groups.find(g=>g.groupCode===gCode);
-      if(!group){ setAuthError("Invalid group code"); return; }
-      if(!authForm.name.trim()){ setAuthError("Name required"); return; }
-      if(pw.length<4){ setAuthError("Password must be 4+ chars"); return; }
-      // Optional admin code: if present, validate; if invalid, error.
-      const adminCode = authForm.adminCode.trim().toUpperCase();
-      let role = "provider";
-      if(adminCode){
-        if(adminCode!==group.adminCode){ setAuthError("Invalid admin code"); return; }
-        role = "admin";
-      }
-      // Load group's users to validate uniqueness
-      let gUsers = [];
-      try { const r = await window.storage.get(gKey(group.id,"users"),true).catch(()=>null); gUsers = r?JSON.parse(r.value):[]; } catch{}
-      if(gUsers.find(u=>u.username===username)){ setAuthError("Username taken in this group"); return; }
-      const nu = { id:Date.now(), username, passwordHash:pwHash,
-        name:authForm.name.trim(), role, seniorityId:null, points:0,
-        targets:{min:0,ideal:0,max:0}, createdAt:Date.now() };
-      const next = [...gUsers,nu];
-      await window.storage.set(gKey(group.id,"users"), JSON.stringify(next), true).catch(()=>{});
-      await loadGroup(group.id);
-      setUsers(next); // ensure in-memory reflects the just-added user even if loadGroup hasn't finished
-      const sess = {groupId:group.id, userId:nu.id}; setSession(sess); sessionStorage.setItem("shift_session",JSON.stringify(sess));
-      setAuthForm({username:"",password:"",name:"",groupCode:"",adminCode:"",superBootstrap:""}); setPage("home");
-      if(role==="provider") setShowOnboarding(true);
-      flash(role==="admin"?`👑 Admin of ${group.name}`:`✅ Joined ${group.name}`);
-      return;
-    }
-
-    if (authMode==="super") {
-      if(!authForm.name.trim()){ setAuthError("Name required"); return; }
-      if(pw.length<4){ setAuthError("Password must be 4+ chars"); return; }
-      const bs = authForm.superBootstrap.trim();
-      if(bs!==SUPER_BOOTSTRAP){ setAuthError("Invalid owner bootstrap code"); return; }
-      if(supers.find(s=>s.username===username)){ setAuthError("Username already registered as owner"); return; }
-      const ns = { id:Date.now(), username, passwordHash:pwHash, name:authForm.name.trim(), createdAt:Date.now() };
-      const next = [...supers,ns]; setSupers(next); await persistRoot("supers",next);
-      const sess = {superId:ns.id}; setSession(sess); sessionStorage.setItem("shift_session",JSON.stringify(sess));
-      setAuthForm({username:"",password:"",name:"",groupCode:"",adminCode:"",superBootstrap:""}); setPage("home");
-      flash(`🛠 Owner account created`);
-      return;
+      return signUpCloud(f);
     }
   };
 
@@ -728,24 +825,6 @@ function ShiftApp() {
         : (e?.body?.error === "invalid_invite"
           ? "Invite link is invalid or expired."
           : "Couldn't send the link. Try again."));
-    } finally { setCloudBusy(false); }
-  };
-  // Phase D.1: password sign-in for test users (and optionally real users who set one).
-  // Same session cookie as magic-link, so success path behaves identically.
-  const signInWithPassword = async (email, password) => {
-    setCloudBusy(true); setCloudError("");
-    try {
-      await window.api.fetchJSON("/api/auth/password", {
-        method: "POST",
-        body: JSON.stringify({ email: (email||"").trim().toLowerCase(), password }),
-      });
-      // Refresh /api/me so cloudUser reflects the new session immediately.
-      try { const meRes = await window.api.fetchJSON("/api/me"); if (meRes) setCloudUser(meRes); } catch {}
-      setCloudPassword("");
-    } catch (e) {
-      setCloudError(e?.body?.error === "rate_limited"
-        ? "Too many attempts. Try again in an hour."
-        : "Email or password is incorrect.");
     } finally { setCloudBusy(false); }
   };
   const signOutCloud = async () => {
@@ -996,7 +1075,8 @@ function ShiftApp() {
       try {
         const r = await window.api.fetchJSON("/api/groups", {
           method: "POST",
-          body: JSON.stringify({ name: ng.name }),
+          // D.3: also persist the codes server-side so cloud signups can resolve groupCode → group.
+          body: JSON.stringify({ name: ng.name, groupCode: gc, adminCode: ac }),
         });
         if (r?.groupId) ng.cloudGroupId = r.groupId;
         // Refresh memberships so the new group shows up in `cloudUser.memberships`.
@@ -2389,17 +2469,22 @@ function ShiftApp() {
 
   if(loading) return <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500">Loading…</div>;
 
-  /* ══ AUTH SCREEN ══ */
-  // Phase D bridge: render auth screen only when there's no `me` at all. Pre-D.3 this was
-  // `!session||!me` because `me` was always derived from `session`. Now `me` may come from
-  // a cloud-owner with no local session — checking `!session` would lock them out.
+  /* ══ AUTH SCREEN (D.3: cloud-backed) ══ */
+  // Render only when there's no `me`. `me` may come from the cloud-owner bridge (no local
+  // session) so we don't gate on `!session`.
   if(!me){
-    const noGroupsYet = groups.length===0;
-    const cloudHelper = authMode==="cloud"
-      ? (pendingInvite
-          ? `Sign in with email to accept your invite to ${pendingInvite.groupName}.`
-          : "Sign in with email — we'll send you a one-time link.")
-      : null;
+    const headerCopy = pendingInvite
+      ? `Sign in to accept your invite to ${pendingInvite.groupName}.`
+      : (authMode === "signup" ? "Create your SHIFT account." : "Sign in to SHIFT.");
+    const sentTo = (authForm.emailOrUsername || authForm.email || "").trim();
+    const sendMagicLink = () => {
+      const email = (authForm.emailOrUsername || "").trim();
+      if (!email.includes("@")) {
+        setAuthError("Enter your email address to use the magic link.");
+        return;
+      }
+      requestMagicLink(email, pendingInvite?.token);
+    };
     return(
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
         <div className="w-full max-w-sm space-y-3">
@@ -2436,97 +2521,104 @@ function ShiftApp() {
           <div className="mb-1 flex justify-center">
             <ShiftLogoStacked height={140}/>
           </div>
-          {pendingInvite && authMode!=="cloud" && (
+          {pendingInvite && (
             <div className="mb-4 px-3 py-2.5 rounded-lg bg-blue-50 border border-blue-200 text-sm">
               <div className="font-medium text-blue-900">You've been invited to <span className="font-semibold">{pendingInvite.groupName}</span></div>
-              <div className="text-xs text-blue-700 mt-0.5">Use the <button className="underline font-medium" onClick={()=>{setAuthMode("cloud");setAuthError("");setCloudError("");}}>Cloud</button> tab to accept.</div>
+              <div className="text-xs text-blue-700 mt-0.5">Sign in or create an account below — we'll attach the invite when you arrive.</div>
             </div>
           )}
-          <p className="text-sm text-slate-500 mb-5">
-            {cloudHelper || (authMode==="super"?"Create a new owner account. Existing owners sign in via the Sign in tab.":(noGroupsYet?"No groups yet — an owner must create one first.":"Sign in or join your group."))}
-          </p>
+          <p className="text-sm text-slate-500 mb-5">{headerCopy}</p>
           <div className="flex bg-slate-100 rounded-lg p-1 mb-5">
-            {[["signin","Sign in"],["signup","Sign up"],["super","Owner"],["cloud","Cloud"]].map(([m,l])=>(
+            {[["signin","Sign in"],["signup","Sign up"]].map(([m,l])=>(
               <button key={m} onClick={()=>{setAuthMode(m);setAuthError("");setCloudError("");setMagicLinkSent(false);}}
                 className={`flex-1 py-2 text-xs font-medium rounded-md transition ${authMode===m?"bg-white shadow text-slate-900":"text-slate-500"}`}>
                 {l}
               </button>
             ))}
           </div>
-          {authMode==="cloud"?(
-            magicLinkSent ? (
-              <div className="space-y-3 text-sm">
-                <div className="px-3 py-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800">
-                  Check your inbox — we sent a sign-in link to <span className="font-medium">{cloudEmail}</span>.
-                </div>
-                <p className="text-xs text-slate-500">The link expires in 15 minutes and can only be used once. You can close this tab.</p>
-                <button onClick={()=>{setMagicLinkSent(false);setCloudError("");}}
-                  className="w-full text-xs font-medium text-slate-600 hover:text-slate-800 py-2">Send to a different email</button>
+          {magicLinkSent ? (
+            <div className="space-y-3 text-sm">
+              <div className="px-3 py-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800">
+                Check your inbox — we sent a sign-in link to <span className="font-medium">{sentTo}</span>.
               </div>
-            ) : (
-              <>
-                <Field label="Email"><input type="email" value={cloudEmail} autoComplete="email" autoCapitalize="none"
-                  onChange={e=>setCloudEmail(e.target.value)}
-                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500" placeholder="you@example.com"/></Field>
-                <Field label="Password (test users only — leave blank to magic-link)">
-                  <input type="password" value={cloudPassword} autoComplete="current-password"
-                    onChange={e=>setCloudPassword(e.target.value)}
-                    onKeyDown={e=>{
-                      if(e.key!=="Enter"||cloudBusy||!cloudEmail.trim()) return;
-                      if(cloudPassword) signInWithPassword(cloudEmail, cloudPassword);
-                      else requestMagicLink(cloudEmail, pendingInvite?.token);
-                    }}
-                    className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500" placeholder=""/>
-                </Field>
-                {cloudError&&<div className="text-xs text-red-600 mb-3">{cloudError}</div>}
-                <button onClick={()=>{
-                  if(cloudPassword) signInWithPassword(cloudEmail, cloudPassword);
-                  else requestMagicLink(cloudEmail, pendingInvite?.token);
-                }}
-                  disabled={cloudBusy||!cloudEmail.trim()}
-                  className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium text-base transition disabled:bg-slate-300">
-                  {cloudBusy
-                    ? (cloudPassword?"Signing in…":"Sending…")
-                    : (cloudPassword?"Sign in":(pendingInvite?"Accept invite":"Send magic link"))}
-                </button>
-                <p className="text-xs text-slate-400 mt-4 text-center">
-                  Cloud sign-in is independent of your local account — both keep working.
-                </p>
-              </>
-            )
-          ):(<>
-          {authMode==="signup"&&(<>
-            <Field label="Group code"><input type="text" value={authForm.groupCode} autoCapitalize="characters"
-              onChange={e=>setAuthForm({...authForm,groupCode:e.target.value.toUpperCase()})}
-              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base font-mono tracking-wider focus:outline-none focus:border-blue-500" placeholder="ABCD12"/></Field>
-            <Field label="Admin code (optional — leave blank to join as provider)"><input type="text" value={authForm.adminCode} autoCapitalize="characters"
-              onChange={e=>setAuthForm({...authForm,adminCode:e.target.value.toUpperCase()})}
-              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base font-mono tracking-wider focus:outline-none focus:border-blue-500" placeholder=""/></Field>
-            <Field label="Full name"><input type="text" value={authForm.name} onChange={e=>setAuthForm({...authForm,name:e.target.value})}
-              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500" placeholder="Jane Smith"/></Field>
-          </>)}
-          {authMode==="super"&&(<>
-            <Field label="Full name"><input type="text" value={authForm.name} onChange={e=>setAuthForm({...authForm,name:e.target.value})}
-              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500" placeholder="Jane Smith"/></Field>
-            <Field label="Owner bootstrap code"><input type="text" value={authForm.superBootstrap}
-              onChange={e=>setAuthForm({...authForm,superBootstrap:e.target.value})}
-              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base font-mono focus:outline-none focus:border-blue-500"/></Field>
-          </>)}
-          <Field label="Username"><input type="text" value={authForm.username} autoComplete="username" autoCapitalize="none"
-            onChange={e=>setAuthForm({...authForm,username:e.target.value})}
-            className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"/></Field>
-          <Field label="Password"><input type="password" value={authForm.password}
-            autoComplete={authMode==="signin"?"current-password":"new-password"}
-            onChange={e=>setAuthForm({...authForm,password:e.target.value})}
-            onKeyDown={e=>e.key==="Enter"&&handleAuth()}
-            className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"/></Field>
-          {authError&&<div className="text-xs text-red-600 mb-3">{authError}</div>}
-          <button onClick={handleAuth} className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium text-base transition">
-            {authMode==="signin"?"Sign in":authMode==="super"?"Create owner account":"Create account"}
-          </button>
-          {authMode==="signup"&&<p className="text-xs text-slate-400 mt-4 text-center">Group and admin codes come from your group's owner.</p>}
-          {authMode==="super"&&<p className="text-xs text-slate-400 mt-4 text-center">An owner bootstrap code is required to create an owner account.</p>}
-          </>)}
+              <p className="text-xs text-slate-500">The link expires in 15 minutes and can only be used once. You can close this tab.</p>
+              <button onClick={()=>{setMagicLinkSent(false);setCloudError("");}}
+                className="w-full text-xs font-medium text-slate-600 hover:text-slate-800 py-2">Send to a different email</button>
+            </div>
+          ) : authMode === "signin" ? (
+            <>
+              <Field label="Email or username">
+                <input type="text" value={authForm.emailOrUsername} autoComplete="username" autoCapitalize="none"
+                  onChange={e=>setAuthForm({...authForm, emailOrUsername:e.target.value})}
+                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"
+                  placeholder="you@example.com or jsmith"/>
+              </Field>
+              <Field label="Password">
+                <input type="password" value={authForm.password} autoComplete="current-password"
+                  onChange={e=>setAuthForm({...authForm, password:e.target.value})}
+                  onKeyDown={e=>e.key==="Enter"&&!cloudBusy&&handleAuth()}
+                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"/>
+              </Field>
+              {(authError||cloudError) && <div className="text-xs text-red-600 mb-3">{authError||cloudError}</div>}
+              <button onClick={handleAuth} disabled={cloudBusy}
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium text-base transition disabled:bg-slate-300">
+                {cloudBusy ? "Signing in…" : "Sign in"}
+              </button>
+              <button onClick={sendMagicLink} disabled={cloudBusy}
+                className="w-full text-xs font-medium text-slate-500 hover:text-slate-700 py-2 mt-1 disabled:opacity-50">
+                Or email me a sign-in link instead
+              </button>
+            </>
+          ) : (
+            // Sign up — cloud-backed. Group code optional only when owner code is supplied.
+            <>
+              <Field label="Full name">
+                <input type="text" value={authForm.displayName}
+                  onChange={e=>setAuthForm({...authForm, displayName:e.target.value})}
+                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"
+                  placeholder="Jane Smith"/>
+              </Field>
+              <Field label="Email">
+                <input type="email" value={authForm.email} autoComplete="email" autoCapitalize="none"
+                  onChange={e=>setAuthForm({...authForm, email:e.target.value})}
+                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"
+                  placeholder="you@example.com"/>
+              </Field>
+              <Field label="Username">
+                <input type="text" value={authForm.username} autoComplete="username" autoCapitalize="none"
+                  onChange={e=>setAuthForm({...authForm, username:e.target.value.toLowerCase()})}
+                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"
+                  placeholder="jsmith"/>
+              </Field>
+              <Field label="Password (8+ characters)">
+                <input type="password" value={authForm.password} autoComplete="new-password"
+                  onChange={e=>setAuthForm({...authForm, password:e.target.value})}
+                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"/>
+              </Field>
+              <Field label="Group code (optional if you have an owner code)">
+                <input type="text" value={authForm.groupCode} autoCapitalize="characters"
+                  onChange={e=>setAuthForm({...authForm, groupCode:e.target.value.toUpperCase()})}
+                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base font-mono tracking-wider focus:outline-none focus:border-blue-500"
+                  placeholder="ABCD12"/>
+              </Field>
+              <Field label="Admin code (optional — elevates you to admin)">
+                <input type="text" value={authForm.adminCode} autoCapitalize="characters"
+                  onChange={e=>setAuthForm({...authForm, adminCode:e.target.value.toUpperCase()})}
+                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base font-mono tracking-wider focus:outline-none focus:border-blue-500"/>
+              </Field>
+              <Field label="Owner code (optional — required to create new groups)">
+                <input type="text" value={authForm.ownerCode}
+                  onChange={e=>setAuthForm({...authForm, ownerCode:e.target.value})}
+                  className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base font-mono focus:outline-none focus:border-blue-500"/>
+              </Field>
+              {authError && <div className="text-xs text-red-600 mb-3">{authError}</div>}
+              <button onClick={handleAuth} disabled={cloudBusy}
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium text-base transition disabled:bg-slate-300">
+                {cloudBusy ? "Creating account…" : "Create account"}
+              </button>
+              <p className="text-xs text-slate-400 mt-4 text-center">Group and admin codes come from your group's owner. The owner code is for setting up a brand-new group.</p>
+            </>
+          )}
         </div>
         </div>
         {toast&&<Toast msg={toast}/>}
@@ -5440,9 +5532,6 @@ function ShiftApp() {
           })}</div>
         )}
 
-        <div className="mt-6 text-xs text-slate-400 text-center">
-          {supers.length} owner account{supers.length===1?"":"s"}. New owners register at the Owner tab on the sign-in screen with the bootstrap code.
-        </div>
       </main>
       {migrateState && <MigrateModal/>}
       {impersonatePicker && <ImpersonatePickerModal/>}

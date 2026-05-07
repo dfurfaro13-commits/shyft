@@ -4,7 +4,7 @@ The product is **SHIFT Scheduling** (call it **SHIFT** for short) — a scheduli
 
 This file is the catch-up brief for Claude Code instances joining the project mid-stream. **Read it first** before exploring code — the architecture has a few non-obvious gotchas that will burn time if you discover them by accident.
 
-> **Naming note for Claude:** the codebase predates the rebrand and still uses **`shyft`** in technical identifiers — file names (`ShiftApp.v3.jsx`, `shyft-v3.html`, `templates/shyft_head.v3.html`), the localStorage namespace (`shyft3_*`), the migration markers (`shyft3_migrate_from_v2`, `shyft3_g{gid}_migrate_top_options`), and the `SUPER_BOOTSTRAP = "Shyft-Kai-Dave"` owner-bootstrap secret. **Leave these alone.** Renaming the storage namespace would invalidate every existing user's data; renaming the bootstrap string would break owner-account creation. Only update brand mentions in user-facing UI strings, comments, and docs.
+> **Naming note for Claude:** the codebase predates the rebrand and still uses **`shyft`** in technical identifiers — file names (`ShiftApp.v3.jsx`, `shyft-v3.html`, `templates/shyft_head.v3.html`), the localStorage namespace (`shyft3_*`), and the migration markers (`shyft3_migrate_from_v2`, `shyft3_g{gid}_migrate_top_options`). **Leave these alone.** Renaming the storage namespace would invalidate every existing user's data. Only update brand mentions in user-facing UI strings, comments, and docs. (The old `SUPER_BOOTSTRAP = "Shyft-Kai-Dave"` constant moved to a Worker secret, `OWNER_BOOTSTRAP_CODE`, in D.3 — same value, different home.)
 
 ---
 
@@ -111,7 +111,8 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | `migrations/0001_init.sql` | D1 schema for Phase A: `users`, `groups`, `memberships`, `invites`, `login_tokens`, `sessions`. |
 | `migrations/0002_events.sql` | Phase B append-only event log (`events` table). |
 | `migrations/0003_snapshots.sql` | Phase C per-group state snapshot (`snapshots` table). Latest only — full history lives in R2. |
-| `migrations/0004_users_passwords.sql` | Phase D: adds `users.password_hash`, `users.kind`, and `password_attempts` rate-limit table. |
+| `migrations/0004_users_passwords.sql` | Phase D.1: adds `users.password_hash`, `users.kind`, and `password_attempts` rate-limit table. |
+| `migrations/0005_username_owner.sql` | Phase D.3: adds `users.username` (partial unique), `users.can_create_groups`, `groups.group_code`, `groups.admin_code`, plus `signup_attempts`. Backfills owner permission + group/admin codes from snapshots. |
 | `Phases for Shyft and Rules for shift assignment.docx` | The spec. Source of truth for behavior. Re-read when in doubt. |
 | `legacy/` | Archived v1/v2 source + built HTML, plus v1-era assignment-algorithm simulators (`simulate.js`, `simulate.py`). **Do not read or grep into.** |
 | `~/.claude/plans/*.md` | Planning artifacts. Look for the most recent one for context on the latest change. |
@@ -122,12 +123,12 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 
 Phase A added a Cloudflare Worker + D1 backend for **magic-link auth and owner-issued invite links** — nothing more. localStorage is still source of truth for all scheduling data; the cloud session is purely additive.
 
-- **Deploy:** `npx wrangler deploy` (after `wrangler login`, `d1 create shift-db`, paste id into `wrangler.jsonc`, `d1 execute shift-db --remote --file=migrations/0001_init.sql`, `r2 bucket create shift-events`, and `wrangler secret put RESEND_API_KEY` + `SESSION_PEPPER`).
+- **Deploy:** `npx wrangler deploy` (after `wrangler login`, `d1 create shift-db`, paste id into `wrangler.jsonc`, run each `migrations/000*.sql` file via `d1 execute shift-db --remote --file=…`, `r2 bucket create shift-events`, and `wrangler secret put RESEND_API_KEY`, `SESSION_PEPPER`, `OWNER_BOOTSTRAP_CODE`).
 - **Local dev:** `npx wrangler dev`. Create `.dev.vars` (gitignored) with `RESEND_API_KEY=...` and `DEV_EMAIL=console` to log magic links instead of sending.
-- **Email sender:** Until a custom domain is added, FROM is `onboarding@resend.dev` and only the email tied to the Resend account receives real magic links. To unblock multi-user, set `EMAIL_FROM` once a verified domain is configured.
+- **Email sender:** custom domain is live (`app.shift-scheduling.com` via Resend). `EMAIL_FROM` is configured; magic links deliver to any address.
 - **CSRF:** every state-changing API call must send `X-Requested-With: shift`. The `window.api.fetchJSON` shim in `templates/shyft_head.v3.html` adds it automatically.
 - **Sessions:** opaque `shift_sid` cookie. Server stores `SHA-256(SESSION_PEPPER + raw)`; raw value never persisted.
-- **Frontend integration points:** the cloud session lives in the `cloudUser` state alongside the existing local `session`. The Auth screen has a 4th "Cloud" tab; the SuperDashboard shows a cloud-account strip and an "Invite link" button per cloud-mirrored group. Local username/group-code login is unchanged.
+- **Auth model post-D.3:** cloud is the source of truth. Auth screen has 2 tabs (Sign in / Sign up); both call cloud APIs. The local-session path in `me` only fires during owner impersonation; otherwise `me` is derived from `cloudUser`. The `OWNER_BOOTSTRAP_CODE` Worker secret (currently `Shyft-Kai-Dave`) gates group creation via the optional Owner code field on Sign up.
 
 Phase C (snapshot sync) is not implemented.
 
@@ -150,7 +151,7 @@ Two consumer flows on the frontend:
 
 The uploader silently no-ops when the user isn't cloud-signed-in or the active group has no `cloudGroupId`. localStorage remains source of truth — Phase C is mirroring, not migration.
 
-### Phase D — backend-as-truth (D.1 + D.2 + D.2.5 shipped; D.3 deferred)
+### Phase D — backend-as-truth (D.1 + D.2 + D.2.5 + D.3 shipped)
 
 **D.1 (password auth + cloud user creation).** Cloud users now carry an optional PBKDF2 `password_hash` (SHA-256 with 310k iters, 16-byte salt; format `pbkdf2$310000$<salt>$<hash>`) and a `kind ∈ ('real','test')` designator. New endpoint `POST /api/auth/password` issues a session for `email + password`; rate-limited at 10/hr per `(email, ip)` via the new `password_attempts` table. Endpoint `POST /api/users` lets an owner/admin create a cloud user + membership — `kind='test'` mints a synthetic `<localId>@<cloudGroupId>.test.invalid` email and a temp password returned in the response; `kind='real'` validates the supplied email and pre-issues a magic-link via Resend.
 
@@ -163,39 +164,25 @@ The admin "+ Add user" modal in PeoplePage now creates BOTH a local user (existi
 - **Cloud-owner bridge.** The `me` useMemo in `ShiftApp.v3.jsx` (~line 343) now derives `me.role === "super"` from `cloudUser.memberships.some(m => m.role === "owner")` when no local session is present. The auth-screen guard (~line 2154) was changed from `if(!session||!me)` to `if(!me)` so a cloud-only owner reaches SuperDashboard. Precedence is: impersonation > local session > cloud-owner bridge — a local sign-in always wins so signing in as a test user works mid-cloud-session.
 - **Owner impersonation.** Each group card in SuperDashboard has a **"👁 View as"** button → `ImpersonatePickerModal` lists admins+providers for that group (read directly from localStorage via `readGroupKey`, no group-load required) → `startImpersonate(gid, localUid)` awaits `loadGroup` then sets the `impersonate` state. State shape: `{groupId, localUid}`, persisted in `sessionStorage` under `shyft3_impersonate` so it survives reloads in the same tab. While impersonating, an amber sticky banner at the top of the main app shows "👤 Impersonating <name> · Stop" — Stop calls `stopImpersonate` which clears state, clears group context, and returns to SuperDashboard via the cloud bridge. Component-local helpers, no head-template mirror needed. **Caveat:** events fired during impersonation hit `/api/events` as if from the impersonated user — fine for test groups, revisit if real users get onboarded pre-D.3.
 
-**D.3 (deferred — design fixed, implementation pending).** Revised plan: do NOT delete the Sign in / Sign up tabs — instead, **rewire them to be cloud-backed** so the auth UX feels like any normal SaaS. The local Owner tab + `SUPER_BOOTSTRAP` are deleted; their replacement is an "Owner code" field on the Sign up form. Magic link survives as a secondary "email me a sign-in link" option on the Sign in tab.
+**D.3 (cloud-backed auth).** Local Sign in / Sign up are gone; their replacements are cloud-backed and live on the same two-tab auth screen. Migration `0005_username_owner.sql` adds `users.username` (nullable, unique-when-not-null partial index), `users.can_create_groups`, `groups.group_code`, `groups.admin_code`, plus a `signup_attempts` rate-limit table. The migration grandfathers existing owners by setting `can_create_groups = 1` for everyone with an `owner` membership, and backfills `groups.group_code` / `admin_code` from the latest snapshot's `payload.meta`.
 
-Confirmed design decisions (David, this session):
+- **`POST /api/auth/signup`** ([src/api/signup.js](src/api/signup.js)): self-serve. Body `{ displayName, email, username, password, groupCode?, adminCode?, ownerCode? }`. Owner code is matched against the `OWNER_BOOTSTRAP_CODE` Worker secret; valid → `can_create_groups = 1` AND group code becomes optional (cold-start owner). With a group code, the user joins as `provider`; supplying a matching admin code elevates to `admin`. PBKDF2 password hash (same params as D.1). Rate-limited 10/hr per IP via `signup_attempts`.
+- **`POST /api/auth/password`** updated to look up by `email OR username` (single `emailOrUsername` field on the wire). Backwards-compat alias `email` is still accepted by the body parser. Response now includes `username` and `canCreateGroups`.
+- **`POST /api/groups`** and **`POST /api/groups/:gid/migrate`**: gated on `can_create_groups`; 403 otherwise. Both also persist `group_code` and `admin_code` on the row (migrate pulls them from `payload.meta`).
+- **`getSessionUser` / `GET /api/me`**: now returns `username` and `canCreateGroups` on the user object.
+- **`OWNER_BOOTSTRAP_CODE` secret**: currently `Shyft-Kai-Dave`. Set via `wrangler secret put OWNER_BOOTSTRAP_CODE` and in `.dev.vars` for local dev.
 
-- **Sign in identifier:** email *or* username + password. Single field accepts either.
-- **Sign in fallback:** "Or email me a sign-in link instead" link below the password field — magic-link as backup. The standalone Cloud tab goes away.
-- **Sign up:** self-service. Anyone can register with name + email + username + password. No email verification (revisit when real users onboard).
-- **Group-creation gate:** sign-up form has an optional **"Owner code"** field. Correct code → user can create groups (their `can_create_groups` flag is true). Empty/wrong code → regular user; can only join groups via invite link or group code. The owner code is a Cloudflare Worker secret (e.g. `OWNER_BOOTSTRAP_CODE`) set via `wrangler secret put`, NOT hard-coded.
-- **Owner status itself stays per-group:** the cloud-owner bridge already grants SuperDashboard access to anyone with `memberships.role = 'owner'` on at least one group. Creating a group as a `can_create_groups` user inserts that owner membership (existing flow in `src/api/groups.js:27`).
-- **Existing cloud test users preserved.** They have `password_hash` and synthetic emails — they sign in via the new Sign in tab using those emails as the identifier. Username NULL is fine; the field is nullable.
+Frontend ([ShiftApp.v3.jsx](ShiftApp.v3.jsx)):
 
-Backend work (next session):
+- Auth screen has 2 tabs (Sign in / Sign up); the old Owner and Cloud tabs are gone.
+- Sign in: single "Email or username" field + password + "Or email me a sign-in link instead" link (magic-link fallback only fires when the input contains `@`).
+- Sign up: name + email + username + password + group code + admin code + owner code. Group code is required unless the owner code is present (cold-start owner case).
+- `handleAuth` is now a thin dispatcher to `signInCloud` / `signUpCloud`. The `signUpCloud` response has the `/api/me` shape and is dropped straight into `cloudUser`.
+- The `me` useMemo's `session?.superId` branch is gone. The cloud bridge now triggers on `cloudUser.memberships.some(m => m.role === "owner") || cloudUser.user.canCreateGroups` — the latter handles a brand-new owner who hasn't created their first group yet.
+- `SUPER_BOOTSTRAP` (in both the JSX preamble and `templates/shyft_head.v3.html`), the `supers` state, the local-only `signInWithPassword` helper, and the `cloudEmail` / `cloudPassword` state are all deleted. Stale localStorage `supers` keys on user devices stay inert; cleanup is deferred.
+- The "X owner accounts" footer in SuperDashboard is removed.
 
-- New migration `0005_users_username_owner.sql`: add `users.username TEXT` (nullable, unique-when-not-null via filtered index) and `users.can_create_groups INTEGER NOT NULL DEFAULT 0`. The existing `kind` column (`real`/`test`) stays orthogonal — `kind` is about email validity, `can_create_groups` is about authorization.
-- Update `POST /api/auth/password` to look up user by `email OR username` rather than just email. Rate-limit key still keyed off the lookup result's id+ip to avoid bypass.
-- New `POST /api/auth/signup` endpoint: validates name/email/username/password format, checks username uniqueness, hashes password (PBKDF2 same params as D.1), optionally validates `ownerCode` against `env.OWNER_BOOTSTRAP_CODE` and sets `can_create_groups`, inserts user, issues session immediately (no verification email). Rate-limited per-ip.
-- Server-side enforcement: `POST /api/groups` rejects with 403 unless caller's `can_create_groups = 1`. `POST /api/groups/:gid/migrate` likewise.
-
-Frontend work (next session):
-
-- Auth screen: 2 tabs (Sign in, Sign up) instead of 4. Both call cloud APIs.
-- Sign in: single "Email or username" field + password + "Or email me a sign-in link" anchor.
-- Sign up: name + email + username + password + "Owner code (optional)" field. On success, immediate session.
-- Delete `SUPER_BOOTSTRAP` constant (JSX preamble line ~94 + `templates/shyft_head.v3.html` line ~295).
-- Delete `supers` state + persistence + hydration + `setSupers` calls.
-- Delete `if(session?.superId)` branch in the `me` useMemo (the cloud-owner bridge replaces it; no super local-account ever exists).
-- Delete the local-auth `super` signup paths in `handleAuth` (~line 444–456) and the unused `superBootstrap` field on `authForm`.
-- Delete the "X owner accounts" footer line in SuperDashboard (~line 5205) — irrelevant once supers don't exist.
-- Local provider/admin sign-in via local Sign in tab is **also gone** under this plan since the tab gets rewired. Existing localStorage user records become inert — they don't auto-clean but the new Sign in form won't read from localStorage anymore. Cleanup of stale localStorage is a separate, future task.
-
-Open question to revisit before coding: how `cloudUser.memberships` are populated for a brand-new user who signs up but hasn't joined any group yet — `/api/me` should return `memberships: []`, and the auth screen should show a "Enter group code or accept invite" state since `me` would be null (no owner role, no local session). Need to add a third post-auth state to render that prompt.
-
-**Concurrency control.** `POST /api/snapshots` accepts `If-Match: <serverTs>` and returns 409 with the current serverTs when stale. The frontend doesn't yet send `If-Match` — backwards-compatible last-write-wins is preserved during D.1/D.2; D.3 will make it mandatory.
+**Concurrency control.** `POST /api/snapshots` accepts `If-Match: <serverTs>` and returns 409 with the current serverTs when stale. The frontend doesn't yet send `If-Match` — backwards-compatible last-write-wins is preserved. Making it mandatory remains deferred.
 
 ---
 

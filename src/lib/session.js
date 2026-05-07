@@ -28,7 +28,8 @@ export async function getSessionUser(env, req) {
   const idHash = await sha256Hex(raw, env.SESSION_PEPPER || "");
   const row = await q1(
     env,
-    `SELECT s.user_id, s.expires_at, s.revoked_at, u.id AS uid, u.email, u.display_name
+    `SELECT s.user_id, s.expires_at, s.revoked_at,
+            u.id AS uid, u.email, u.username, u.display_name, u.can_create_groups
        FROM sessions s
        JOIN users u ON u.id = s.user_id
       WHERE s.id_hash = ?`,
@@ -37,7 +38,13 @@ export async function getSessionUser(env, req) {
   if (!row) return null;
   if (row.revoked_at) return null;
   if (row.expires_at < nowSec()) return null;
-  return { id: row.uid, email: row.email, displayName: row.display_name };
+  return {
+    id: row.uid,
+    email: row.email,
+    username: row.username,
+    displayName: row.display_name,
+    canCreateGroups: !!row.can_create_groups,
+  };
 }
 
 export async function revokeSession(env, req) {

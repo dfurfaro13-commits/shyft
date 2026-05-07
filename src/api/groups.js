@@ -8,26 +8,39 @@ import { json, err, readJson } from "../lib/http.js";
 const DEFAULT_INVITE_TTL_DAYS = 7;
 const MAX_INVITE_TTL_DAYS = 30;
 
-// POST /api/groups  { name }
+// POST /api/groups  { name, groupCode?, adminCode? }
+//
+// D.3: gated on users.can_create_groups (set by signup with a valid OWNER_BOOTSTRAP_CODE, or
+// by the migration's grandfather pass). Optional groupCode/adminCode persist the codes a member
+// will type when joining via the Sign up form; if omitted the row is created without codes
+// (admin can set them later — not yet wired).
 export async function createGroup(req, env) {
   const csrf = requireCsrfHeader(req);
   if (csrf) return csrf;
   const user = await getSessionUser(env, req);
   if (!user) return err(401, "unauthorized");
+  if (!user.canCreateGroups) return err(403, "not_authorized_to_create_groups");
 
   const body = await readJson(req);
   const name = String(body.name || "").trim();
   if (!name) return err(400, "name_required");
   if (name.length > 80) return err(400, "name_too_long");
+  const groupCode = body.groupCode ? String(body.groupCode).trim().toUpperCase() : null;
+  const adminCode = body.adminCode ? String(body.adminCode).trim().toUpperCase() : null;
+
+  if (groupCode) {
+    const taken = await q1(env, "SELECT 1 AS ok FROM groups WHERE group_code = ?", groupCode);
+    if (taken) return err(409, "group_code_taken");
+  }
 
   const groupId = newId("grp");
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO groups (id, name, owner_user_id) VALUES (?, ?, ?)")
-      .bind(groupId, name, user.id),
+    env.DB.prepare("INSERT INTO groups (id, name, owner_user_id, group_code, admin_code) VALUES (?, ?, ?, ?, ?)")
+      .bind(groupId, name, user.id, groupCode, adminCode),
     env.DB.prepare("INSERT INTO memberships (user_id, group_id, role) VALUES (?, ?, 'owner')")
       .bind(user.id, groupId),
   ]);
-  return json({ groupId, name });
+  return json({ groupId, name, groupCode, adminCode });
 }
 
 // POST /api/groups/:gid/invites  { role, expiresInDays? }
@@ -107,6 +120,7 @@ export async function migrateGroup(req, env, { gid }) {
   if (csrf) return csrf;
   const caller = await getSessionUser(env, req);
   if (!caller) return err(401, "unauthorized");
+  if (!caller.canCreateGroups) return err(403, "not_authorized_to_create_groups");
 
   const body = await readJson(req);
   const name = String(body.name || "").trim();
@@ -115,13 +129,26 @@ export async function migrateGroup(req, env, { gid }) {
   const snapshotPayload = body.snapshot || null;
   if (!snapshotPayload) return err(400, "snapshot_required");
 
+  // Pull group/admin codes out of the snapshot meta so the cloud row knows what local users
+  // will be typing into the Sign up form.
+  const meta = (snapshotPayload && typeof snapshotPayload === "object" && snapshotPayload.meta) || {};
+  const groupCode = meta.groupCode ? String(meta.groupCode).trim().toUpperCase() : null;
+  const adminCode = meta.adminCode ? String(meta.adminCode).trim().toUpperCase() : null;
+
+  // If this group code already exists in cloud (re-migration of the same local group), bail
+  // rather than create a duplicate row that the partial unique index would reject anyway.
+  if (groupCode) {
+    const taken = await q1(env, "SELECT id FROM groups WHERE group_code = ?", groupCode);
+    if (taken) return err(409, "group_code_taken");
+  }
+
   const cloudGroupId = newId("grp");
   const nowS = nowSec();
 
   // 1. Create the group + caller's owner membership.
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO groups (id, name, owner_user_id) VALUES (?, ?, ?)")
-      .bind(cloudGroupId, name, caller.id),
+    env.DB.prepare("INSERT INTO groups (id, name, owner_user_id, group_code, admin_code) VALUES (?, ?, ?, ?, ?)")
+      .bind(cloudGroupId, name, caller.id, groupCode, adminCode),
     env.DB.prepare("INSERT INTO memberships (user_id, group_id, role) VALUES (?, ?, 'owner')")
       .bind(caller.id, cloudGroupId),
   ]);

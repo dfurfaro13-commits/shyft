@@ -2,6 +2,7 @@
 // Patterns support :param segments which are extracted into the third arg.
 
 import { authRequest, authVerify, authPassword, authLogout, me } from "./auth.js";
+import { authSignup } from "./signup.js";
 import { createGroup, createInvite, getInvite, migrateGroup } from "./groups.js";
 import { createUser } from "./users.js";
 import { logEvent } from "./events.js";
@@ -12,6 +13,7 @@ const routes = [
   ["POST", "/api/auth/request",                   authRequest],
   ["GET",  "/api/auth/verify",                    authVerify],
   ["POST", "/api/auth/password",                  authPassword],
+  ["POST", "/api/auth/signup",                    authSignup],
   ["POST", "/api/auth/logout",                    authLogout],
   ["GET",  "/api/me",                             me],
   ["POST", "/api/groups",                         createGroup],

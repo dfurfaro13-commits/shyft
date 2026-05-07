@@ -135,30 +135,35 @@ export async function authVerify(req, env) {
   });
 }
 
-// POST /api/auth/password  { email, password }
-// Per stress-test: stricter limits than magic-link (10/hr per (email, ip)) since passwords
-// are brute-forceable. Constant-time response shape regardless of whether the email exists.
+// POST /api/auth/password  { emailOrUsername, password }
+// Per stress-test: stricter limits than magic-link (10/hr per (identifier, ip)) since passwords
+// are brute-forceable. Constant-time response shape regardless of whether the user exists.
+//
+// D.3: identifier may be email OR username. Rate-limit key is the literal input string so an
+// attacker can't burn the same row twice by alternating shapes.
 export async function authPassword(req, env) {
   const csrf = requireCsrfHeader(req);
   if (csrf) return csrf;
   const body = await readJson(req);
-  const email = normalizeEmail(body.email);
+  // Backwards-compat: accept `email` field too. New frontend sends `emailOrUsername`.
+  const identifier = String(body.emailOrUsername || body.email || "").trim().toLowerCase();
   const password = String(body.password || "");
-  if (!isEmail(email) || !password) return err(400, "invalid_credentials");
+  if (!identifier || !password) return err(400, "invalid_credentials");
 
   const ip = req.headers.get("CF-Connecting-IP") || "unknown";
   const since = nowSec() - PASSWORD_RATE_WINDOW;
   const rate = await q1(
     env,
     "SELECT COUNT(*) AS n FROM password_attempts WHERE email = ? AND ip = ? AND ts >= ?",
-    email, ip, since,
+    identifier, ip, since,
   );
   if ((rate?.n || 0) >= PASSWORD_RATE_LIMIT) return err(429, "rate_limited");
 
+  // Lookup by email OR username. Both columns are COLLATE NOCASE so a single value works.
   const user = await q1(
     env,
-    "SELECT id, email, display_name, password_hash FROM users WHERE email = ?",
-    email,
+    "SELECT id, email, username, display_name, password_hash, can_create_groups FROM users WHERE email = ? OR username = ?",
+    identifier, identifier,
   );
   // Always run the verify even if user is missing — keeps timing roughly constant so
   // attackers can't enumerate accounts via response time.
@@ -166,13 +171,21 @@ export async function authPassword(req, env) {
 
   await exec(env,
     "INSERT INTO password_attempts (email, ip, ok) VALUES (?, ?, ?)",
-    email, ip, ok ? 1 : 0,
+    identifier, ip, ok ? 1 : 0,
   );
 
   if (!ok || !user) return err(401, "invalid_credentials");
 
   const { raw: sidRaw } = await createSession(env, user.id);
-  return new Response(JSON.stringify({ user: { id: user.id, email: user.email, displayName: user.display_name } }), {
+  return new Response(JSON.stringify({
+    user: {
+      id: user.id,
+      email: user.email,
+      username: user.username,
+      displayName: user.display_name,
+      canCreateGroups: !!user.can_create_groups,
+    },
+  }), {
     status: 200,
     headers: {
       "Content-Type": "application/json",

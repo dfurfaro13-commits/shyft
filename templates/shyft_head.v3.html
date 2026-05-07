@@ -292,7 +292,6 @@
     };
     const inBlock = (k, cfg) => { const b = currentBlockOf(cfg); return !!(b && k >= b.start && k <= b.end); };
 
-    const SUPER_BOOTSTRAP = "Shyft-Kai-Dave";
     const gKey = (gid, k) => `g${gid}_${k}`;
     const genCode = (len=6) => { const c="ABCDEFGHJKMNPQRSTUVWXYZ23456789"; let s=""; for(let i=0;i<len;i++) s+=c[Math.floor(Math.random()*c.length)]; return s; };
 
