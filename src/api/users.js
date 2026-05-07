@@ -6,6 +6,8 @@ import { requireCsrfHeader } from "../lib/csrf.js";
 import { getSessionUser } from "../lib/session.js";
 import { json, err, readJson, normalizeEmail, isEmail } from "../lib/http.js";
 
+const MIN_PASSWORD_LEN = 8;
+
 // POST /api/users  { kind: 'real'|'test', role: 'admin'|'provider', displayName, email?, groupId, localUid? }
 //
 // - kind='real':   email required; sends magic-link sign-in invitation; no password generated.
@@ -111,4 +113,25 @@ export async function createUser(req, env) {
     tempPassword,                        // null for real users; the temp password for test users
     reused: !!existingMem || (user.kind && user.kind !== kind),
   });
+}
+
+// POST /api/users/me/password  { password }
+//
+// Phase D.3 preflight: lets a cloud-signed-in user set or change their own password. Required
+// before D.3 ships so users who only ever signed in via magic-link can switch to the new
+// password-first sign-in flow without being locked out (magic-link still works as fallback).
+// No rate-limit — caller is already authenticated.
+export async function setMyPassword(req, env) {
+  const csrf = requireCsrfHeader(req);
+  if (csrf) return csrf;
+  const user = await getSessionUser(env, req);
+  if (!user) return err(401, "unauthorized");
+
+  const body = await readJson(req);
+  const password = String(body.password || "");
+  if (password.length < MIN_PASSWORD_LEN) return err(400, "password_too_short");
+
+  const passwordHash = await hashPassword(password);
+  await exec(env, "UPDATE users SET password_hash = ? WHERE id = ?", passwordHash, user.id);
+  return json({ ok: true });
 }

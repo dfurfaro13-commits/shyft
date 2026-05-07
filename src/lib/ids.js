@@ -23,3 +23,14 @@ function bytesToBase64Url(bytes) {
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
+
+// 6-char human-readable group join code. Same alphabet as the local genCode helper in JSX
+// (no 0/O, 1/I/L) so codes look consistent across cloud and local UIs. ~31 bits of entropy
+// — plenty for the join-by-code flow given uniqueness is enforced by the DB index.
+const JOIN_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+export function generateJoinCode(length = 6) {
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  let out = "";
+  for (let i = 0; i < length; i++) out += JOIN_CODE_ALPHABET[bytes[i] % JOIN_CODE_ALPHABET.length];
+  return out;
+}

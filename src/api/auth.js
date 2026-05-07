@@ -3,7 +3,7 @@ import { newId, randomToken, sha256Hex } from "../lib/ids.js";
 import { sendMagicLink } from "../lib/email.js";
 import { checkLoginRateLimit } from "../lib/ratelimit.js";
 import { requireCsrfHeader } from "../lib/csrf.js";
-import { verifyPassword } from "../lib/passwords.js";
+import { verifyPassword, hashPassword } from "../lib/passwords.js";
 import {
   createSession,
   getSessionUser,
@@ -14,8 +14,12 @@ import {
 import { json, noContent, err, html, readJson, normalizeEmail, isEmail } from "../lib/http.js";
 
 const LOGIN_TOKEN_TTL_SEC = 60 * 15;
-const PASSWORD_RATE_LIMIT = 10;          // per (email, ip) per hour
+const PASSWORD_RATE_LIMIT = 10;          // per (identifier, ip) per hour
 const PASSWORD_RATE_WINDOW = 3600;
+const SIGNUP_RATE_LIMIT = 20;            // per IP per hour
+const SIGNUP_RATE_WINDOW = 3600;
+const MIN_PASSWORD_LEN = 8;
+const USERNAME_RE = /^[a-zA-Z0-9_.-]{3,30}$/;
 
 // POST /api/auth/request  { email, inviteToken? }
 export async function authRequest(req, env) {
@@ -135,38 +139,47 @@ export async function authVerify(req, env) {
   });
 }
 
-// POST /api/auth/password  { email, password }
-// Per stress-test: stricter limits than magic-link (10/hr per (email, ip)) since passwords
-// are brute-forceable. Constant-time response shape regardless of whether the email exists.
+// POST /api/auth/password  { identifier, password }
+//   D.3: identifier is email OR username. Stricter limits than magic-link (10/hr per
+//   (identifier, ip)) since passwords are brute-forceable. Constant-time response shape
+//   regardless of whether the identifier resolves.
 export async function authPassword(req, env) {
   const csrf = requireCsrfHeader(req);
   if (csrf) return csrf;
   const body = await readJson(req);
-  const email = normalizeEmail(body.email);
+  // Backwards-compatible: accept `identifier` (D.3) or `email` (pre-D.3 callers).
+  const rawIdent = String(body.identifier ?? body.email ?? "").trim();
   const password = String(body.password || "");
-  if (!isEmail(email) || !password) return err(400, "invalid_credentials");
+  if (!rawIdent || !password) return err(400, "invalid_credentials");
 
   const ip = req.headers.get("CF-Connecting-IP") || "unknown";
   const since = nowSec() - PASSWORD_RATE_WINDOW;
+  const rateKey = rawIdent.toLowerCase();
   const rate = await q1(
     env,
     "SELECT COUNT(*) AS n FROM password_attempts WHERE email = ? AND ip = ? AND ts >= ?",
-    email, ip, since,
+    rateKey, ip, since,
   );
   if ((rate?.n || 0) >= PASSWORD_RATE_LIMIT) return err(429, "rate_limited");
 
-  const user = await q1(
-    env,
-    "SELECT id, email, display_name, password_hash FROM users WHERE email = ?",
-    email,
-  );
+  // Detect identifier shape — if it parses as an email, look up by email; otherwise treat
+  // as a username. Both columns use NOCASE collation in their indexes.
+  const looksLikeEmail = isEmail(normalizeEmail(rawIdent));
+  const user = looksLikeEmail
+    ? await q1(env,
+        "SELECT id, email, display_name, password_hash FROM users WHERE email = ?",
+        normalizeEmail(rawIdent))
+    : await q1(env,
+        "SELECT id, email, display_name, password_hash FROM users WHERE username = ? COLLATE NOCASE",
+        rawIdent);
+
   // Always run the verify even if user is missing — keeps timing roughly constant so
   // attackers can't enumerate accounts via response time.
   const ok = user?.password_hash ? await verifyPassword(password, user.password_hash) : false;
 
   await exec(env,
     "INSERT INTO password_attempts (email, ip, ok) VALUES (?, ?, ?)",
-    email, ip, ok ? 1 : 0,
+    rateKey, ip, ok ? 1 : 0,
   );
 
   if (!ok || !user) return err(401, "invalid_credentials");
@@ -179,6 +192,71 @@ export async function authPassword(req, env) {
       "Set-Cookie": sessionSetCookieHeader(sidRaw),
     },
   });
+}
+
+// POST /api/auth/signup  { name, email, username, password, ownerCode? }
+//   Self-service registration. Creates a `kind='real'` user. If `ownerCode` matches the
+//   `OWNER_BOOTSTRAP_CODE` Worker secret, the user gets `can_create_groups=1` (i.e. shows up
+//   on SuperDashboard via the cloud-owner bridge once they create their first group). Empty
+//   ownerCode = regular user. Wrong ownerCode = explicit 400 (don't silently demote).
+//   Issues a session immediately — no email verification.
+export async function authSignup(req, env) {
+  const csrf = requireCsrfHeader(req);
+  if (csrf) return csrf;
+
+  const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+  const since = nowSec() - SIGNUP_RATE_WINDOW;
+  const rate = await q1(env, "SELECT COUNT(*) AS n FROM signup_attempts WHERE ip = ? AND ts >= ?", ip, since);
+  if ((rate?.n || 0) >= SIGNUP_RATE_LIMIT) return err(429, "rate_limited");
+  await exec(env, "INSERT INTO signup_attempts (ip) VALUES (?)", ip);
+
+  const body = await readJson(req);
+  const name = String(body.name || "").trim();
+  const email = normalizeEmail(body.email);
+  const username = String(body.username || "").trim();
+  const password = String(body.password || "");
+  const ownerCode = String(body.ownerCode || "").trim();
+
+  if (!name) return err(400, "missing_name");
+  if (name.length > 80) return err(400, "name_too_long");
+  if (!isEmail(email)) return err(400, "invalid_email");
+  if (!USERNAME_RE.test(username)) return err(400, "invalid_username");
+  if (password.length < MIN_PASSWORD_LEN) return err(400, "password_too_short");
+
+  // Owner-code validation. Empty = regular signup. Non-empty must match the secret.
+  let canCreateGroups = 0;
+  if (ownerCode) {
+    if (!env.OWNER_BOOTSTRAP_CODE || ownerCode !== env.OWNER_BOOTSTRAP_CODE) {
+      return err(400, "invalid_owner_code");
+    }
+    canCreateGroups = 1;
+  }
+
+  // Uniqueness checks — do them up front so the user gets a precise error instead of a generic
+  // constraint failure. Race-safe-enough for hobby scale; the unique indexes are the real guard.
+  const emailHit = await q1(env, "SELECT id FROM users WHERE email = ?", email);
+  if (emailHit) return err(409, "email_taken");
+  const userHit = await q1(env, "SELECT id FROM users WHERE username = ? COLLATE NOCASE", username);
+  if (userHit) return err(409, "username_taken");
+
+  const userId = newId("usr");
+  const passwordHash = await hashPassword(password);
+  try {
+    await exec(
+      env,
+      "INSERT INTO users (id, email, display_name, username, kind, password_hash, can_create_groups) VALUES (?, ?, ?, ?, 'real', ?, ?)",
+      userId, email, name, username, passwordHash, canCreateGroups,
+    );
+  } catch (e) {
+    // Race: another request inserted the same email/username between our check and INSERT.
+    return err(409, "conflict");
+  }
+
+  const { raw: sidRaw } = await createSession(env, userId);
+  return new Response(
+    JSON.stringify({ user: { id: userId, email, displayName: name, username }, canCreateGroups: !!canCreateGroups }),
+    { status: 200, headers: { "Content-Type": "application/json", "Set-Cookie": sessionSetCookieHeader(sidRaw) } },
+  );
 }
 
 // POST /api/auth/logout
@@ -196,15 +274,32 @@ export async function authLogout(req, env) {
 export async function me(req, env) {
   const user = await getSessionUser(env, req);
   if (!user) return err(401, "unauthorized");
+  // adminCode is hidden from non-owners — only the owner needs to share it. join_code stays
+  // visible to everyone in the group so admin/provider members can see the code they joined with.
   const memberships = (await env.DB.prepare(
     `SELECT m.group_id AS groupId, m.role AS role, m.local_uid AS localUid,
-            g.name AS groupName
+            g.name AS groupName, g.join_code AS joinCode,
+            CASE WHEN m.role = 'owner' THEN g.admin_code ELSE NULL END AS adminCode
        FROM memberships m
        JOIN groups g ON g.id = m.group_id
       WHERE m.user_id = ?
       ORDER BY g.name`,
   ).bind(user.id).all()).results || [];
-  return json({ user, memberships });
+  // hasPassword + canCreateGroups + username drive UI affordances:
+  // - hasPassword: "Set" vs "Change" password label
+  // - canCreateGroups: show/hide "Create group" form on SuperDashboard + migrate button
+  // - username: surfaced in the cloud-account strip when present
+  const row = await q1(
+    env,
+    "SELECT password_hash, can_create_groups, username FROM users WHERE id = ?",
+    user.id,
+  );
+  return json({
+    user: { ...user, username: row?.username || null },
+    memberships,
+    hasPassword: !!row?.password_hash,
+    canCreateGroups: !!row?.can_create_groups,
+  });
 }
 
 // HTML response for the verify endpoint. Confirmation page rather than auto-redirect

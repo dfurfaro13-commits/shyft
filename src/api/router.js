@@ -1,9 +1,13 @@
 // URL-pattern dispatch. Tiny, no dependencies. Each entry is [method, pattern, handler].
 // Patterns support :param segments which are extracted into the third arg.
 
-import { authRequest, authVerify, authPassword, authLogout, me } from "./auth.js";
-import { createGroup, createInvite, getInvite, migrateGroup } from "./groups.js";
-import { createUser } from "./users.js";
+import { authRequest, authVerify, authPassword, authSignup, authLogout, me } from "./auth.js";
+import {
+  createGroup, createInvite, getInvite, migrateGroup,
+  ensureJoinCode, ensureAdminCode, joinGroupByCode, backfillUsernames, setMyLocalUid,
+} from "./groups.js";
+import { createUser, setMyPassword } from "./users.js";
+import { listOwnerUsers, updateOwnerUser, deleteOwnerUser } from "./owner.js";
 import { logEvent } from "./events.js";
 import { putSnapshot, getLatestSnapshot } from "./snapshots.js";
 import { err } from "../lib/http.js";
@@ -12,13 +16,23 @@ const routes = [
   ["POST", "/api/auth/request",                   authRequest],
   ["GET",  "/api/auth/verify",                    authVerify],
   ["POST", "/api/auth/password",                  authPassword],
+  ["POST", "/api/auth/signup",                    authSignup],
   ["POST", "/api/auth/logout",                    authLogout],
   ["GET",  "/api/me",                             me],
   ["POST", "/api/groups",                         createGroup],
+  ["POST", "/api/groups/join",                    joinGroupByCode],
   ["POST", "/api/groups/:gid/invites",            createInvite],
   ["POST", "/api/groups/:gid/migrate",            migrateGroup],
+  ["POST", "/api/groups/:gid/join-code",          ensureJoinCode],
+  ["POST", "/api/groups/:gid/admin-code",         ensureAdminCode],
+  ["POST", "/api/groups/:gid/backfill-usernames", backfillUsernames],
+  ["POST", "/api/memberships/:gid/local-uid",     setMyLocalUid],
   ["GET",  "/api/invites/:token",                 getInvite],
   ["POST", "/api/users",                          createUser],
+  ["POST", "/api/users/me/password",              setMyPassword],
+  ["GET",  "/api/owner/users",                    listOwnerUsers],
+  ["PATCH","/api/owner/users/:uid",               updateOwnerUser],
+  ["DELETE","/api/owner/users/:uid",              deleteOwnerUser],
   ["POST", "/api/events",                         logEvent],
   ["POST", "/api/snapshots",                      putSnapshot],
   ["GET",  "/api/snapshots/:groupId/latest",      getLatestSnapshot],
