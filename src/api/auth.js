@@ -211,7 +211,7 @@ export async function me(req, env) {
   if (!user) return err(401, "unauthorized");
   const memberships = (await env.DB.prepare(
     `SELECT m.group_id AS groupId, m.role AS role, m.local_uid AS localUid,
-            g.name AS groupName
+            g.name AS groupName, g.group_code AS groupCode, g.admin_code AS adminCode
        FROM memberships m
        JOIN groups g ON g.id = m.group_id
       WHERE m.user_id = ?

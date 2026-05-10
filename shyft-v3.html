@@ -1021,6 +1021,48 @@ function ShiftApp() {
     setUnclaimedCloudGroups(cloudUser.memberships.filter(m => !localCloudGids.has(m.groupId)));
   }, [cloudUser, groups]);
 
+  // Auto-restore owner-role cloud groups on a fresh device. The cloud-owner bridge sends owners
+  // straight to SuperDashboard, bypassing the auth-screen "Restore" cards — so without this
+  // effect, an owner signing in on a new browser sees an empty SuperDashboard until they
+  // sign in as a member of one of their own groups. Snapshots are pulled silently; codes fall
+  // back to the membership row's groupCode/adminCode (returned by /api/me) when no snapshot yet exists.
+  const ownerRestoreInflight = useRef(false);
+  useEffect(() => {
+    if (ownerRestoreInflight.current) return;
+    if (!cloudUser?.memberships?.length) return;
+    if (!cloudUser.memberships.some(m => m.role === "owner")) return;
+    const localCloudGids = new Set(groups.map(g => g.cloudGroupId).filter(Boolean));
+    const owned = cloudUser.memberships.filter(m => m.role === "owner" && !localCloudGids.has(m.groupId));
+    if (owned.length === 0) return;
+    ownerRestoreInflight.current = true;
+    (async () => {
+      try {
+        let next = groups;
+        for (const m of owned) {
+          let snap = null;
+          try { snap = await window.api.fetchJSON("/api/snapshots/" + encodeURIComponent(m.groupId) + "/latest"); } catch {}
+          const meta = snap?.payload?.meta || {};
+          const newId = Date.now() + Math.floor(Math.random()*1000);
+          const ng = {
+            id: newId,
+            name: meta.name || m.groupName || "Restored group",
+            groupCode: meta.groupCode || m.groupCode || genCode(6),
+            adminCode: meta.adminCode || m.adminCode || genCode(6),
+            createdAt: meta.createdAt || Date.now(),
+            cloudGroupId: m.groupId,
+          };
+          next = [...next, ng];
+          if (snap?.payload) await applySnapshot(newId, snap.payload);
+          try { if (snap?.clientTs) localStorage.setItem(`shyft3_g${newId}_lastModified`, String(snap.clientTs)); } catch {}
+        }
+        setGroups(next);
+        await persistRoot("groups", next);
+      } finally {
+        ownerRestoreInflight.current = false;
+      }
+    })();
+  }, [cloudUser, groups]);
+
   // After a group is loaded AND cloud session is known, check whether the cloud has newer data.
   // Re-runs whenever the active group changes or the cloud session boots.
   useEffect(() => {
