@@ -136,7 +136,7 @@ Phase C (snapshot sync) is not implemented.
 
 Every meaningful state mutation also fires a `POST /api/events` to D1 — the primary ML training corpus. localStorage is still source of truth; the event log is parallel, fire-and-forget, and silently no-ops when the user isn't cloud-signed-in or the active group hasn't been mirrored. The component-local helper `trackEvent(type, payload, opts?)` (in `ShiftApp.v3.jsx`, near the cloud helpers) is the only call surface — search for `trackEvent(` to find every wired call site.
 
-Currently logged event types: `topOption.set`, `topOption.clear`, `preference.toggle`, `unavail.toggle`, `block.reconcile`, `block.lock`, `block.unlock`, `shift.confirm`, `shift.flag`, `marketplace.post`, `marketplace.take`, `marketplace.cancel`. The Worker rejects unknown types — to add a new event type, append to `ALLOWED_TYPES` in `src/api/events.js` first.
+Currently logged event types: `topOption.set`, `topOption.clear`, `topOption.link`, `topOption.unlink`, `preference.toggle`, `unavail.toggle`, `block.reconcile`, `block.lock`, `block.unlock`, `shift.confirm`, `shift.flag`, `marketplace.post`, `marketplace.take`, `marketplace.cancel`. The Worker rejects unknown types — to add a new event type, append to `ALLOWED_TYPES` in `src/api/events.js` first. (D.4.A added a batch of types reserved for D.4.B wiring — see the D.4.A subsection below.)
 
 R2 archival of the event log (originally part of the Phase B plan) is deferred — D1 is queryable directly and we'll dump monthly archives to R2 only when the corpus gets large enough to need it.
 
@@ -151,7 +151,7 @@ Two consumer flows on the frontend:
 
 The uploader silently no-ops when the user isn't cloud-signed-in or the active group has no `cloudGroupId`. localStorage remains source of truth — Phase C is mirroring, not migration.
 
-### Phase D — backend-as-truth (D.1 + D.2 + D.2.5 + D.3 shipped)
+### Phase D — backend-as-truth (D.1 + D.2 + D.2.5 + D.3 + D.4.A shipped)
 
 **D.1 (password auth + cloud user creation).** Cloud users now carry an optional PBKDF2 `password_hash` (SHA-256 with 310k iters, 16-byte salt; format `pbkdf2$310000$<salt>$<hash>`) and a `kind ∈ ('real','test')` designator. New endpoint `POST /api/auth/password` issues a session for `email + password`; rate-limited at 10/hr per `(email, ip)` via the new `password_attempts` table. Endpoint `POST /api/users` lets an owner/admin create a cloud user + membership — `kind='test'` mints a synthetic `<localId>@<cloudGroupId>.test.invalid` email and a temp password returned in the response; `kind='real'` validates the supplied email and pre-issues a magic-link via Resend.
 
@@ -180,7 +180,7 @@ Frontend ([ShiftApp.v3.jsx](ShiftApp.v3.jsx)):
 - `handleAuth` is now a thin dispatcher to `signInCloud` / `signUpCloud`. The `signUpCloud` response has the `/api/me` shape and is dropped straight into `cloudUser`.
 - **`enterGroupAsCloudMember`** is the post-auth navigation helper for non-owner roles. After a successful sign in or sign up, if the user has a non-owner membership it: pulls the latest cloud snapshot for the group (or creates an empty mirror if none), inserts a local `groups[]` entry + a local `users[gid][i]` entry tagged with `cloudUserId`, and sets `session = {groupId, userId}` so the `me` useMemo resolves. Without this helper, providers/admins land on the auth screen with a "Restore" card and no way in. Owners are a no-op — the cloud bridge takes them to SuperDashboard.
 - The `me` useMemo's `session?.superId` branch is gone. The cloud bridge now triggers on `cloudUser.memberships.some(m => m.role === "owner") || cloudUser.user.canCreateGroups` — the latter handles a brand-new owner who hasn't created their first group yet.
-- `SUPER_BOOTSTRAP` (in both the JSX preamble and `templates/shyft_head.v3.html`), the `supers` state, the local-only `signInWithPassword` helper, the standalone `signOutCloud` helper, and the `cloudEmail` / `cloudPassword` state are all deleted. The unified `signOut` revokes the cloud session AND clears local + impersonation state in one call. Stale localStorage `supers` keys on user devices stay inert; cleanup is deferred.
+- `SUPER_BOOTSTRAP` (in both the JSX preamble and `templates/shyft_head.v3.html`), the `supers` state, the local-only `signInWithPassword` helper, the standalone `signOutCloud` helper, and the `cloudEmail` / `cloudPassword` state are all deleted. The unified `signOut` revokes the cloud session AND clears local + impersonation state in one call. The pre-D.3 `shyft3_supers` localStorage key is pruned on first load via a one-shot block in `templates/shyft_head.v3.html` (marker `shyft3_migrate_prune_supers`).
 - The "X owner accounts" footer and the redundant blue "Sign out (cloud)" strip in SuperDashboard are removed; one Sign out button per UI surface.
 
 **Concurrency control.** `POST /api/snapshots` accepts `If-Match: <serverTs>` and returns 409 with the current serverTs when stale. The frontend doesn't yet send `If-Match` — backwards-compatible last-write-wins is preserved. Making it mandatory remains deferred.
@@ -188,6 +188,16 @@ Frontend ([ShiftApp.v3.jsx](ShiftApp.v3.jsx)):
 **Accounts management.** Owner-only surface in SuperDashboard (top-right "Accounts" button). Backend: [src/api/owner.js](src/api/owner.js) exposes `GET /api/owner/users` (list users in caller's owned groups, self excluded, memberships rolled up), `PATCH /api/owner/users/:uid` (change email and/or password — backend rejects self-edit, email collisions, short passwords), and `DELETE /api/owner/users/:uid` (drops memberships in caller's owned groups; if no memberships remain anywhere, fully tombstones — anonymizes email/display_name, NULLs username + password_hash, deletes sessions + login_tokens + password_attempts; refuses to delete a user who owns any group). Frontend: `AccountsModal` lists users with kind/magic-link badges and (group, role) chips; `AccountsEditModal` and `AccountsDeleteModal` are the action surfaces. Tombstoned users naturally drop out of the list (no memberships → JOIN excludes). Cherry-picked from the now-stale `wip/parallel-d3-with-accounts` branch.
 
 **Deploy hygiene.** The Worker's `assets.directory` is `./` (worktree root), so any file in the root that isn't excluded by `.assetsignore` ships as a public asset. During the D.3 deploy a D1 backup (`backup-pre-d3-*.sql`) and the `.git` worktree pointer briefly leaked at the public origin before the rule was tightened. Current `.assetsignore` excludes `*.sql`, `*.sqlite*`, the `.git` file (and `.git/` directory form), `.dev.vars`, `src/`, `migrations/`, etc. Before any future deploy, sanity-check what `wrangler deploy` reports as new uploads.
+
+**D.4.A (backend foundation).** Pure additive Worker change with no frontend wiring yet — sets the stage for the full D.4 event-sourcing cutover (plan: `~/.claude/plans/crispy-twirling-nest.md`).
+
+- **`ALLOWED_TYPES` expanded** in [src/api/events.js](src/api/events.js) with 12 D.4.B types (`user.create`, `user.update`, `user.delete`, `block.reset`, `shift.swap-admin`, `shift.trade-admin`, `trade.offer-post`, `trade.offer-accept`, `trade.offer-decline`, `incentive.open-set`, `config.update`, `unavail.reason`) plus a `snapshot.bootstrap` placeholder. Allow-listing now lets the backend accept these events the moment the frontend starts emitting in D.4.B — no second deploy in the middle of that change.
+- **`POST /api/events` response** now returns `{ id, serverTs }` (via `INSERT ... RETURNING server_ts`) instead of 204. `serverTs` is the canonical ordering key consumers will use as the `since` cursor.
+- **`MAX_PAYLOAD_BYTES` bumped** 16 KB → 64 KB to absorb cascade payloads from `user.delete` / `block.reconcile` on long-tenured users.
+- **`GET /api/events?gid=&since=&limit=&type=`** is the new event-tail endpoint. Auth = member of `gid`. Returns `{ events: [...], nextCursor: serverTs|null }`, ordered `(server_ts ASC, id ASC)`. Default `limit` 500, max 2000; soft 512 KB response cap. `nextCursor` is the last returned `serverTs` (inclusive) — consumers MUST dedupe by event `id` because `server_ts` is second-granularity and several events can share a tick.
+- No schema migration: D1's `unixepoch()` is second-granularity but `id` is a TEXT PK with stable lexicographic comparison, so `(server_ts, id)` is a total order already.
+
+Frontend is unchanged. No D.4.A behavior is visible to users — the only observable difference is that `POST /api/events` now returns JSON instead of 204, but the existing fire-and-forget callers ignore the response either way.
 
 ---
 

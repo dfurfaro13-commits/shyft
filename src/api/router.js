@@ -6,7 +6,7 @@ import { authSignup } from "./signup.js";
 import { createGroup, createInvite, getInvite, migrateGroup } from "./groups.js";
 import { createUser } from "./users.js";
 import { listOwnerUsers, updateOwnerUser, deleteOwnerUser } from "./owner.js";
-import { logEvent } from "./events.js";
+import { logEvent, listEvents } from "./events.js";
 import { putSnapshot, getLatestSnapshot } from "./snapshots.js";
 import { err } from "../lib/http.js";
 
@@ -26,6 +26,7 @@ const routes = [
   ["PATCH",  "/api/owner/users/:uid",             updateOwnerUser],
   ["DELETE", "/api/owner/users/:uid",             deleteOwnerUser],
   ["POST",   "/api/events",                       logEvent],
+  ["GET",    "/api/events",                       listEvents],
   ["POST",   "/api/snapshots",                    putSnapshot],
   ["GET",    "/api/snapshots/:groupId/latest",    getLatestSnapshot],
 ];

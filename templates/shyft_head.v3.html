@@ -137,6 +137,15 @@
       localStorage.setItem(MARKER, "done");
     })();
 
+    // One-shot D.3 cleanup: pre-D.3 devices stored local owner accounts under "shyft3_supers".
+    // That code path is gone (auth is cloud-backed now), so the key is inert. Prune it once.
+    (function(){
+      const MARKER = "shyft3_migrate_prune_supers";
+      if (localStorage.getItem(MARKER) === "done") return;
+      localStorage.removeItem("shyft3_supers");
+      localStorage.setItem(MARKER, "done");
+    })();
+
     // Storage shim — v3 owns the "shyft3_*" namespace exclusively.
     window.storage = {
       get: async (key) => {
