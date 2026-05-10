@@ -304,7 +304,715 @@
     const gKey = (gid, k) => `g${gid}_${k}`;
     const genCode = (len=6) => { const c="ABCDEFGHJKMNPQRSTUVWXYZ23456789"; let s=""; for(let i=0;i<len;i++) s+=c[Math.floor(Math.random()*c.length)]; return s; };
 
+    // ════════════════════════════════════════════════════════════════════════════
+    // D.4.C — applyEvent reducer (pure event-log replay)
+    //
+    // Mirror of the same block in ShiftApp.v3.jsx preamble. This file is the
+    // runtime canonical copy; the preamble exists only for IDE readability.
+    // Used today by window.__shiftValidator; the D.4.D2 cutover routes every
+    // mutation through applyEvent.
+    //
+    // Determinism contract: NO Date.now(), NO Math.random(), NO localStorage,
+    // NO React state. Every non-deterministic input (entity ids, postedAt
+    // timestamps, generated linkIds) must come from evt.id / evt.payload /
+    // evt.clientTs. Handlers that mutate must take only (state, evt) and return
+    // a new state object.
+    //
+    // Idempotency: applyEvent silently no-ops if evt.id is already in
+    // state.appliedEventIds (FIFO ring buffer, cap APPLIED_EVENTS_CAP).
+    //
+    // State shape (matches what applySnapshot writes through to localStorage,
+    // plus the ring buffer):
+    //   { users, shifts, unavailability, preferences, topOptions, marketplace,
+    //     openIncentives, config, appliedEventIds }
+    //
+    // Event shape (matches GET /api/events response items):
+    //   { id, type, userId, localUid, blockId, clientTs, serverTs, payload }
+    // ════════════════════════════════════════════════════════════════════════════
 
+    const APPLIED_EVENTS_CAP = 200;
+
+    function trackAppliedEventId(prev, id) {
+      const arr = Array.isArray(prev) ? prev : [];
+      if (arr.includes(id)) return arr;
+      const next = arr.length >= APPLIED_EVENTS_CAP
+        ? [...arr.slice(arr.length - APPLIED_EVENTS_CAP + 1), id]
+        : [...arr, id];
+      return next;
+    }
+
+    // Remove uid's entry from one day's topOptions map; drop the day if empty.
+    function removeTopOptionEntry(topOptions, dateKey, uid) {
+      const dayMap = { ...(topOptions[dateKey] || {}) };
+      delete dayMap[uid];
+      delete dayMap[String(uid)];
+      const next = { ...topOptions };
+      if (Object.keys(dayMap).length) next[dateKey] = dayMap;
+      else delete next[dateKey];
+      return next;
+    }
+
+    // Re-stamp linkIds on a sub-chain of dates for one uid (used by .clear / .unlink).
+    function stampChainLinkIds(topOptions, dates, uid, lid) {
+      if (!Array.isArray(dates) || !dates.length) return topOptions;
+      const next = { ...topOptions };
+      for (const dk of dates) {
+        const en = next[dk]?.[uid] || next[dk]?.[String(uid)];
+        const key = en ? (uid in (next[dk] || {}) ? uid : String(uid)) : null;
+        if (!en || !key) continue;
+        if (lid) {
+          if (en.linkId === lid) continue;
+          next[dk] = { ...next[dk], [key]: { ...en, linkId: lid } };
+        } else {
+          if (en.linkId == null) continue;
+          const { linkId: _drop, ...rest } = en;
+          next[dk] = { ...next[dk], [key]: rest };
+        }
+      }
+      return next;
+    }
+
+    // Apply award entries from block.reconcile to the shifts map.
+    function applyAwardsToShifts(shifts, awards) {
+      if (!Array.isArray(awards) || !awards.length) return shifts;
+      const next = { ...shifts };
+      for (const a of awards) {
+        if (!a || !a.dateKey || a.uid == null) continue;
+        const day = next[a.dateKey] ? { ...next[a.dateKey] } : {};
+        day[a.slotId] = {
+          uid: a.uid,
+          auto: false,
+          source: a.source || "pool",
+          ...(a.bid != null ? { bid: a.bid } : {}),
+          confirm: null,
+        };
+        next[a.dateKey] = day;
+      }
+      return next;
+    }
+
+    // Apply bid deltas + penalties + incentive credits to users.points in a single pass.
+    function applyPointsCascade(users, deltas, penalties, incCredits) {
+      const has = (m, u) => m && (m[u.id] !== undefined || m[String(u.id)] !== undefined);
+      const get = (m, u) => m ? (m[u.id] ?? m[String(u.id)] ?? 0) : 0;
+      const anyMap = m => m && Object.keys(m).length > 0;
+      if (!anyMap(deltas) && !anyMap(penalties) && !anyMap(incCredits)) return users;
+      return users.map(u => {
+        if (!has(deltas, u) && !has(penalties, u) && !has(incCredits, u)) return u;
+        const bid = get(deltas, u);
+        const pen = get(penalties, u);
+        const inc = get(incCredits, u);
+        if (bid === 0 && pen === 0 && inc === 0) return u;
+        return { ...u, points: Math.max(0, (u.points || 0) + bid + inc - pen) };
+      });
+    }
+
+    // Clear the (dateKey, slotId) entries listed in block.reconcile.openIncentivesPatch.consumed.
+    function applyOpenIncentivesPatch(openIncentives, patch) {
+      if (!patch || !Array.isArray(patch.consumed) || !patch.consumed.length) return openIncentives;
+      const next = { ...openIncentives };
+      for (const c of patch.consumed) {
+        const day = next[c.dateKey];
+        if (!day) continue;
+        const nextDay = { ...day };
+        delete nextDay[c.slotId];
+        delete nextDay[String(c.slotId)];
+        if (Object.keys(nextDay).length) next[c.dateKey] = nextDay;
+        else delete next[c.dateKey];
+      }
+      return next;
+    }
+
+    // Patch one block's fields by id within config.blocks[].
+    function patchBlockInConfig(config, blockId, patch) {
+      if (!config || !Array.isArray(config.blocks)) return config;
+      const blocks = config.blocks.map(b => String(b.id) === String(blockId) ? { ...b, ...patch } : b);
+      return { ...config, blocks };
+    }
+
+    // Close any open auto-posted listing for a (dateKey, slotId) and stale its pending offers.
+    function closeAutoListingFor(marketplace, dateKey, slotId) {
+      let changed = false;
+      const next = marketplace.map(l => {
+        if (l.dateKey === dateKey && Number(l.slotId) === Number(slotId) && l.status === "open" && l.autoPosted) {
+          changed = true;
+          return {
+            ...l,
+            status: "cancelled",
+            tradeOffers: (l.tradeOffers || []).map(o => o.status === "pending" ? { ...o, status: "stale" } : o),
+          };
+        }
+        return l;
+      });
+      return changed ? next : marketplace;
+    }
+
+    const EVENT_HANDLERS = {
+
+      "topOption.set": (s, e) => {
+        const { dateKey, slotPref, bid } = e.payload || {};
+        const uid = e.localUid;
+        if (!dateKey || uid == null) return s;
+        const dayCur = s.topOptions[dateKey] || {};
+        const existing = dayCur[uid] || dayCur[String(uid)];
+        const wasIn = !!existing;
+        const merged = { ...(existing || {}), bid: bid ?? 1, slotPref: slotPref ?? null };
+        const key = wasIn ? (uid in dayCur ? uid : String(uid)) : uid;
+        const nextDay = { ...dayCur, [key]: merged };
+        let next = { ...s, topOptions: { ...s.topOptions, [dateKey]: nextDay } };
+        // First-time set also auto-marks the day preferred (mirrors setTopOption live cascade).
+        if (!wasIn) {
+          const prefKey = (next.preferences[uid] !== undefined) ? uid : (next.preferences[String(uid)] !== undefined ? String(uid) : uid);
+          const pcur = next.preferences[prefKey] || [];
+          if (!pcur.includes(dateKey)) {
+            next = { ...next, preferences: { ...next.preferences, [prefKey]: [...pcur, dateKey] } };
+          }
+        }
+        return next;
+      },
+
+      "topOption.clear": (s, e) => {
+        const { dateKey, chainRepair } = e.payload || {};
+        const uid = e.localUid;
+        if (!dateKey || uid == null) return s;
+        let nextTops = removeTopOptionEntry(s.topOptions, dateKey, uid);
+        if (chainRepair) {
+          nextTops = stampChainLinkIds(nextTops, chainRepair.left, uid, chainRepair.leftLid);
+          nextTops = stampChainLinkIds(nextTops, chainRepair.right, uid, chainRepair.rightLid);
+        }
+        return { ...s, topOptions: nextTops };
+      },
+
+      "topOption.link": (s, e) => {
+        const { dateKey, withDateKey, linkId } = e.payload || {};
+        const uid = e.localUid;
+        if (!dateKey || !withDateKey || !linkId || uid == null) return s;
+        const aLid = s.topOptions[dateKey]?.[uid]?.linkId || s.topOptions[dateKey]?.[String(uid)]?.linkId || null;
+        const bLid = s.topOptions[withDateKey]?.[uid]?.linkId || s.topOptions[withDateKey]?.[String(uid)]?.linkId || null;
+        const oldLids = new Set([aLid, bLid].filter(Boolean));
+        const nextTops = { ...s.topOptions };
+        let mutated = false;
+        for (const dk of Object.keys(nextTops)) {
+          const dayMap = nextTops[dk] || {};
+          const k = (uid in dayMap) ? uid : (String(uid) in dayMap ? String(uid) : null);
+          if (!k) continue;
+          const en = dayMap[k];
+          if (!en?.linkId) continue;
+          if (oldLids.has(en.linkId) && en.linkId !== linkId) {
+            nextTops[dk] = { ...dayMap, [k]: { ...en, linkId } };
+            mutated = true;
+          }
+        }
+        for (const dk of [dateKey, withDateKey]) {
+          const dayMap = nextTops[dk] || {};
+          const k = (uid in dayMap) ? uid : (String(uid) in dayMap ? String(uid) : null);
+          if (!k) continue;
+          const en = dayMap[k];
+          if (!en || en.linkId === linkId) continue;
+          nextTops[dk] = { ...dayMap, [k]: { ...en, linkId } };
+          mutated = true;
+        }
+        return mutated ? { ...s, topOptions: nextTops } : s;
+      },
+
+      "topOption.unlink": (s, e) => {
+        const { chainRepair } = e.payload || {};
+        const uid = e.localUid;
+        if (!chainRepair || uid == null) return s;
+        let nextTops = stampChainLinkIds(s.topOptions, chainRepair.left, uid, chainRepair.leftLid);
+        nextTops = stampChainLinkIds(nextTops, chainRepair.right, uid, chainRepair.rightLid);
+        return { ...s, topOptions: nextTops };
+      },
+
+      "preference.toggle": (s, e) => {
+        const { dateKey, wanted } = e.payload || {};
+        const uid = e.localUid;
+        if (!dateKey || uid == null) return s;
+        const prefKey = (uid in s.preferences) ? uid : (String(uid) in s.preferences ? String(uid) : uid);
+        const cur = s.preferences[prefKey] || [];
+        const has = cur.includes(dateKey);
+        if (wanted && !has) {
+          return { ...s, preferences: { ...s.preferences, [prefKey]: [...cur, dateKey] } };
+        }
+        if (!wanted && has) {
+          let next = { ...s, preferences: { ...s.preferences, [prefKey]: cur.filter(d => d !== dateKey) } };
+          // Removing preferred also clears the Top Option (mirrors togglePreference live cascade).
+          if (next.topOptions[dateKey]?.[uid] || next.topOptions[dateKey]?.[String(uid)]) {
+            next = { ...next, topOptions: removeTopOptionEntry(next.topOptions, dateKey, uid) };
+          }
+          return next;
+        }
+        return s;
+      },
+
+      "unavail.toggle": (s, e) => {
+        const { dateKey, blocked } = e.payload || {};
+        const uid = e.localUid;
+        if (!dateKey || uid == null) return s;
+        const unavailKey = (uid in s.unavailability) ? uid : (String(uid) in s.unavailability ? String(uid) : uid);
+        const cur = { ...(s.unavailability[unavailKey] || {}) };
+        if (blocked) {
+          cur[dateKey] = null;
+          let next = { ...s, unavailability: { ...s.unavailability, [unavailKey]: cur } };
+          // Blocking also drops the preference for the day (mirrors _applyToggleUnavail).
+          const prefKey = (uid in next.preferences) ? uid : (String(uid) in next.preferences ? String(uid) : null);
+          if (prefKey != null) {
+            const pcur = next.preferences[prefKey] || [];
+            if (pcur.includes(dateKey)) {
+              next = { ...next, preferences: { ...next.preferences, [prefKey]: pcur.filter(d => d !== dateKey) } };
+            }
+          }
+          return next;
+        } else {
+          delete cur[dateKey];
+          return { ...s, unavailability: { ...s.unavailability, [unavailKey]: cur } };
+        }
+      },
+
+      "unavail.reason": (s, e) => {
+        const { dateKey, reason } = e.payload || {};
+        const uid = e.localUid;
+        if (!dateKey || uid == null) return s;
+        const unavailKey = (uid in s.unavailability) ? uid : (String(uid) in s.unavailability ? String(uid) : null);
+        if (unavailKey == null) return s;
+        const cur = s.unavailability[unavailKey] || {};
+        if (!(dateKey in cur)) return s;
+        return {
+          ...s,
+          unavailability: { ...s.unavailability, [unavailKey]: { ...cur, [dateKey]: reason ?? null } },
+        };
+      },
+
+      "block.reconcile": (s, e) => {
+        const p = e.payload || {};
+        let next = { ...s, shifts: applyAwardsToShifts(s.shifts, p.awards) };
+        const incCredits = p.openIncentivesPatch?.credits || {};
+        next = {
+          ...next,
+          users: applyPointsCascade(next.users, p.deltas, p.availPenalties, incCredits),
+          openIncentives: applyOpenIncentivesPatch(next.openIncentives, p.openIncentivesPatch),
+        };
+        if (p.blockId) {
+          next = {
+            ...next,
+            config: patchBlockInConfig(next.config, p.blockId, {
+              phase: "reconciliation",
+              lastReconcileDeltas: p.deltas || {},
+              pointsAtClose: p.pointsAtClose || null,
+              availPenalties: p.availPenalties || {},
+            }),
+          };
+        }
+        return next;
+      },
+
+      "block.lock": (s, e) => {
+        const blockId = e.payload?.blockId || e.blockId;
+        if (!blockId) return s;
+        return { ...s, config: patchBlockInConfig(s.config, blockId, { phase: "locked" }) };
+      },
+
+      "block.unlock": (s, e) => {
+        const blockId = e.payload?.blockId || e.blockId;
+        if (!blockId) return s;
+        return { ...s, config: patchBlockInConfig(s.config, blockId, { phase: "reconciliation" }) };
+      },
+
+      "block.reset": (s, e) => {
+        const p = e.payload || {};
+        let nextShifts = s.shifts;
+        if (Array.isArray(p.clearedDateKeys) && p.clearedDateKeys.length) {
+          nextShifts = { ...s.shifts };
+          for (const k of p.clearedDateKeys) delete nextShifts[k];
+        }
+        // Reverse bid charges + restore penalty deductions per resetBlock live logic.
+        const restored = p.restoredDeltas || {};
+        const restoredPenalties = p.restoredPenalties || {};
+        const touched = new Set([...Object.keys(restored), ...Object.keys(restoredPenalties)]);
+        let nextUsers = s.users;
+        if (touched.size) {
+          nextUsers = s.users.map(u => {
+            const k = String(u.id);
+            if (!touched.has(k) && !touched.has(u.id)) return u;
+            const bidDelta = restored[k] ?? restored[u.id] ?? 0;
+            const penalty = restoredPenalties[k] ?? restoredPenalties[u.id] ?? 0;
+            if (bidDelta === 0 && penalty === 0) return u;
+            return { ...u, points: Math.max(0, (u.points || 0) - bidDelta + penalty) };
+          });
+        }
+        let nextConfig = s.config;
+        if (p.blockId) {
+          nextConfig = patchBlockInConfig(nextConfig, p.blockId, {
+            phase: "availability",
+            lastReconcileDeltas: {},
+            pointsAtClose: null,
+            availPenalties: {},
+          });
+        }
+        return { ...s, shifts: nextShifts, users: nextUsers, config: nextConfig };
+      },
+
+      "shift.confirm": (s, e) => {
+        const { dateKey, slotId } = e.payload || {};
+        if (!dateKey || slotId == null) return s;
+        const day = s.shifts[dateKey];
+        const entry = day?.[slotId];
+        if (!entry) return s;
+        return {
+          ...s,
+          shifts: {
+            ...s.shifts,
+            [dateKey]: { ...day, [slotId]: { ...entry, confirm: "ok", flagReason: null } },
+          },
+        };
+      },
+
+      "shift.flag": (s, e) => {
+        const { dateKey, slotId, reason, listing } = e.payload || {};
+        if (!dateKey || slotId == null) return s;
+        const day = s.shifts[dateKey];
+        const entry = day?.[slotId];
+        if (!entry) return s;
+        let next = {
+          ...s,
+          shifts: {
+            ...s.shifts,
+            [dateKey]: { ...day, [slotId]: { ...entry, confirm: "flagged", flagReason: reason ?? null } },
+          },
+        };
+        // Idempotent listing append — _postListing returns the existing listing if one is
+        // already up for this slot, so the same id can be replayed safely.
+        if (listing && listing.id && !s.marketplace.some(l => l.id === listing.id)) {
+          next = { ...next, marketplace: [...next.marketplace, listing] };
+        }
+        return next;
+      },
+
+      "shift.swap-admin": (s, e) => {
+        const { fromUid, toUid, dateKey, slotId } = e.payload || {};
+        if (!dateKey || slotId == null) return s;
+        const day = s.shifts[dateKey];
+        const entry = day?.[slotId];
+        if (!entry) return s;
+        return {
+          ...s,
+          shifts: {
+            ...s.shifts,
+            [dateKey]: {
+              ...day,
+              [slotId]: { ...entry, uid: toUid, source: "auto-swap", swappedFrom: fromUid, confirm: null, flagReason: null },
+            },
+          },
+          marketplace: closeAutoListingFor(s.marketplace, dateKey, slotId),
+        };
+      },
+
+      "shift.trade-admin": (s, e) => {
+        const { aUid, bUid, aDate, aSlot, bDate, bSlot } = e.payload || {};
+        if (!aDate || aSlot == null || !bDate || bSlot == null) return s;
+        const aDay = s.shifts[aDate];
+        const bDay = s.shifts[bDate];
+        const aEntry = aDay?.[aSlot];
+        const bEntry = bDay?.[bSlot];
+        if (!aEntry || !bEntry) return s;
+        return {
+          ...s,
+          shifts: {
+            ...s.shifts,
+            [aDate]: { ...aDay, [aSlot]: { ...aEntry, uid: bUid, source: "auto-trade", swappedFrom: aUid, confirm: null, flagReason: null } },
+            [bDate]: { ...(s.shifts[bDate] || {}), [bSlot]: { ...bEntry, uid: aUid, source: "auto-trade", swappedFrom: bUid, confirm: null, flagReason: null } },
+          },
+          marketplace: closeAutoListingFor(s.marketplace, aDate, aSlot),
+        };
+      },
+
+      "marketplace.post": (s, e) => {
+        const { dateKey, slotId, incentivePts, listingId } = e.payload || {};
+        if (!listingId || !dateKey || slotId == null) return s;
+        if (s.marketplace.some(l => l.id === listingId)) return s;
+        const entry = s.shifts[dateKey]?.[slotId];
+        const sellerId = entry ? (typeof entry === "object" ? entry.uid : entry) : null;
+        if (sellerId == null) return s;
+        const listing = {
+          id: listingId,
+          dateKey,
+          slotId,
+          sellerId,
+          incentivePts: Math.max(0, parseInt(incentivePts) || 0),
+          postedAt: e.clientTs,
+          status: "open",
+          autoPosted: false,
+          flagReason: null,
+        };
+        return { ...s, marketplace: [...s.marketplace, listing] };
+      },
+
+      "marketplace.take": (s, e) => {
+        const { listingId } = e.payload || {};
+        const taker = e.localUid;
+        if (!listingId || taker == null) return s;
+        const listing = s.marketplace.find(l => l.id === listingId);
+        if (!listing || listing.status !== "open") return s;
+        const day = s.shifts[listing.dateKey];
+        const entry = day?.[listing.slotId];
+        if (!entry) return s;
+        let next = {
+          ...s,
+          shifts: {
+            ...s.shifts,
+            [listing.dateKey]: {
+              ...day,
+              [listing.slotId]: { ...entry, uid: taker, source: "marketplace", takenFrom: listing.sellerId, confirm: null },
+            },
+          },
+        };
+        if (listing.incentivePts > 0) {
+          next = {
+            ...next,
+            users: next.users.map(u => {
+              if (String(u.id) === String(listing.sellerId)) {
+                return { ...u, points: Math.max(0, (u.points || 0) - listing.incentivePts) };
+              }
+              if (String(u.id) === String(taker)) {
+                return { ...u, points: (u.points || 0) + listing.incentivePts };
+              }
+              return u;
+            }),
+          };
+        }
+        next = {
+          ...next,
+          marketplace: next.marketplace.map(l => l.id === listingId
+            ? {
+                ...l,
+                status: "taken",
+                takenBy: taker,
+                takenAt: e.clientTs,
+                tradeOffers: (l.tradeOffers || []).map(o => o.status === "pending" ? { ...o, status: "stale" } : o),
+              }
+            : l),
+        };
+        return next;
+      },
+
+      "marketplace.cancel": (s, e) => {
+        const { listingId } = e.payload || {};
+        if (!listingId) return s;
+        const listing = s.marketplace.find(l => l.id === listingId);
+        if (!listing || listing.status !== "open") return s;
+        return {
+          ...s,
+          marketplace: s.marketplace.map(l => l.id === listingId
+            ? {
+                ...l,
+                status: "cancelled",
+                tradeOffers: (l.tradeOffers || []).map(o => o.status === "pending" ? { ...o, status: "stale" } : o),
+              }
+            : l),
+        };
+      },
+
+      "trade.offer-post": (s, e) => {
+        const { offerId, listingId, fromUid, dateKey, slotId, incentivePts } = e.payload || {};
+        if (!offerId || !listingId) return s;
+        const listing = s.marketplace.find(l => l.id === listingId);
+        if (!listing || listing.status !== "open") return s;
+        if ((listing.tradeOffers || []).some(o => o.id === offerId)) return s;
+        const offer = {
+          id: offerId,
+          offererId: fromUid,
+          offererDateKey: dateKey,
+          offererSlotId: slotId,
+          incentivePts: Math.max(0, parseInt(incentivePts) || 0),
+          postedAt: e.clientTs,
+          status: "pending",
+        };
+        return {
+          ...s,
+          marketplace: s.marketplace.map(l => l.id === listingId
+            ? { ...l, tradeOffers: [...(l.tradeOffers || []), offer] }
+            : l),
+        };
+      },
+
+      "trade.offer-accept": (s, e) => {
+        const p = e.payload || {};
+        const { offerId, listingId, aDate, aSlot, aUid, bDate, bSlot, bUid, pointsTransferred } = p;
+        if (!offerId || !listingId) return s;
+        const listing = s.marketplace.find(l => l.id === listingId);
+        if (!listing) return s;
+        const aDay = s.shifts[aDate];
+        const bDay = s.shifts[bDate];
+        const aEntry = aDay?.[aSlot];
+        const bEntry = bDay?.[bSlot];
+        if (!aEntry || !bEntry) return s;
+        let next = {
+          ...s,
+          shifts: {
+            ...s.shifts,
+            [aDate]: { ...aDay, [aSlot]: { ...aEntry, uid: bUid, source: "trade", swappedFrom: aUid, confirm: null, flagReason: null } },
+            [bDate]: { ...(s.shifts[bDate] || {}), [bSlot]: { ...bEntry, uid: aUid, source: "trade", swappedFrom: bUid, confirm: null, flagReason: null } },
+          },
+        };
+        if (pointsTransferred && Object.keys(pointsTransferred).length) {
+          next = {
+            ...next,
+            users: next.users.map(u => {
+              const delta = pointsTransferred[String(u.id)] ?? pointsTransferred[u.id] ?? 0;
+              if (delta === 0) return u;
+              return { ...u, points: Math.max(0, (u.points || 0) + delta) };
+            }),
+          };
+        }
+        next = {
+          ...next,
+          marketplace: next.marketplace.map(l => l.id === listingId
+            ? {
+                ...l,
+                status: "traded",
+                takenBy: bUid,
+                takenAt: e.clientTs,
+                tradeOffers: (l.tradeOffers || []).map(o =>
+                  o.id === offerId ? { ...o, status: "accepted" }
+                                  : (o.status === "pending" ? { ...o, status: "declined" } : o)
+                ),
+              }
+            : l),
+        };
+        return next;
+      },
+
+      "trade.offer-decline": (s, e) => {
+        const { offerId, listingId, status } = e.payload || {};
+        if (!offerId) return s;
+        // Allow lookup by listingId (preferred) or by scanning offers (fallback for older payloads).
+        const target = listingId
+          ? s.marketplace.find(l => l.id === listingId)
+          : s.marketplace.find(l => (l.tradeOffers || []).some(o => o.id === offerId));
+        if (!target) return s;
+        const newStatus = status || "declined";
+        return {
+          ...s,
+          marketplace: s.marketplace.map(l => l.id === target.id
+            ? { ...l, tradeOffers: (l.tradeOffers || []).map(o => o.id === offerId ? { ...o, status: newStatus } : o) }
+            : l),
+        };
+      },
+
+      "incentive.open-set": (s, e) => {
+        const { dateKey, slotId, points } = e.payload || {};
+        if (!dateKey || slotId == null) return s;
+        const pts = Math.max(0, parseInt(points) || 0);
+        const next = { ...s.openIncentives };
+        if (pts > 0) {
+          next[dateKey] = { ...(next[dateKey] || {}), [slotId]: pts };
+        } else if (next[dateKey]?.[slotId] != null || next[dateKey]?.[String(slotId)] != null) {
+          const day = { ...next[dateKey] };
+          delete day[slotId];
+          delete day[String(slotId)];
+          if (Object.keys(day).length) next[dateKey] = day;
+          else delete next[dateKey];
+        } else {
+          return s;
+        }
+        return { ...s, openIncentives: next };
+      },
+
+      "config.update": (s, e) => {
+        const patch = e.payload?.patch;
+        if (!patch || typeof patch !== "object") return s;
+        return { ...s, config: { ...s.config, ...patch } };
+      },
+
+      "user.create": (s, e) => {
+        const u = e.payload?.user;
+        if (!u || u.id == null) return s;
+        if (s.users.some(x => x.id === u.id)) return s;
+        return { ...s, users: [...s.users, u] };
+      },
+
+      "user.update": (s, e) => {
+        const { uid, patch } = e.payload || {};
+        if (uid == null || !patch || typeof patch !== "object") return s;
+        return {
+          ...s,
+          users: s.users.map(u => String(u.id) === String(uid) ? { ...u, ...patch } : u),
+        };
+      },
+
+      "user.delete": (s, e) => {
+        const { uid, cascadeShifts } = e.payload || {};
+        if (uid == null) return s;
+        const match = u => String(u.id) === String(uid);
+        let next = { ...s, users: s.users.filter(u => !match(u)) };
+        if (Array.isArray(cascadeShifts) && cascadeShifts.length) {
+          const drop = new Set(cascadeShifts.map(c => `${c.dateKey}::${c.slotId}`));
+          const nextShifts = {};
+          for (const [k, day] of Object.entries(s.shifts)) {
+            const cleaned = {};
+            for (const [sid, ent] of Object.entries(day)) {
+              if (drop.has(`${k}::${sid}`)) continue;
+              cleaned[sid] = ent;
+            }
+            if (Object.keys(cleaned).length) nextShifts[k] = cleaned;
+          }
+          next = { ...next, shifts: nextShifts };
+        }
+        if (next.unavailability[uid] !== undefined || next.unavailability[String(uid)] !== undefined) {
+          const u = { ...next.unavailability };
+          delete u[uid];
+          delete u[String(uid)];
+          next = { ...next, unavailability: u };
+        }
+        if (next.preferences[uid] !== undefined || next.preferences[String(uid)] !== undefined) {
+          const p = { ...next.preferences };
+          delete p[uid];
+          delete p[String(uid)];
+          next = { ...next, preferences: p };
+        }
+        return next;
+      },
+
+      "snapshot.bootstrap": (s) => s,  // placeholder; reserved for D.4 future use
+    };
+
+    function applyEvent(state, evt) {
+      if (!evt || !evt.id) return state;
+      if (state.appliedEventIds && state.appliedEventIds.includes(evt.id)) return state;
+      const h = EVENT_HANDLERS[evt.type];
+      if (!h) return state;  // forward-compat: unknown event type is a no-op
+      const next = h(state, evt);
+      return { ...next, appliedEventIds: trackAppliedEventId(state.appliedEventIds, evt.id) };
+    }
+
+    // Normalize state for diffing: sort arrays-of-{id} by id, sort object keys.
+    function normalizeForDiff(v) {
+      if (Array.isArray(v)) {
+        const items = v.length && v.every(x => x && typeof x === "object" && "id" in x)
+          ? [...v].sort((a, b) => String(a.id).localeCompare(String(b.id)))
+          : v;
+        return items.map(normalizeForDiff);
+      }
+      if (v && typeof v === "object") {
+        const sorted = {};
+        for (const k of Object.keys(v).sort()) sorted[k] = normalizeForDiff(v[k]);
+        return sorted;
+      }
+      return v;
+    }
+
+    function diffState(replayed, live) {
+      const slices = ["users","shifts","unavailability","preferences","topOptions","marketplace","openIncentives","config"];
+      const out = [];
+      for (const k of slices) {
+        const a = normalizeForDiff(replayed[k]);
+        const b = normalizeForDiff(live[k]);
+        if (JSON.stringify(a) !== JSON.stringify(b)) {
+          out.push({ slice: k, replayed: a, live: b });
+        }
+      }
+      return out;
+    }
 
 function ShiftApp() {
   const [loading, setLoading] = useState(true);
@@ -1192,6 +1900,70 @@ function ShiftApp() {
     window.api.fetchJSON("/api/events", { method: "POST", body: JSON.stringify(body) }).catch(()=>{});
   };
 
+  // D.4.C — offline validator. Owner-only. No UI; access from DevTools as
+  // `await window.__shiftValidator.run()`. Pulls the latest snapshot, replays
+  // every event newer than its server_ts through applyEvent, and deep-diffs the
+  // result against the current live state. Logs to console. Acceptance gate
+  // for moving to D.4.D1 is "0 divergences across normal use for one full day."
+  useEffect(() => {
+    if (!cloudUser || !currentGroup?.cloudGroupId || me?.role !== "super") {
+      if (typeof window !== "undefined" && window.__shiftValidator) delete window.__shiftValidator;
+      return;
+    }
+    const gid = currentGroup.cloudGroupId;
+    window.__shiftValidator = {
+      async run() {
+        try {
+          const snap = await window.api.fetchJSON(`/api/snapshots/${gid}/latest`);
+          if (!snap?.payload) { console.warn("[validator] no snapshot for", gid); return null; }
+          const base = {
+            users: snap.payload.users || [],
+            shifts: snap.payload.shifts || {},
+            unavailability: snap.payload.unavailability || {},
+            preferences: snap.payload.preferences || {},
+            topOptions: snap.payload.topOptions || {},
+            marketplace: snap.payload.marketplace || [],
+            openIncentives: snap.payload.openIncentives || {},
+            config: snap.payload.config || {},
+            appliedEventIds: [],
+          };
+          // Pull events strictly newer than the snapshot. Tail past nextCursor in 2000-row batches.
+          let cursor = (snap.serverTs ?? 0) + 1;
+          const all = [];
+          // Hard cap on pagination to avoid runaway loops.
+          for (let i = 0; i < 50; i++) {
+            const r = await window.api.fetchJSON(`/api/events?gid=${gid}&since=${cursor}&limit=2000`);
+            const batch = r?.events || [];
+            if (!batch.length) break;
+            all.push(...batch);
+            if (!r.nextCursor) break;
+            cursor = r.nextCursor + 1;
+          }
+          let state = base;
+          for (const evt of all) state = applyEvent(state, evt);
+          const live = { users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config };
+          const diffs = diffState(state, live);
+          if (diffs.length === 0) {
+            console.log(`%c[validator] ✅ 0 divergences · replayed ${all.length} events from snap@${snap.serverTs}`, "color:green;font-weight:bold");
+          } else {
+            console.error(`[validator] ❌ ${diffs.length} divergence(s) · replayed ${all.length} events from snap@${snap.serverTs}`);
+            diffs.forEach(d => {
+              console.group(`[validator] slice: ${d.slice}`);
+              console.error("replayed:", d.replayed);
+              console.error("live:    ", d.live);
+              console.groupEnd();
+            });
+          }
+          return { divergences: diffs.length, events: all.length, snapshotTs: snap.serverTs, diffs };
+        } catch (err) {
+          console.error("[validator] run failed:", err);
+          return null;
+        }
+      },
+    };
+    return () => { if (typeof window !== "undefined" && window.__shiftValidator) delete window.__shiftValidator; };
+  }, [cloudUser, currentGroup?.cloudGroupId, me?.role, users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config]);
+
   /* ── Super-admin helpers ── */
   const createGroup = async (name) => {
     const existingCodes = new Set(groups.flatMap(g=>[g.groupCode, g.adminCode]));
@@ -1499,6 +2271,9 @@ function ShiftApp() {
     const nextTops = {...topOptions};
     if(Object.keys(dayMap).length) nextTops[dateKey] = dayMap;
     else delete nextTops[dateKey];
+    // D.4.B/C: capture the chain split decisions so applyEvent can replay deterministically
+    // (newLinkId is Math.random-based and can't be re-derived from prior state).
+    let chainRepair = null;
     if(chain.length){
       const idx = chain.indexOf(dateKey);
       const left = chain.slice(0, idx);
@@ -1517,9 +2292,10 @@ function ShiftApp() {
       };
       for(const d of left) stamp(d, leftLid);
       for(const d of right) stamp(d, rightLid);
+      chainRepair = { left, right, leftLid, rightLid };
     }
     setTopOptions(nextTops); await persist("topOptions", nextTops);
-    trackEvent("topOption.clear", { dateKey });
+    trackEvent("topOption.clear", { dateKey, ...(chainRepair ? { chainRepair } : {}) });
     flash("Top Option removed");
   };
 
@@ -1613,7 +2389,11 @@ function ShiftApp() {
     for(const d of left) stamp(d, leftLid);
     for(const d of right) stamp(d, rightLid);
     setTopOptions(nextTops); await persist("topOptions", nextTops);
-    trackEvent("topOption.unlink", { dateKey, splitAtNext: true });
+    // D.4.B/C: chainRepair lets applyEvent replay the split without calling Math.random.
+    trackEvent("topOption.unlink", {
+      dateKey, splitAtNext: true,
+      chainRepair: { left, right, leftLid, rightLid },
+    });
     flash("Unlinked");
   };
 
@@ -2277,8 +3057,14 @@ function ShiftApp() {
     const next = {...shifts};
     next[dateKey] = {...next[dateKey], [slotId]: {...entry, confirm: "flagged", flagReason: reason || null}};
     setShifts(next); await persist("shifts", next);
-    await _postListing(dateKey, slotId, 0, { autoPosted: true, flagReason: reason || null });
-    trackEvent("shift.flag", { dateKey, slotId, reason: reason || null });
+    // D.4.B/C: include the listing (newly-created OR pre-existing) so applyEvent can replay
+    // the auto-posted cascade without re-rolling the id/postedAt. Idempotent in the reducer
+    // (no-op append if listing.id is already in marketplace state).
+    const listing = await _postListing(dateKey, slotId, 0, { autoPosted: true, flagReason: reason || null });
+    trackEvent("shift.flag", {
+      dateKey, slotId, reason: reason || null,
+      ...(listing ? { listing } : {}),
+    });
     flash("⚠️ Flagged · admin notified, also posted to marketplace");
     setFlagDraft(null);
   };

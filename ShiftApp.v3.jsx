@@ -94,6 +94,180 @@ const inBlock = (k, cfg) => { const b = currentBlockOf(cfg); return !!(b && k >=
 const gKey = (gid, k) => `g${gid}_${k}`;
 const genCode = (len=6) => { const c="ABCDEFGHJKMNPQRSTUVWXYZ23456789"; let s=""; for(let i=0;i<len;i++) s+=c[Math.floor(Math.random()*c.length)]; return s; };
 
+// ════════════════════════════════════════════════════════════════════════════
+// D.4.C — applyEvent reducer (REFERENCE-ONLY MIRROR)
+//
+// The canonical runtime copy lives in templates/shyft_head.v3.html (which is
+// what gets concatenated into the runtime build). This preamble copy exists
+// for IDE readability ONLY — the `tail -n +N` step of the build strips
+// everything above `export default function ShiftApp`, so changes here have
+// no effect on the running app. Keep this in sync with the head template per
+// the CLAUDE.md head-template sync rule.
+//
+// See the head template for full inline documentation.
+// ════════════════════════════════════════════════════════════════════════════
+
+const APPLIED_EVENTS_CAP = 200;
+
+function trackAppliedEventId(prev, id) {
+  const arr = Array.isArray(prev) ? prev : [];
+  if (arr.includes(id)) return arr;
+  const next = arr.length >= APPLIED_EVENTS_CAP
+    ? [...arr.slice(arr.length - APPLIED_EVENTS_CAP + 1), id]
+    : [...arr, id];
+  return next;
+}
+
+function removeTopOptionEntry(topOptions, dateKey, uid) {
+  const dayMap = { ...(topOptions[dateKey] || {}) };
+  delete dayMap[uid];
+  delete dayMap[String(uid)];
+  const next = { ...topOptions };
+  if (Object.keys(dayMap).length) next[dateKey] = dayMap;
+  else delete next[dateKey];
+  return next;
+}
+
+function stampChainLinkIds(topOptions, dates, uid, lid) {
+  if (!Array.isArray(dates) || !dates.length) return topOptions;
+  const next = { ...topOptions };
+  for (const dk of dates) {
+    const en = next[dk]?.[uid] || next[dk]?.[String(uid)];
+    const key = en ? (uid in (next[dk] || {}) ? uid : String(uid)) : null;
+    if (!en || !key) continue;
+    if (lid) {
+      if (en.linkId === lid) continue;
+      next[dk] = { ...next[dk], [key]: { ...en, linkId: lid } };
+    } else {
+      if (en.linkId == null) continue;
+      const { linkId: _drop, ...rest } = en;
+      next[dk] = { ...next[dk], [key]: rest };
+    }
+  }
+  return next;
+}
+
+function applyAwardsToShifts(shifts, awards) {
+  if (!Array.isArray(awards) || !awards.length) return shifts;
+  const next = { ...shifts };
+  for (const a of awards) {
+    if (!a || !a.dateKey || a.uid == null) continue;
+    const day = next[a.dateKey] ? { ...next[a.dateKey] } : {};
+    day[a.slotId] = {
+      uid: a.uid, auto: false, source: a.source || "pool",
+      ...(a.bid != null ? { bid: a.bid } : {}),
+      confirm: null,
+    };
+    next[a.dateKey] = day;
+  }
+  return next;
+}
+
+function applyPointsCascade(users, deltas, penalties, incCredits) {
+  const has = (m, u) => m && (m[u.id] !== undefined || m[String(u.id)] !== undefined);
+  const get = (m, u) => m ? (m[u.id] ?? m[String(u.id)] ?? 0) : 0;
+  const anyMap = m => m && Object.keys(m).length > 0;
+  if (!anyMap(deltas) && !anyMap(penalties) && !anyMap(incCredits)) return users;
+  return users.map(u => {
+    if (!has(deltas, u) && !has(penalties, u) && !has(incCredits, u)) return u;
+    const bid = get(deltas, u);
+    const pen = get(penalties, u);
+    const inc = get(incCredits, u);
+    if (bid === 0 && pen === 0 && inc === 0) return u;
+    return { ...u, points: Math.max(0, (u.points || 0) + bid + inc - pen) };
+  });
+}
+
+function applyOpenIncentivesPatch(openIncentives, patch) {
+  if (!patch || !Array.isArray(patch.consumed) || !patch.consumed.length) return openIncentives;
+  const next = { ...openIncentives };
+  for (const c of patch.consumed) {
+    const day = next[c.dateKey];
+    if (!day) continue;
+    const nextDay = { ...day };
+    delete nextDay[c.slotId];
+    delete nextDay[String(c.slotId)];
+    if (Object.keys(nextDay).length) next[c.dateKey] = nextDay;
+    else delete next[c.dateKey];
+  }
+  return next;
+}
+
+function patchBlockInConfig(config, blockId, patch) {
+  if (!config || !Array.isArray(config.blocks)) return config;
+  const blocks = config.blocks.map(b => String(b.id) === String(blockId) ? { ...b, ...patch } : b);
+  return { ...config, blocks };
+}
+
+function closeAutoListingFor(marketplace, dateKey, slotId) {
+  let changed = false;
+  const next = marketplace.map(l => {
+    if (l.dateKey === dateKey && Number(l.slotId) === Number(slotId) && l.status === "open" && l.autoPosted) {
+      changed = true;
+      return {
+        ...l, status: "cancelled",
+        tradeOffers: (l.tradeOffers || []).map(o => o.status === "pending" ? { ...o, status: "stale" } : o),
+      };
+    }
+    return l;
+  });
+  return changed ? next : marketplace;
+}
+
+// 26 handlers — see head template for full implementations. Reproducing only
+// the structure here; the head-template copy is authoritative.
+const EVENT_HANDLERS = {
+  "topOption.set":      (s, e) => s, "topOption.clear":    (s, e) => s,
+  "topOption.link":     (s, e) => s, "topOption.unlink":   (s, e) => s,
+  "preference.toggle":  (s, e) => s, "unavail.toggle":     (s, e) => s,
+  "unavail.reason":     (s, e) => s, "block.reconcile":    (s, e) => s,
+  "block.lock":         (s, e) => s, "block.unlock":       (s, e) => s,
+  "block.reset":        (s, e) => s, "shift.confirm":      (s, e) => s,
+  "shift.flag":         (s, e) => s, "shift.swap-admin":   (s, e) => s,
+  "shift.trade-admin":  (s, e) => s, "marketplace.post":   (s, e) => s,
+  "marketplace.take":   (s, e) => s, "marketplace.cancel": (s, e) => s,
+  "trade.offer-post":   (s, e) => s, "trade.offer-accept": (s, e) => s,
+  "trade.offer-decline":(s, e) => s, "incentive.open-set": (s, e) => s,
+  "config.update":      (s, e) => s, "user.create":        (s, e) => s,
+  "user.update":        (s, e) => s, "user.delete":        (s, e) => s,
+  "snapshot.bootstrap": (s) => s,
+};
+
+function applyEvent(state, evt) {
+  if (!evt || !evt.id) return state;
+  if (state.appliedEventIds && state.appliedEventIds.includes(evt.id)) return state;
+  const h = EVENT_HANDLERS[evt.type];
+  if (!h) return state;
+  const next = h(state, evt);
+  return { ...next, appliedEventIds: trackAppliedEventId(state.appliedEventIds, evt.id) };
+}
+
+function normalizeForDiff(v) {
+  if (Array.isArray(v)) {
+    const items = v.length && v.every(x => x && typeof x === "object" && "id" in x)
+      ? [...v].sort((a, b) => String(a.id).localeCompare(String(b.id)))
+      : v;
+    return items.map(normalizeForDiff);
+  }
+  if (v && typeof v === "object") {
+    const sorted = {};
+    for (const k of Object.keys(v).sort()) sorted[k] = normalizeForDiff(v[k]);
+    return sorted;
+  }
+  return v;
+}
+
+function diffState(replayed, live) {
+  const slices = ["users","shifts","unavailability","preferences","topOptions","marketplace","openIncentives","config"];
+  const out = [];
+  for (const k of slices) {
+    const a = normalizeForDiff(replayed[k]);
+    const b = normalizeForDiff(live[k]);
+    if (JSON.stringify(a) !== JSON.stringify(b)) out.push({ slice: k, replayed: a, live: b });
+  }
+  return out;
+}
+
 export default function ShiftApp() {
   const [loading, setLoading] = useState(true);
   const [groups, setGroups] = useState([]);
@@ -980,6 +1154,70 @@ export default function ShiftApp() {
     window.api.fetchJSON("/api/events", { method: "POST", body: JSON.stringify(body) }).catch(()=>{});
   };
 
+  // D.4.C — offline validator. Owner-only. No UI; access from DevTools as
+  // `await window.__shiftValidator.run()`. Pulls the latest snapshot, replays
+  // every event newer than its server_ts through applyEvent, and deep-diffs the
+  // result against the current live state. Logs to console. Acceptance gate
+  // for moving to D.4.D1 is "0 divergences across normal use for one full day."
+  useEffect(() => {
+    if (!cloudUser || !currentGroup?.cloudGroupId || me?.role !== "super") {
+      if (typeof window !== "undefined" && window.__shiftValidator) delete window.__shiftValidator;
+      return;
+    }
+    const gid = currentGroup.cloudGroupId;
+    window.__shiftValidator = {
+      async run() {
+        try {
+          const snap = await window.api.fetchJSON(`/api/snapshots/${gid}/latest`);
+          if (!snap?.payload) { console.warn("[validator] no snapshot for", gid); return null; }
+          const base = {
+            users: snap.payload.users || [],
+            shifts: snap.payload.shifts || {},
+            unavailability: snap.payload.unavailability || {},
+            preferences: snap.payload.preferences || {},
+            topOptions: snap.payload.topOptions || {},
+            marketplace: snap.payload.marketplace || [],
+            openIncentives: snap.payload.openIncentives || {},
+            config: snap.payload.config || {},
+            appliedEventIds: [],
+          };
+          // Pull events strictly newer than the snapshot. Tail past nextCursor in 2000-row batches.
+          let cursor = (snap.serverTs ?? 0) + 1;
+          const all = [];
+          // Hard cap on pagination to avoid runaway loops.
+          for (let i = 0; i < 50; i++) {
+            const r = await window.api.fetchJSON(`/api/events?gid=${gid}&since=${cursor}&limit=2000`);
+            const batch = r?.events || [];
+            if (!batch.length) break;
+            all.push(...batch);
+            if (!r.nextCursor) break;
+            cursor = r.nextCursor + 1;
+          }
+          let state = base;
+          for (const evt of all) state = applyEvent(state, evt);
+          const live = { users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config };
+          const diffs = diffState(state, live);
+          if (diffs.length === 0) {
+            console.log(`%c[validator] ✅ 0 divergences · replayed ${all.length} events from snap@${snap.serverTs}`, "color:green;font-weight:bold");
+          } else {
+            console.error(`[validator] ❌ ${diffs.length} divergence(s) · replayed ${all.length} events from snap@${snap.serverTs}`);
+            diffs.forEach(d => {
+              console.group(`[validator] slice: ${d.slice}`);
+              console.error("replayed:", d.replayed);
+              console.error("live:    ", d.live);
+              console.groupEnd();
+            });
+          }
+          return { divergences: diffs.length, events: all.length, snapshotTs: snap.serverTs, diffs };
+        } catch (err) {
+          console.error("[validator] run failed:", err);
+          return null;
+        }
+      },
+    };
+    return () => { if (typeof window !== "undefined" && window.__shiftValidator) delete window.__shiftValidator; };
+  }, [cloudUser, currentGroup?.cloudGroupId, me?.role, users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config]);
+
   /* ── Super-admin helpers ── */
   const createGroup = async (name) => {
     const existingCodes = new Set(groups.flatMap(g=>[g.groupCode, g.adminCode]));
@@ -1287,6 +1525,9 @@ export default function ShiftApp() {
     const nextTops = {...topOptions};
     if(Object.keys(dayMap).length) nextTops[dateKey] = dayMap;
     else delete nextTops[dateKey];
+    // D.4.B/C: capture the chain split decisions so applyEvent can replay deterministically
+    // (newLinkId is Math.random-based and can't be re-derived from prior state).
+    let chainRepair = null;
     if(chain.length){
       const idx = chain.indexOf(dateKey);
       const left = chain.slice(0, idx);
@@ -1305,9 +1546,10 @@ export default function ShiftApp() {
       };
       for(const d of left) stamp(d, leftLid);
       for(const d of right) stamp(d, rightLid);
+      chainRepair = { left, right, leftLid, rightLid };
     }
     setTopOptions(nextTops); await persist("topOptions", nextTops);
-    trackEvent("topOption.clear", { dateKey });
+    trackEvent("topOption.clear", { dateKey, ...(chainRepair ? { chainRepair } : {}) });
     flash("Top Option removed");
   };
 
@@ -1401,7 +1643,11 @@ export default function ShiftApp() {
     for(const d of left) stamp(d, leftLid);
     for(const d of right) stamp(d, rightLid);
     setTopOptions(nextTops); await persist("topOptions", nextTops);
-    trackEvent("topOption.unlink", { dateKey, splitAtNext: true });
+    // D.4.B/C: chainRepair lets applyEvent replay the split without calling Math.random.
+    trackEvent("topOption.unlink", {
+      dateKey, splitAtNext: true,
+      chainRepair: { left, right, leftLid, rightLid },
+    });
     flash("Unlinked");
   };
 
@@ -2065,8 +2311,14 @@ export default function ShiftApp() {
     const next = {...shifts};
     next[dateKey] = {...next[dateKey], [slotId]: {...entry, confirm: "flagged", flagReason: reason || null}};
     setShifts(next); await persist("shifts", next);
-    await _postListing(dateKey, slotId, 0, { autoPosted: true, flagReason: reason || null });
-    trackEvent("shift.flag", { dateKey, slotId, reason: reason || null });
+    // D.4.B/C: include the listing (newly-created OR pre-existing) so applyEvent can replay
+    // the auto-posted cascade without re-rolling the id/postedAt. Idempotent in the reducer
+    // (no-op append if listing.id is already in marketplace state).
+    const listing = await _postListing(dateKey, slotId, 0, { autoPosted: true, flagReason: reason || null });
+    trackEvent("shift.flag", {
+      dateKey, slotId, reason: reason || null,
+      ...(listing ? { listing } : {}),
+    });
     flash("⚠️ Flagged · admin notified, also posted to marketplace");
     setFlagDraft(null);
   };
