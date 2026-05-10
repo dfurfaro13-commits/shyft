@@ -117,7 +117,14 @@ export async function authSignup(req, env) {
   // can drop it straight into cloudUser without a follow-up fetch.
   const { raw: sidRaw } = await createSession(env, userId);
   const memberships = group
-    ? [{ groupId: group.id, role, localUid: null, groupName: await groupName(env, group.id) }]
+    ? [{
+        groupId: group.id,
+        role,
+        localUid: null,
+        groupName: await groupName(env, group.id),
+        groupCode: groupCode || null,
+        adminCode: group.admin_code || null,
+      }]
     : [];
   const user = { id: userId, email, username, displayName, canCreateGroups: !!canCreateGroups };
   return new Response(JSON.stringify({ user, memberships }), {

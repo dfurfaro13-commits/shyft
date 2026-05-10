@@ -340,6 +340,25 @@ function ShiftApp() {
   const [accounts, setAccounts] = useState({ list: null, loading: false, error: "" });
   const [accountsEdit, setAccountsEdit] = useState(null);   // { uid, name, email, password, busy, error } or null
   const [accountsDelete, setAccountsDelete] = useState(null); // { uid, name, busy, error } or null
+  // Profile page form state. Holds the in-flight edits the user makes to their cloud
+  // account (displayName, email, password). `pwOpen` toggles the "Change password" form
+  // section so the password fields aren't always rendered. Keeps separate `busy` and
+  // `error` per section to avoid blocking the displayName/email edit while a password
+  // change is in flight (or vice versa).
+  const [profileForm, setProfileForm] = useState({
+    displayName: "", email: "",
+    currentPassword: "", newPassword: "", newPasswordConfirm: "",
+    pwOpen: false,
+    infoBusy: false, infoError: "", infoOk: "",
+    pwBusy: false, pwError: "", pwOk: "",
+  });
+  // Snapshot history (recovery) modal state. Opened from the Owner group cards. Shape:
+  //   { group: <local g>, loading, error, current: {clientTs,serverTs}, history: [...], busy }
+  const [snapHistory, setSnapHistory] = useState(null);
+  // Email lookup for "ghost" cloud accounts that exist in users but aren't in caller's owned
+  // groups (so /api/owner/users doesn't return them). Surfaces them so the owner can investigate
+  // and, when appropriate, delete via the orphan-cleanup path on the server.
+  const [accountsLookup, setAccountsLookup] = useState({ email: "", busy: false, result: null, error: "" });
   const [authMode, setAuthMode] = useState("signin");
   // D.3: cloud-backed auth. `emailOrUsername` accepts either on Sign in; signup uses email,
   // username, displayName, plus optional groupCode/adminCode/ownerCode. Local-only fields
@@ -402,6 +421,16 @@ function ShiftApp() {
   const [unclaimedCloudGroups, setUnclaimedCloudGroups] = useState([]);
   const snapshotUploadTimer = useRef(null);
   const snapshotUploadInflight = useRef(false);
+  // D.3 follow-up: one-shot heal for owners whose local groupCode/adminCode drifted from
+  // cloud (e.g., they rolled codes locally before the PATCH endpoint existed). Set to true
+  // after the first successful pass so we don't hammer the API on every render.
+  const codesReconciledRef = useRef(false);
+  // D.3 follow-up: one-shot auto-claim of owner-owned cloud groups missing from localStorage.
+  // Without this, an owner signing in on a fresh browser/incognito sees an empty Owner
+  // dashboard — their groups only appear after a member-sign-in restores the local mirror as
+  // a side effect. The auth-screen "Restore" cards solve this for non-owners but the cloud
+  // bridge skips the auth screen for owners, leaving them stranded. Set true after first run.
+  const ownerGroupsClaimedRef = useRef(false);
 
   useEffect(() => {
     (async () => {
@@ -844,19 +873,297 @@ function ShiftApp() {
   // D.3 follow-up: load the Accounts list. Called on first switch to the Accounts tab and again
   // after every successful edit/delete. Errors stay inline so the user can retry without losing
   // context (no toast).
+  //
+  // Also merges in LOCAL-only users — users that exist in localStorage (e.g., added via the
+  // in-group "+ Add user" flow when the group wasn't cloud-mirrored, or before D.3) but have
+  // no matching cloud account. Without this, the SuperDashboard's per-group "Admins" / "Providers"
+  // counts (which read local) silently include people the Accounts list (which reads cloud)
+  // can't see. Local-only entries are flagged and only support a local Remove action.
   const loadAccounts = async () => {
     setAccounts(s => ({ ...s, loading: true, error: "" }));
+    let cloudList = [];
+    let cloudError = false;
     try {
       const r = await window.api.fetchJSON("/api/owner/users");
-      setAccounts({ list: r?.users || [], loading: false, error: "" });
+      cloudList = (r?.users || []).map(u => ({ ...u, source: "cloud" }));
     } catch (e) {
-      setAccounts(s => ({ ...s, loading: false, error: "Couldn't load accounts. Try again." }));
+      cloudError = true;
+    }
+    // Build dedupe sets from cloud users so local rows already linked are skipped. A local
+    // row is considered linked to cloud when ANY of these match:
+    //   - local.cloudUserId === cloudUser.id      (set by enterGroupAsCloudMember)
+    //   - local.email === cloudUser.email         (manual-add path with explicit email)
+    //   - local.id === cloudMembership.localUid   (set by D.2 migrate — the most common path
+    //     for the synthetic test users; without this check, every D.2 user falsely appears
+    //     as "Local only" with a Remove button, which wipes them from users[] when clicked.)
+    // Cloud emails are stored lowercase; normalize defensively.
+    const cloudIds = new Set(cloudList.map(u => u.id));
+    const cloudEmails = new Set(cloudList.map(u => (u.email || "").toLowerCase()).filter(Boolean));
+    // Set of "<cloudGroupId>:<localUid>" pairs — a local user with id matching localUid in any
+    // membership is considered linked. Compare as strings since cloud localUid is TEXT and
+    // local ids are typically Date.now() numbers.
+    const cloudLocalUidPairs = new Set();
+    for (const u of cloudList) {
+      for (const m of (u.memberships || [])) {
+        if (m.localUid != null) cloudLocalUidPairs.add(`${m.groupId}:${String(m.localUid)}`);
+      }
+    }
+    // Walk every local group's users[]. Each unmatched user is a local-only Account.
+    const localOnly = new Map(); // localUid -> entry (deduped across groups)
+    for (const g of groups) {
+      const gusers = readGroupKey(g.id, "users", []);
+      for (const u of gusers) {
+        if (u.cloudUserId && cloudIds.has(u.cloudUserId)) continue;
+        const lcEmail = (u.email || "").toLowerCase();
+        if (lcEmail && cloudEmails.has(lcEmail)) continue;
+        if (g.cloudGroupId && cloudLocalUidPairs.has(`${g.cloudGroupId}:${String(u.id)}`)) continue;
+        const key = `${g.id}:${u.id}`;
+        if (localOnly.has(key)) continue;
+        localOnly.set(key, {
+          id: `local:${key}`,
+          source: "local",
+          localGroupId: g.id,
+          localUserId: u.id,
+          displayName: u.name || "(no name)",
+          email: u.email || "",
+          username: u.username || null,
+          kind: undefined,
+          hasPassword: true,
+          memberships: [{ groupId: g.id, groupName: g.name, role: u.role, localUid: u.id }],
+        });
+      }
+    }
+    const merged = [...cloudList, ...Array.from(localOnly.values())].sort((a, b) =>
+      (a.displayName || a.email || "").localeCompare(b.displayName || b.email || "")
+    );
+    setAccounts({
+      list: merged,
+      loading: false,
+      error: cloudError ? "Cloud accounts couldn't load — showing local users only." : "",
+    });
+  };
+  // Look up any cloud user by email (owner-only on the server). Surfaces ghost accounts —
+  // users that exist in the cloud users table but don't appear in /api/owner/users because
+  // they have no membership in any of the caller's owned groups. The result includes ALL
+  // their memberships (with `callerOwns` set per-group), so the UI can show whether the
+  // caller has authority to manage each one.
+  const lookupAccountByEmail = async () => {
+    const email = (accountsLookup.email || "").trim().toLowerCase();
+    if (!email || !email.includes("@")) {
+      setAccountsLookup(s => ({ ...s, error: "Enter a valid email address." }));
+      return;
+    }
+    setAccountsLookup(s => ({ ...s, busy: true, error: "", result: null }));
+    try {
+      const r = await window.api.fetchJSON("/api/owner/lookup?email=" + encodeURIComponent(email));
+      setAccountsLookup(s => ({ ...s, busy: false, result: r, error: "" }));
+    } catch (e) {
+      const code = e?.body?.error;
+      const msg = ({
+        not_found: "No cloud account with that email.",
+        invalid_email: "Invalid email format.",
+        forbidden: "You don't have permission to look up accounts.",
+      })[code] || "Lookup failed. Try again.";
+      setAccountsLookup(s => ({ ...s, busy: false, error: msg, result: null }));
     }
   };
-  // Tab switcher. Loads the accounts list lazily — once per switch into the tab.
+  // Delete a cloud user surfaced by the lookup. The server already enforces the auth rules
+  // (shared-group OR caller-canCreateGroups + target-has-no-memberships), so we just call
+  // through and reflect the result.
+  const deleteLookupResult = async () => {
+    const r = accountsLookup.result;
+    if (!r?.user) return;
+    const label = r.user.displayName || r.user.email || "this account";
+    if (!confirm(`Permanently delete cloud account "${label}"? This anonymizes the user and revokes all sign-in tokens.`)) return;
+    setAccountsLookup(s => ({ ...s, busy: true, error: "" }));
+    try {
+      const res = await window.api.fetchJSON("/api/owner/users/" + encodeURIComponent(r.user.id), { method: "DELETE" });
+      flash(res?.fullyDeleted ? "🗑 Account deleted" : "🗑 Removed from your groups");
+      setAccountsLookup({ email: "", busy: false, result: null, error: "" });
+      await loadAccounts();
+    } catch (e) {
+      const code = e?.body?.error;
+      const msg = ({
+        target_is_owner: "Can't delete an owner of another group.",
+        cannot_delete_self: "Can't delete your own account from here.",
+        forbidden: "You don't manage this account.",
+        not_found: "Account no longer exists.",
+      })[code] || "Couldn't delete.";
+      setAccountsLookup(s => ({ ...s, busy: false, error: msg }));
+    }
+  };
+  // Profile-page helpers. `openProfile` seeds the form with whatever cloudUser currently has
+  // and navigates to the page (in-group surface) or sets the SuperDashboard tab. Splitting the
+  // info-save and password-save into separate handlers lets the user edit one without the
+  // other's busy state blocking the form.
+  const seedProfileForm = () => setProfileForm({
+    displayName: cloudUser?.user?.displayName || "",
+    email: cloudUser?.user?.email || "",
+    currentPassword: "", newPassword: "", newPasswordConfirm: "",
+    pwOpen: false,
+    infoBusy: false, infoError: "", infoOk: "",
+    pwBusy: false, pwError: "", pwOk: "",
+  });
+  const openProfilePage = () => { seedProfileForm(); setPage("profile"); };
+  // Save displayName / email. If both are unchanged from cloudUser, no-op with a friendly note.
+  const saveProfileInfo = async () => {
+    const cu = cloudUser?.user;
+    if (!cu) { setProfileForm(s=>({...s, infoError:"Not signed in to cloud."})); return; }
+    const dn = (profileForm.displayName || "").trim();
+    const em = (profileForm.email || "").trim().toLowerCase();
+    const body = {};
+    if (dn && dn !== (cu.displayName || "")) body.displayName = dn;
+    if (em && em !== (cu.email || "")) body.email = em;
+    if (Object.keys(body).length === 0) {
+      setProfileForm(s=>({...s, infoOk:"Nothing to update.", infoError:""}));
+      return;
+    }
+    setProfileForm(s=>({...s, infoBusy:true, infoError:"", infoOk:""}));
+    try {
+      await window.api.fetchJSON("/api/me", { method:"PATCH", body: JSON.stringify(body) });
+      // Refresh cloudUser so the rest of the UI (top-right email, accounts list, etc.) reflects new values.
+      try { const meRes = await window.api.fetchJSON("/api/me"); if (meRes) setCloudUser(meRes); } catch {}
+      setProfileForm(s=>({...s, infoBusy:false, infoOk:"✅ Saved", infoError:""}));
+    } catch (e) {
+      const code = e?.body?.error;
+      const msg = ({
+        invalid_email: "Invalid email format.",
+        email_taken: "That email is already in use by another account.",
+        invalid_display_name: "Display name must be 1–80 characters.",
+        unauthorized: "Session expired. Sign in again.",
+      })[code] || "Couldn't save. Try again.";
+      setProfileForm(s=>({...s, infoBusy:false, infoError:msg, infoOk:""}));
+    }
+  };
+  // Save new password. Verifies current password server-side; the confirm field is checked client-side.
+  const saveProfilePassword = async () => {
+    const cu = cloudUser?.user;
+    if (!cu) { setProfileForm(s=>({...s, pwError:"Not signed in to cloud."})); return; }
+    const cur = profileForm.currentPassword || "";
+    const nw = profileForm.newPassword || "";
+    const cf = profileForm.newPasswordConfirm || "";
+    if (!cur) { setProfileForm(s=>({...s, pwError:"Enter your current password."})); return; }
+    if (nw.length < 8) { setProfileForm(s=>({...s, pwError:"New password must be at least 8 characters."})); return; }
+    if (nw !== cf) { setProfileForm(s=>({...s, pwError:"New passwords don't match."})); return; }
+    setProfileForm(s=>({...s, pwBusy:true, pwError:"", pwOk:""}));
+    try {
+      await window.api.fetchJSON("/api/me", {
+        method: "PATCH",
+        body: JSON.stringify({ currentPassword: cur, password: nw }),
+      });
+      setProfileForm(s=>({
+        ...s, pwBusy:false, pwOk:"✅ Password updated", pwError:"",
+        currentPassword:"", newPassword:"", newPasswordConfirm:"", pwOpen:false,
+      }));
+    } catch (e) {
+      const code = e?.body?.error;
+      const msg = ({
+        current_password_required: "Enter your current password.",
+        current_password_incorrect: "Current password is incorrect.",
+        password_too_short: "New password must be at least 8 characters.",
+        no_password_set: "This account has no password set — sign in with a magic link first.",
+        unauthorized: "Session expired. Sign in again.",
+      })[code] || "Couldn't change password. Try again.";
+      setProfileForm(s=>({...s, pwBusy:false, pwError:msg, pwOk:""}));
+    }
+  };
+  // Force-pull the current cloud snapshot for a cloud-mirrored group and apply it locally.
+  // Idempotent recovery action — if the cloud is good but local is corrupted (e.g., users[]
+  // was wiped while topOptions/prefs survived), this is the fastest way back. The snapshot
+  // sync banner does the same thing but only fires when cloud is detectably newer than local;
+  // this button bypasses that comparison so the owner can trigger it on demand.
+  const syncGroupFromCloud = async (g) => {
+    if (!g.cloudGroupId) { flash("⚠️ Group not cloud-mirrored"); return; }
+    if (!cloudUser) { flash("⚠️ Sign in to cloud first"); return; }
+    if (!confirm(
+      `Pull the current cloud snapshot for "${g.name}" and overwrite this device's local copy?\n\n` +
+      `Use this when local data looks wrong (missing users, missing prefs, etc.) but the cloud is intact.`
+    )) return;
+    try {
+      const snap = await window.api.fetchJSON("/api/snapshots/" + encodeURIComponent(g.cloudGroupId) + "/latest");
+      if (!snap?.payload) { flash("⚠️ No cloud snapshot to pull"); return; }
+      await applySnapshot(g.id, snap.payload);
+      try { localStorage.setItem(`shyft3_g${g.id}_lastModified`, String(snap.clientTs || Date.now())); } catch {}
+      flash(`✅ Synced "${g.name}" from cloud`);
+    } catch (e) {
+      flash("⚠️ Sync failed — check console for details");
+      console.error("syncGroupFromCloud failed:", e?.body || e);
+    }
+  };
+  // Open the Snapshot history modal for a cloud-mirrored group. Fetches the R2 history list
+  // and the current D1 latest. Owner-only; the backend enforces the same.
+  const openSnapshotHistory = async (g) => {
+    if (!g.cloudGroupId) { flash("⚠️ Group not cloud-mirrored"); return; }
+    setSnapHistory({ group: g, loading: true, error: "", current: null, history: [], busy: false });
+    try {
+      const r = await window.api.fetchJSON(`/api/owner/snapshots/${encodeURIComponent(g.cloudGroupId)}/history?limit=30`);
+      setSnapHistory(s => s && s.group?.id === g.id ? { ...s, loading: false, current: r.current, history: r.history || [] } : s);
+    } catch (e) {
+      const code = e?.body?.error;
+      const msg = ({
+        not_owner: "Only the cloud owner can view snapshot history.",
+        r2_unavailable: "Snapshot history isn't available right now.",
+      })[code] || "Couldn't load snapshot history.";
+      setSnapHistory(s => s && s.group?.id === g.id ? { ...s, loading: false, error: msg } : s);
+    }
+  };
+  // Restore a specific R2 snapshot to D1 latest, then immediately apply it locally so the
+  // owner sees their data come back without waiting for a sync banner. Heavy operation —
+  // confirm first.
+  const restoreSnapshotFromHistory = async (entry) => {
+    if (!snapHistory?.group || !entry?.key) return;
+    const g = snapHistory.group;
+    const summary = entry.summary;
+    const summaryLine = summary
+      ? `${summary.userCount} users, ${summary.prefsCount} prefs, ${summary.shiftsDayCount} shift-days, ${summary.topOptionsDayCount} top-option-days`
+      : "(no preview available)";
+    if (!confirm(
+      `Restore "${g.name}" from snapshot @ ${new Date(entry.serverTs * 1000).toLocaleString()}?\n` +
+      `\n${summaryLine}\n\n` +
+      `This overwrites the current cloud snapshot AND your local copy of this group. The old snapshot stays in history — you can roll forward again later.`
+    )) return;
+    setSnapHistory(s => s ? { ...s, busy: true, error: "" } : s);
+    try {
+      const r = await window.api.fetchJSON(`/api/owner/snapshots/${encodeURIComponent(g.cloudGroupId)}/restore`, {
+        method: "POST",
+        body: JSON.stringify({ key: entry.key }),
+      });
+      // Apply locally immediately so the user sees the rollback without needing the sync banner.
+      if (r?.payload) {
+        await applySnapshot(g.id, r.payload);
+        try { localStorage.setItem(`shyft3_g${g.id}_lastModified`, String(r.clientTs || Date.now())); } catch {}
+      }
+      flash(`✅ Restored "${g.name}"`);
+      setSnapHistory(null);
+    } catch (e) {
+      const code = e?.body?.error;
+      const msg = ({
+        not_owner: "Only the cloud owner can restore snapshots.",
+        snapshot_not_found: "That snapshot is no longer available in storage.",
+        snapshot_corrupt: "That snapshot file is corrupted — pick another.",
+        invalid_key: "Snapshot key looks wrong — refresh and try again.",
+        r2_unavailable: "Snapshot storage isn't available right now.",
+      })[code] || "Restore failed. Try again.";
+      setSnapHistory(s => s ? { ...s, busy: false, error: msg } : s);
+    }
+  };
+  // Remove a local-only user from a local group's users[]. No cloud calls — these accounts
+  // never made it to the cloud in the first place. Idempotent if the user is already gone.
+  const removeLocalOnlyUser = async (localGid, localUid) => {
+    const key = `shyft3_${gKey(localGid, "users")}`;
+    let list = [];
+    try { const raw = localStorage.getItem(key); list = raw ? JSON.parse(raw) : []; } catch {}
+    const next = list.filter(u => u.id !== localUid);
+    try { localStorage.setItem(key, JSON.stringify(next)); } catch {}
+    // If this group is currently loaded into React state, mirror the change.
+    if (groupId === localGid) setUsers(next);
+  };
+  // Tab switcher. Loads the accounts list lazily — once per switch into the tab. The profile
+  // tab seeds the cloud-info form fields from the current cloudUser so they're not blank.
   const switchSuperDashTab = (tab) => {
     setSuperDashTab(tab);
     if (tab === "accounts") loadAccounts();
+    if (tab === "profile") seedProfileForm();
   };
   // Owner-only: PATCH email and/or password. Empty values are skipped.
   const submitAccountsEdit = async () => {
@@ -1019,6 +1326,93 @@ function ShiftApp() {
     if (!cloudUser?.memberships?.length) { setUnclaimedCloudGroups([]); return; }
     const localCloudGids = new Set(groups.map(g => g.cloudGroupId).filter(Boolean));
     setUnclaimedCloudGroups(cloudUser.memberships.filter(m => !localCloudGids.has(m.groupId)));
+  }, [cloudUser, groups]);
+
+  // D.3 follow-up: auto-claim owner-owned cloud groups on first signin. Without this, an
+  // owner signing in on a fresh device (incognito, new browser, factory reset) sees an
+  // empty SuperDashboard even though /api/me lists their owned groups, because the cloud
+  // bridge routes them past the auth-screen Restore cards. Walks every owner-role
+  // membership in cloudUser and creates a local mirror (with applied snapshot if available)
+  // for any cloudGroupId not already in groups[]. Runs once per session via the ref.
+  useEffect(() => {
+    if (ownerGroupsClaimedRef.current) return;
+    if (!cloudUser?.memberships?.length) return;
+    const ownerMemberships = cloudUser.memberships.filter(m => m.role === "owner");
+    if (!ownerMemberships.length) return;
+    // Wait until the local groups[] has been hydrated from localStorage so we don't
+    // spuriously claim groups that ARE locally present. The bootstrap effect at line 214
+    // sets `loading=false` once it's done; gate on that.
+    if (loading) return;
+    const localCloudGids = new Set(groups.map(g => g.cloudGroupId).filter(Boolean));
+    const missing = ownerMemberships.filter(m => !localCloudGids.has(m.groupId));
+    if (!missing.length) { ownerGroupsClaimedRef.current = true; return; }
+    ownerGroupsClaimedRef.current = true;
+    (async () => {
+      let claimed = 0;
+      for (const m of missing) {
+        // Inline silent variant of claimCloudGroup — same logic but no toast per group, and
+        // we accumulate the new local groups into one persist call to avoid race conditions
+        // when multiple groups are claimed back-to-back.
+        let snap = null;
+        try { snap = await window.api.fetchJSON("/api/snapshots/" + encodeURIComponent(m.groupId) + "/latest"); }
+        catch { /* no snapshot yet — skip; owner can manually create or open later */ continue; }
+        if (!snap?.payload) continue;
+        const meta = snap.payload.meta || {};
+        const newId = Date.now() + claimed; // +offset so the IDs don't collide if Date.now ticks the same ms
+        const ng = {
+          id: newId,
+          name: meta.name || m.groupName || "Restored group",
+          groupCode: meta.groupCode || m.groupCode || genCode(6),
+          adminCode: meta.adminCode || m.adminCode || genCode(6),
+          createdAt: meta.createdAt || Date.now(),
+          cloudGroupId: m.groupId,
+        };
+        // applySnapshot writes the per-group keys directly to localStorage; safe to call
+        // before we've persisted the groups[] entry that references newId.
+        await applySnapshot(newId, snap.payload);
+        try { localStorage.setItem(`shyft3_g${newId}_lastModified`, String(snap.clientTs)); } catch {}
+        // Update React state + persist after each claim — keeps the UI reactive while
+        // also avoiding a stale closure on `groups` if multiple iterations run.
+        setGroups(prev => {
+          const next = [...prev, ng];
+          persistRoot("groups", next).catch(() => {});
+          return next;
+        });
+        claimed++;
+      }
+      if (claimed > 0) flash(`✅ Restored ${claimed} group${claimed === 1 ? "" : "s"} from cloud`);
+    })();
+  }, [cloudUser, groups, loading]);
+
+  // D.3 follow-up: one-shot reconciliation. For each cloud-mirrored group the user is in,
+  // copy the cloud's groupCode/adminCode (returned by /api/me) into the local groups[] entry
+  // when they differ. Cloud is the source of truth — that's what /api/auth/signup matches
+  // against, so the dashboard must display whatever the cloud has, otherwise members can't
+  // join. Heals divergence from the era when rollGroupCodes only updated localStorage. If the
+  // cloud has no codes set, we leave the local copy alone (legacy migration backfill case).
+  useEffect(() => {
+    if (codesReconciledRef.current) return;
+    if (!cloudUser?.memberships?.length || !groups.length) return;
+    const cloudByGid = new Map();
+    for (const m of cloudUser.memberships) cloudByGid.set(m.groupId, m);
+    let changed = false;
+    const next = groups.map(g => {
+      if (!g.cloudGroupId) return g;
+      const m = cloudByGid.get(g.cloudGroupId);
+      if (!m) return g;
+      const cloudGroupCode = m.groupCode || null;
+      const cloudAdminCode = m.adminCode || null;
+      const updates = {};
+      if (cloudGroupCode && cloudGroupCode !== g.groupCode) updates.groupCode = cloudGroupCode;
+      if (cloudAdminCode && cloudAdminCode !== g.adminCode) updates.adminCode = cloudAdminCode;
+      if (Object.keys(updates).length === 0) return g;
+      changed = true;
+      return { ...g, ...updates };
+    });
+    if (!changed) { codesReconciledRef.current = true; return; }
+    codesReconciledRef.current = true;
+    setGroups(next);
+    persistRoot("groups", next).catch(() => {});
   }, [cloudUser, groups]);
 
   // After a group is loaded AND cloud session is known, check whether the cloud has newer data.
@@ -4956,6 +5350,169 @@ function ShiftApp() {
     </>);
   };
 
+  // Profile page. Accessible from the in-group sidebar/header (for providers + admins) and
+  // from the Owner SuperDashboard (as a tab). Adapts based on context:
+  //   - `superContext = true` → render only the cloud-account section. The owner has no
+  //     local user record (they got here via the cloud bridge), so the "Group profile"
+  //     section is omitted.
+  //   - `superContext = false` (in-group) → render both sections. The local section shows
+  //     name/role/points/targets read from `me` (the local user record).
+  const ProfilePage = ({ superContext = false } = {}) => {
+    const cu = cloudUser?.user;
+    const inGroup = !superContext && !!me && me.role !== "super";
+    const localUser = inGroup ? users.find(u => u.id === me.id) : null;
+    return (
+      <div className="max-w-2xl">
+        <h1 className="text-2xl font-semibold mb-1">Profile</h1>
+        <p className="text-sm text-slate-500 mb-5">Manage your account info, email, and password.</p>
+
+        {/* CLOUD ACCOUNT SECTION ── editable; backed by /api/me. */}
+        <div className="bg-white border border-slate-200 rounded-xl p-4 mb-4">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wide">Cloud account</h2>
+            {cu?.canCreateGroups && (
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 font-semibold uppercase tracking-wide">Owner-tier</span>
+            )}
+          </div>
+          {!cu ? (
+            <p className="text-sm text-slate-500">You're not signed in to the cloud on this device. Sign in from the auth screen to manage your cloud account.</p>
+          ) : (
+            <>
+              {/* Read-only username — post-D.3 we don't allow self-rename, since username
+                  collisions on rename are hard to surface gracefully. */}
+              <div className="mb-3">
+                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Username</div>
+                <div className="text-sm text-slate-800 font-mono">{cu.username || <span className="text-slate-400 italic">(none)</span>}</div>
+              </div>
+              <div className="mb-3">
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">Display name</label>
+                <input type="text" value={profileForm.displayName}
+                  onChange={e=>setProfileForm(s=>({...s, displayName:e.target.value, infoOk:"", infoError:""}))}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                  maxLength={80}/>
+              </div>
+              <div className="mb-3">
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">Email</label>
+                <input type="email" value={profileForm.email}
+                  onChange={e=>setProfileForm(s=>({...s, email:e.target.value.toLowerCase(), infoOk:"", infoError:""}))}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"/>
+                <p className="text-[11px] text-slate-500 mt-1">Used for sign-in and magic links. Existing sign-in tokens for the old email won't migrate.</p>
+              </div>
+              {profileForm.infoError && <div className="text-xs text-red-600 mb-2">{profileForm.infoError}</div>}
+              {profileForm.infoOk && <div className="text-xs text-emerald-700 mb-2">{profileForm.infoOk}</div>}
+              <div className="flex gap-2 items-center">
+                <button onClick={saveProfileInfo} disabled={profileForm.infoBusy}
+                  className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-lg disabled:opacity-50">
+                  {profileForm.infoBusy ? "Saving…" : "Save changes"}
+                </button>
+                <button onClick={()=>setProfileForm(s=>({...s, displayName:cu.displayName||"", email:cu.email||"", infoOk:"", infoError:""}))}
+                  disabled={profileForm.infoBusy}
+                  className="px-3 py-2 text-sm text-slate-600 hover:text-slate-900 disabled:opacity-50">Reset</button>
+              </div>
+
+              {/* Password change — collapsible, since most visits aren't to change pw. */}
+              <div className="mt-5 pt-4 border-t border-slate-100">
+                {!profileForm.pwOpen ? (
+                  <button onClick={()=>setProfileForm(s=>({...s, pwOpen:true, pwError:"", pwOk:""}))}
+                    className="text-sm font-semibold text-blue-600 hover:text-blue-800">Change password →</button>
+                ) : (
+                  <>
+                    <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wide mb-3">Change password</h3>
+                    <div className="space-y-3">
+                      <div>
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">Current password</label>
+                        <input type="password" value={profileForm.currentPassword}
+                          onChange={e=>setProfileForm(s=>({...s, currentPassword:e.target.value, pwError:"", pwOk:""}))}
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" autoComplete="current-password"/>
+                      </div>
+                      <div>
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">New password</label>
+                        <input type="password" value={profileForm.newPassword}
+                          onChange={e=>setProfileForm(s=>({...s, newPassword:e.target.value, pwError:"", pwOk:""}))}
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" autoComplete="new-password"/>
+                        <p className="text-[11px] text-slate-500 mt-1">Minimum 8 characters.</p>
+                      </div>
+                      <div>
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">Confirm new password</label>
+                        <input type="password" value={profileForm.newPasswordConfirm}
+                          onChange={e=>setProfileForm(s=>({...s, newPasswordConfirm:e.target.value, pwError:"", pwOk:""}))}
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" autoComplete="new-password"/>
+                      </div>
+                      {profileForm.pwError && <div className="text-xs text-red-600">{profileForm.pwError}</div>}
+                      {profileForm.pwOk && <div className="text-xs text-emerald-700">{profileForm.pwOk}</div>}
+                      <div className="flex gap-2">
+                        <button onClick={saveProfilePassword} disabled={profileForm.pwBusy}
+                          className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-lg disabled:opacity-50">
+                          {profileForm.pwBusy ? "Saving…" : "Update password"}
+                        </button>
+                        <button onClick={()=>setProfileForm(s=>({...s, pwOpen:false, currentPassword:"", newPassword:"", newPasswordConfirm:"", pwError:"", pwOk:""}))}
+                          disabled={profileForm.pwBusy}
+                          className="px-3 py-2 text-sm text-slate-600 hover:text-slate-900 disabled:opacity-50">Cancel</button>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* GROUP PROFILE SECTION ── only for in-group views. Read-only summary of the local
+            user record (name, role, group, points). Owners on SuperDashboard see no local
+            record, so this section is omitted there. */}
+        {inGroup && localUser && (
+          <div className="bg-white border border-slate-200 rounded-xl p-4">
+            <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wide mb-3">Group profile · {currentGroup?.name}</h2>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Name</div>
+                <div className="text-sm text-slate-800">{localUser.name || "—"}</div>
+              </div>
+              <div>
+                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Role</div>
+                <div className="text-sm text-slate-800 capitalize">{localUser.role}</div>
+              </div>
+              <div>
+                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Username</div>
+                <div className="text-sm text-slate-800 font-mono">{localUser.username || <span className="text-slate-400 italic">(none)</span>}</div>
+              </div>
+              {localUser.role === "provider" && (
+                <div>
+                  <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Points</div>
+                  <div className="text-sm text-slate-800 tabular-nums">{localUser.points || 0}</div>
+                </div>
+              )}
+            </div>
+            {localUser.role === "provider" && (
+              <div className="mt-4 pt-3 border-t border-slate-100">
+                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-2">Shift targets</div>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    ["Min", "min"],
+                    ["Ideal", "ideal"],
+                    ["Max", "max"],
+                  ].map(([label, k]) => (
+                    <div key={k}>
+                      <div className="text-[10px] font-medium text-slate-500 mb-1">{label}</div>
+                      <input type="number" min="0"
+                        value={localUser.targets?.[k] || 0}
+                        onChange={e => updateUser(localUser.id, { targets: { ...(localUser.targets||{min:0,ideal:0,max:0}), [k]: parseInt(e.target.value) || 0 } })}
+                        className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-sm tabular-nums text-center"/>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[11px] text-slate-500 mt-2">Min auto-raises to your seniority floor when applicable. Set max to 0 for no cap.</p>
+              </div>
+            )}
+            <p className="text-[11px] text-slate-500 mt-3">
+              Need a name change here? Ask your group admin — they manage the group roster from the People page.
+            </p>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const StandingsPage = () => {
     // During AVAIL the penalty is a forecast — bake it into the displayed total so the ranking
     // reflects effective bid ceiling. After Close & assign it's already in u.points, so we
@@ -5427,6 +5984,22 @@ function ShiftApp() {
     let gc, ac;
     do { gc = genCode(6); } while(taken.has(gc));
     do { ac = genCode(6); } while(taken.has(ac) || ac===gc);
+    // For cloud-mirrored groups, push the new codes to the cloud BEFORE persisting locally —
+    // if the cloud rejects (e.g., uniqueness conflict) we don't want the local UI to drift.
+    if (g.cloudGroupId && cloudUser) {
+      try {
+        await window.api.fetchJSON(`/api/groups/${encodeURIComponent(g.cloudGroupId)}/codes`, {
+          method: "PATCH",
+          body: JSON.stringify({ groupCode: gc, adminCode: ac }),
+        });
+      } catch (e) {
+        const code = e?.body?.error;
+        if (code === "group_code_taken") { flash("⚠️ Generated code conflicts on cloud — try again"); return; }
+        if (code === "not_owner") { flash("⚠️ Cloud doesn't recognize you as owner of this group"); return; }
+        flash("⚠️ Couldn't push new codes to cloud — keeping old codes");
+        return;
+      }
+    }
     const next = groups.map(x => x.id===gid ? {...x, groupCode:gc, adminCode:ac} : x);
     setGroups(next); await persistRoot("groups", next);
     flash(`🔄 New codes for "${g.name}"`);
@@ -5467,7 +6040,7 @@ function ShiftApp() {
       {/* D.3 follow-up: top-level tabs for the owner dashboard. */}
       <div className="bg-white border-b border-slate-200 px-4 sm:px-6">
         <div className="max-w-3xl mx-auto flex gap-1">
-          {[["groups","Groups"],["accounts","Accounts"]].map(([key,label]) => (
+          {[["groups","Groups"],["accounts","Accounts"],["profile","Profile"]].map(([key,label]) => (
             <button key={key} onClick={()=>switchSuperDashTab(key)}
               className={`px-4 py-2.5 text-sm font-medium border-b-2 transition ${superDashTab===key ? "border-blue-600 text-blue-700" : "border-transparent text-slate-500 hover:text-slate-700"}`}>
               {label}
@@ -5557,6 +6130,12 @@ function ShiftApp() {
                       <button onClick={()=>setImpersonatePicker({gid: g.id, gname: g.name})} className="text-slate-700 hover:text-slate-900 text-xs font-medium px-2 py-1">👁 View as</button>
                       <button onClick={()=>{ setRenameValue(g.name); setRenamingGid(g.id); }} className="text-slate-600 hover:text-slate-900 text-xs font-medium px-2 py-1">Rename</button>
                       <button onClick={()=>rollGroupCodes(g.id)} className="text-slate-600 hover:text-slate-900 text-xs font-medium px-2 py-1">Roll codes</button>
+                      {g.cloudGroupId && cloudUser && (
+                        <button onClick={()=>syncGroupFromCloud(g)} className="text-emerald-700 hover:text-emerald-900 text-xs font-medium px-2 py-1">Sync from cloud</button>
+                      )}
+                      {g.cloudGroupId && cloudUser && (
+                        <button onClick={()=>openSnapshotHistory(g)} className="text-amber-700 hover:text-amber-900 text-xs font-medium px-2 py-1">Snapshot history</button>
+                      )}
                       {!g.cloudGroupId && cloudUser && (
                         <button onClick={()=>startMigrateGroup(g)} className="text-blue-600 hover:text-blue-700 text-xs font-medium px-2 py-1">Migrate to cloud</button>
                       )}
@@ -5627,7 +6206,60 @@ function ShiftApp() {
             {accounts.loading ? "Loading…" : "Refresh"}
           </button>
         </div>
-        <p className="text-sm text-slate-500 mb-4">Every user across the groups you own. Edit credentials or remove someone here.</p>
+        <p className="text-sm text-slate-500 mb-4">Every user across the groups you own. Cloud accounts can be edited or deleted; local-only users (no cloud account) can be removed.</p>
+
+        {/* Email lookup — surfaces ghost cloud accounts that don't appear in the main list
+            (e.g., signed up but never joined any group the caller owns). */}
+        <div className="bg-white border border-slate-200 rounded-lg p-3 mb-3">
+          <div className="text-xs font-semibold text-slate-700 uppercase tracking-wide mb-2">Look up by email</div>
+          <p className="text-[11px] text-slate-500 mb-2">Find a cloud account that doesn't show up above (e.g., signed up but isn't a member of any group you own).</p>
+          <div className="flex gap-2">
+            <input type="email" value={accountsLookup.email}
+              onChange={e=>setAccountsLookup(s=>({...s, email:e.target.value, error:""}))}
+              onKeyDown={e=>{if(e.key==="Enter")lookupAccountByEmail();}}
+              placeholder="user@example.com"
+              className="flex-1 px-2 py-1.5 border border-slate-300 rounded-lg text-sm"/>
+            <button onClick={lookupAccountByEmail} disabled={accountsLookup.busy}
+              className="text-xs font-semibold px-3 py-1.5 bg-slate-800 text-white rounded-lg hover:bg-slate-700 disabled:opacity-50">
+              {accountsLookup.busy ? "…" : "Look up"}
+            </button>
+          </div>
+          {accountsLookup.error && (
+            <div className="mt-2 text-xs text-red-700">{accountsLookup.error}</div>
+          )}
+          {accountsLookup.result && (
+            <div className="mt-3 border-t border-slate-100 pt-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="font-medium text-sm text-slate-900">{accountsLookup.result.user.displayName || "(no name)"}</div>
+                {accountsLookup.result.user.kind === "test" && <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 font-semibold uppercase tracking-wide">Test</span>}
+                {accountsLookup.result.user.canCreateGroups && <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-100 text-purple-700 font-semibold uppercase tracking-wide">Owner-tier</span>}
+                {accountsLookup.result.isSelf && <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 font-semibold uppercase tracking-wide">You</span>}
+              </div>
+              <div className="text-xs text-slate-500 mt-0.5 break-all">{accountsLookup.result.user.email}{accountsLookup.result.user.username ? ` · ${accountsLookup.result.user.username}` : ""}</div>
+              <div className="mt-2">
+                <div className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Memberships ({accountsLookup.result.memberships.length})</div>
+                {accountsLookup.result.memberships.length === 0 ? (
+                  <div className="text-[11px] text-slate-500 italic">No group memberships — orphan cloud account.</div>
+                ) : (
+                  <div className="flex flex-wrap gap-1">
+                    {accountsLookup.result.memberships.map(m => (
+                      <span key={m.groupId} className={`text-[10px] px-1.5 py-0.5 rounded ${m.callerOwns ? "bg-slate-100 text-slate-700" : "bg-amber-100 text-amber-800"}`}>
+                        {m.groupName} · <span className="font-semibold">{m.role}</span>{!m.callerOwns ? " · not yours" : ""}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {!accountsLookup.result.isSelf && (
+                <button onClick={deleteLookupResult} disabled={accountsLookup.busy}
+                  className="mt-3 text-xs font-semibold px-2.5 py-1 border border-red-200 text-red-700 rounded-lg hover:bg-red-50 disabled:opacity-50">
+                  Delete cloud account
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
         {accounts.error && (
           <div className="mb-3 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700 flex items-center justify-between">
             <span>{accounts.error}</span>
@@ -5646,9 +6278,10 @@ function ShiftApp() {
                   <div className="flex items-center gap-2 flex-wrap">
                     <div className="font-medium text-sm text-slate-900">{u.displayName || "(no name)"}</div>
                     {u.kind === "test" && <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 font-semibold uppercase tracking-wide">Test</span>}
-                    {!u.hasPassword && <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 font-semibold uppercase tracking-wide">Magic-link only</span>}
+                    {u.source === "local" && <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-100 text-orange-700 font-semibold uppercase tracking-wide">Local only</span>}
+                    {u.source !== "local" && !u.hasPassword && <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 font-semibold uppercase tracking-wide">Magic-link only</span>}
                   </div>
-                  <div className="text-xs text-slate-500 mt-0.5 break-all">{u.email}{u.username ? ` · ${u.username}` : ""}</div>
+                  <div className="text-xs text-slate-500 mt-0.5 break-all">{u.email || (u.source === "local" ? "(no email on file)" : "")}{u.username ? ` · ${u.username}` : ""}</div>
                   <div className="mt-1.5 flex flex-wrap gap-1">
                     {u.memberships.map(m => (
                       <span key={m.groupId} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">
@@ -5656,23 +6289,40 @@ function ShiftApp() {
                       </span>
                     ))}
                   </div>
+                  {u.source === "local" && (
+                    <div className="text-[11px] text-orange-700 mt-1.5">No cloud account — sign-in to this app over the web won't work for them.</div>
+                  )}
                 </div>
                 <div className="flex flex-col gap-1.5 flex-shrink-0">
-                  <button onClick={()=>setAccountsEdit({ uid:u.id, name:u.displayName||u.email, email:"", password:"", busy:false, error:"" })}
-                    className="text-xs font-semibold px-2.5 py-1 border border-slate-200 rounded-lg hover:bg-slate-50">Edit</button>
-                  <button onClick={()=>setAccountsDelete({ uid:u.id, name:u.displayName||u.email, busy:false, error:"" })}
-                    className="text-xs font-semibold px-2.5 py-1 border border-red-200 text-red-700 rounded-lg hover:bg-red-50">Delete</button>
+                  {u.source === "local" ? (
+                    <button onClick={async()=>{
+                        if(!confirm(`Remove "${u.displayName||u.email||"this user"}" from "${u.memberships[0]?.groupName||"the group"}"? This deletes their local record only.`)) return;
+                        await removeLocalOnlyUser(u.localGroupId, u.localUserId);
+                        flash("🗑 Local user removed");
+                        await loadAccounts();
+                      }}
+                      className="text-xs font-semibold px-2.5 py-1 border border-red-200 text-red-700 rounded-lg hover:bg-red-50">Remove</button>
+                  ) : (
+                    <>
+                      <button onClick={()=>setAccountsEdit({ uid:u.id, name:u.displayName||u.email, email:"", password:"", busy:false, error:"" })}
+                        className="text-xs font-semibold px-2.5 py-1 border border-slate-200 rounded-lg hover:bg-slate-50">Edit</button>
+                      <button onClick={()=>setAccountsDelete({ uid:u.id, name:u.displayName||u.email, busy:false, error:"" })}
+                        className="text-xs font-semibold px-2.5 py-1 border border-red-200 text-red-700 rounded-lg hover:bg-red-50">Delete</button>
+                    </>
+                  )}
                 </div>
               </div>
             ))}
           </div>
         ) : null}
       </>)}
+      {superDashTab === "profile" && <ProfilePage superContext/>}
       </main>
       {migrateState && <MigrateModal/>}
       {impersonatePicker && <ImpersonatePickerModal/>}
       {accountsEdit && <AccountsEditModal/>}
       {accountsDelete && <AccountsDeleteModal/>}
+      {snapHistory && <SnapshotHistoryModal/>}
       {toast&&<Toast msg={toast}/>}
     </div>
     );
@@ -5775,6 +6425,76 @@ function ShiftApp() {
     );
   };
 
+  // Snapshot history / restore modal. Lists every R2 history entry for a cloud-mirrored
+  // group, newest first, with summary stats so the owner can pick a known-good snapshot
+  // to roll back to. The current D1 latest is highlighted so the user knows what they're
+  // replacing. Restore overwrites both cloud and local immediately.
+  const SnapshotHistoryModal = () => {
+    if (!snapHistory) return null;
+    const { group, loading, error, current, history, busy } = snapHistory;
+    const fmtTs = (sec) => sec ? new Date(sec * 1000).toLocaleString() : "—";
+    const isCurrent = (entry) => current && entry.serverTs === current.serverTs && entry.clientTs === current.clientTs;
+    return (
+      <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60] p-4" onClick={()=>!busy&&setSnapHistory(null)}>
+        <div className="bg-white rounded-2xl max-w-2xl w-full p-5 max-h-[90vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
+          <div className="text-2xl mb-1">📜</div>
+          <div className="font-semibold text-xl text-slate-900 mb-1">Snapshot history — {group.name}</div>
+          <p className="text-sm text-slate-500 mb-3">
+            Each row is one snapshot ever uploaded for this group. The current "latest" is what the cloud serves to all devices. Restore an earlier snapshot to roll back lost data — your local copy will refresh immediately.
+          </p>
+          {current && (
+            <div className="mb-3 px-3 py-2 rounded-lg bg-blue-50 border border-blue-200 text-xs text-blue-900">
+              Current latest: <span className="font-mono">{fmtTs(current.serverTs)}</span> (server) · <span className="font-mono">{fmtTs(Math.floor((current.clientTs||0)/1000))}</span> (client)
+            </div>
+          )}
+          {error && (
+            <div className="mb-3 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">{error}</div>
+          )}
+          {loading ? (
+            <div className="py-10 text-center text-sm text-slate-500">Loading history…</div>
+          ) : history.length === 0 ? (
+            <div className="py-10 text-center text-sm text-slate-500 italic">No snapshot history found in storage.</div>
+          ) : (
+            <div className="space-y-2">
+              {history.map(h => (
+                <div key={h.key} className={`border rounded-lg p-3 ${isCurrent(h) ? "border-blue-400 bg-blue-50/50" : "border-slate-200 bg-white"}`}>
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <div className="text-sm font-semibold text-slate-900">{fmtTs(h.serverTs)}</div>
+                        {isCurrent(h) && <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 font-semibold uppercase tracking-wide">Current</span>}
+                      </div>
+                      <div className="text-[11px] text-slate-500 mt-0.5">
+                        client {fmtTs(Math.floor(h.clientTs/1000))} · {(h.size/1024).toFixed(1)} KB
+                      </div>
+                      {h.summary ? (
+                        <div className="text-xs text-slate-700 mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5">
+                          <span><span className="font-semibold">{h.summary.userCount}</span> users</span>
+                          <span><span className="font-semibold">{h.summary.prefsCount}</span> prefs</span>
+                          <span><span className="font-semibold">{h.summary.shiftsDayCount}</span> shift-days</span>
+                          <span><span className="font-semibold">{h.summary.topOptionsDayCount}</span> top-option-days</span>
+                          {h.summary.name && <span className="text-slate-500">name: "{h.summary.name}"</span>}
+                        </div>
+                      ) : (
+                        <div className="text-[11px] text-slate-400 italic mt-1">(preview not loaded — older entry)</div>
+                      )}
+                    </div>
+                    <button onClick={()=>restoreSnapshotFromHistory(h)} disabled={busy || isCurrent(h)}
+                      className="text-xs font-semibold px-2.5 py-1 border border-amber-300 text-amber-800 rounded-lg hover:bg-amber-50 disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0">
+                      {isCurrent(h) ? "Current" : "Restore"}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <button onClick={()=>!busy&&setSnapHistory(null)} disabled={busy}
+            className="w-full mt-4 py-2 text-sm text-slate-500 hover:text-slate-700 disabled:opacity-50">Close</button>
+        </div>
+      </div>
+    );
+  };
+
   // Phase D.2: confirm-then-result modal for migrating a local group to the cloud.
   // Confirm phase lists every local user about to become a cloud test user.
   // Result phase lists each user with their synthetic email + temp password — the only
@@ -5861,6 +6581,7 @@ function ShiftApp() {
     if(page==="standings") return StandingsPage();
     if(page==="setup") return SetupPage();
     if(page==="people") return PeoplePage();
+    if(page==="profile") return <ProfilePage/>;
   };
 
   // v2 shell: persistent sidebar on desktop (≥lg) with brand/block card/nav/user footer.
@@ -5926,13 +6647,16 @@ function ShiftApp() {
           </button>
         ))}</nav>
         <div className="pt-4 border-t border-slate-200 mt-4">
-          <div className="flex items-center gap-2.5 px-1">
+          {/* Clickable user-info row → Profile. The whole row is the target so the avatar
+              and name are both obvious tap zones. Highlights when Profile is the active page. */}
+          <button onClick={openProfilePage}
+            className={`w-full flex items-center gap-2.5 px-1 py-1.5 rounded-lg transition ${page==="profile" ? "bg-brand-50" : "hover:bg-slate-50"}`}>
             <span className="w-9 h-9 rounded-full text-white flex items-center justify-center text-xs font-semibold shadow-card flex-shrink-0" style={{background:COLORS[me.id%COLORS.length]}}>{initials(me.name)}</span>
-            <div className="flex-1 min-w-0">
-              <div className="text-sm font-semibold text-ink-900 truncate">{me.name}</div>
-              <div className="text-[10px] text-ink-500 uppercase tracking-wider font-semibold">{me.role}</div>
+            <div className="flex-1 min-w-0 text-left">
+              <div className={`text-sm font-semibold truncate ${page==="profile" ? "text-brand-700" : "text-ink-900"}`}>{me.name}</div>
+              <div className="text-[10px] text-ink-500 uppercase tracking-wider font-semibold">{me.role} · profile →</div>
             </div>
-          </div>
+          </button>
           <button onClick={signOut} className="w-full mt-3 text-xs font-semibold px-3 py-2 border border-slate-200 rounded-lg text-ink-700 hover:bg-slate-50">Sign out</button>
         </div>
       </aside>
@@ -5949,7 +6673,9 @@ function ShiftApp() {
             ); })()}
           </div>
           <div className="flex items-center gap-2">
-            <span className="w-8 h-8 rounded-full text-white flex items-center justify-center text-xs font-semibold shadow-card flex-shrink-0" style={{background:COLORS[me.id%COLORS.length]}}>{initials(me.name)}</span>
+            <button onClick={openProfilePage} aria-label="Open profile"
+              className={`w-8 h-8 rounded-full text-white flex items-center justify-center text-xs font-semibold shadow-card flex-shrink-0 ${page==="profile" ? "ring-2 ring-brand-400" : ""}`}
+              style={{background:COLORS[me.id%COLORS.length]}}>{initials(me.name)}</button>
             <button onClick={signOut} className="text-[11px] font-semibold px-2.5 py-1.5 border border-slate-200 rounded-lg text-ink-700">Sign out</button>
           </div>
         </header>

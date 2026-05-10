@@ -43,6 +43,64 @@ export async function createGroup(req, env) {
   return json({ groupId, name, groupCode, adminCode });
 }
 
+// PATCH /api/groups/:gid/codes  { groupCode?, adminCode? }
+//
+// D.3 follow-up: lets the owner roll the group/admin codes after creation, so the
+// codes shown on the local SuperDashboard stay in sync with what the cloud accepts on
+// signup. Idempotent: if the supplied codes already match what's stored, returns ok
+// without writing. Validates uniqueness against other groups.
+export async function updateGroupCodes(req, env, { gid }) {
+  const csrf = requireCsrfHeader(req);
+  if (csrf) return csrf;
+  const user = await getSessionUser(env, req);
+  if (!user) return err(401, "unauthorized");
+
+  const membership = await q1(
+    env,
+    "SELECT role FROM memberships WHERE user_id = ? AND group_id = ?",
+    user.id,
+    gid,
+  );
+  if (!membership || membership.role !== "owner") return err(403, "not_owner");
+
+  const body = await readJson(req);
+  const groupCode = body.groupCode != null ? String(body.groupCode).trim().toUpperCase() : undefined;
+  const adminCode = body.adminCode != null ? String(body.adminCode).trim().toUpperCase() : undefined;
+  if (groupCode === undefined && adminCode === undefined) return err(400, "nothing_to_update");
+
+  const current = await q1(
+    env,
+    "SELECT group_code AS groupCode, admin_code AS adminCode FROM groups WHERE id = ?",
+    gid,
+  );
+  if (!current) return err(404, "not_found");
+
+  const updates = [];
+  const params = [];
+  if (groupCode !== undefined && groupCode !== (current.groupCode || "")) {
+    if (groupCode) {
+      const taken = await q1(env, "SELECT id FROM groups WHERE group_code = ? AND id != ?", groupCode, gid);
+      if (taken) return err(409, "group_code_taken");
+    }
+    updates.push("group_code = ?");
+    params.push(groupCode || null);
+  }
+  if (adminCode !== undefined && adminCode !== (current.adminCode || "")) {
+    updates.push("admin_code = ?");
+    params.push(adminCode || null);
+  }
+  if (!updates.length) return json({ ok: true, changed: false, groupCode: current.groupCode, adminCode: current.adminCode });
+
+  params.push(gid);
+  await exec(env, `UPDATE groups SET ${updates.join(", ")} WHERE id = ?`, ...params);
+  return json({
+    ok: true,
+    changed: true,
+    groupCode: groupCode !== undefined ? (groupCode || null) : current.groupCode,
+    adminCode: adminCode !== undefined ? (adminCode || null) : current.adminCode,
+  });
+}
+
 // POST /api/groups/:gid/invites  { role, expiresInDays? }
 export async function createInvite(req, env, { gid }) {
   const csrf = requireCsrfHeader(req);

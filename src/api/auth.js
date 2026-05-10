@@ -3,7 +3,7 @@ import { newId, randomToken, sha256Hex } from "../lib/ids.js";
 import { sendMagicLink } from "../lib/email.js";
 import { checkLoginRateLimit } from "../lib/ratelimit.js";
 import { requireCsrfHeader } from "../lib/csrf.js";
-import { verifyPassword } from "../lib/passwords.js";
+import { verifyPassword, hashPassword } from "../lib/passwords.js";
 import {
   createSession,
   getSessionUser,
@@ -211,13 +211,71 @@ export async function me(req, env) {
   if (!user) return err(401, "unauthorized");
   const memberships = (await env.DB.prepare(
     `SELECT m.group_id AS groupId, m.role AS role, m.local_uid AS localUid,
-            g.name AS groupName
+            g.name AS groupName, g.group_code AS groupCode, g.admin_code AS adminCode
        FROM memberships m
        JOIN groups g ON g.id = m.group_id
       WHERE m.user_id = ?
       ORDER BY g.name`,
   ).bind(user.id).all()).results || [];
   return json({ user, memberships });
+}
+
+// PATCH /api/me  { displayName?, email?, password?, currentPassword? }
+//   Self-edit endpoint for the signed-in cloud user. Three independently-allowed fields:
+//   - displayName: trimmed, ≤80 chars
+//   - email: must be unique across users; magic-link history under the OLD email is
+//            left intact (stale but harmless)
+//   - password: requires `currentPassword` for verification, then hashed with the same
+//               PBKDF2 params as signup
+//   At least one field must be supplied. Other sessions for this user remain valid after a
+//   password change (we don't tie sessions to password hash); add session revocation later
+//   if that becomes a security ask.
+export async function updateMe(req, env) {
+  const csrf = requireCsrfHeader(req);
+  if (csrf) return csrf;
+  const user = await getSessionUser(env, req);
+  if (!user) return err(401, "unauthorized");
+
+  const body = await readJson(req);
+  const updates = [];
+  const params = [];
+
+  if (body.displayName !== undefined) {
+    const dn = String(body.displayName || "").trim();
+    if (!dn || dn.length > 80) return err(400, "invalid_display_name");
+    updates.push("display_name = ?");
+    params.push(dn);
+  }
+
+  if (body.email !== undefined) {
+    const email = normalizeEmail(body.email);
+    if (!isEmail(email)) return err(400, "invalid_email");
+    if (email !== user.email) {
+      const existing = await q1(env, "SELECT id FROM users WHERE email = ? AND id != ?", email, user.id);
+      if (existing) return err(409, "email_taken");
+      updates.push("email = ?");
+      params.push(email);
+    }
+  }
+
+  if (body.password !== undefined) {
+    const newPw = String(body.password || "");
+    if (newPw.length < 8) return err(400, "password_too_short");
+    const currentPw = String(body.currentPassword || "");
+    if (!currentPw) return err(400, "current_password_required");
+    const row = await q1(env, "SELECT password_hash FROM users WHERE id = ?", user.id);
+    if (!row?.password_hash) return err(400, "no_password_set");
+    const ok = await verifyPassword(currentPw, row.password_hash);
+    if (!ok) return err(401, "current_password_incorrect");
+    const newHash = await hashPassword(newPw);
+    updates.push("password_hash = ?");
+    params.push(newHash);
+  }
+
+  if (!updates.length) return err(400, "nothing_to_update");
+  params.push(user.id);
+  await exec(env, `UPDATE users SET ${updates.join(", ")} WHERE id = ?`, ...params);
+  return json({ ok: true });
 }
 
 // HTML response for the verify endpoint. Confirmation page rather than auto-redirect

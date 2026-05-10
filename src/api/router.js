@@ -1,13 +1,13 @@
 // URL-pattern dispatch. Tiny, no dependencies. Each entry is [method, pattern, handler].
 // Patterns support :param segments which are extracted into the third arg.
 
-import { authRequest, authVerify, authPassword, authLogout, me } from "./auth.js";
+import { authRequest, authVerify, authPassword, authLogout, me, updateMe } from "./auth.js";
 import { authSignup } from "./signup.js";
-import { createGroup, createInvite, getInvite, migrateGroup } from "./groups.js";
+import { createGroup, createInvite, getInvite, migrateGroup, updateGroupCodes } from "./groups.js";
 import { createUser } from "./users.js";
-import { listOwnerUsers, updateOwnerUser, deleteOwnerUser } from "./owner.js";
+import { listOwnerUsers, updateOwnerUser, deleteOwnerUser, lookupUser } from "./owner.js";
 import { logEvent } from "./events.js";
-import { putSnapshot, getLatestSnapshot } from "./snapshots.js";
+import { putSnapshot, getLatestSnapshot, listSnapshotHistory, restoreSnapshot } from "./snapshots.js";
 import { err } from "../lib/http.js";
 
 const routes = [
@@ -17,17 +17,22 @@ const routes = [
   ["POST",   "/api/auth/signup",                  authSignup],
   ["POST",   "/api/auth/logout",                  authLogout],
   ["GET",    "/api/me",                           me],
+  ["PATCH",  "/api/me",                           updateMe],
   ["POST",   "/api/groups",                       createGroup],
   ["POST",   "/api/groups/:gid/invites",          createInvite],
   ["POST",   "/api/groups/:gid/migrate",          migrateGroup],
+  ["PATCH",  "/api/groups/:gid/codes",            updateGroupCodes],
   ["GET",    "/api/invites/:token",               getInvite],
   ["POST",   "/api/users",                        createUser],
   ["GET",    "/api/owner/users",                  listOwnerUsers],
+  ["GET",    "/api/owner/lookup",                 lookupUser],
   ["PATCH",  "/api/owner/users/:uid",             updateOwnerUser],
   ["DELETE", "/api/owner/users/:uid",             deleteOwnerUser],
   ["POST",   "/api/events",                       logEvent],
   ["POST",   "/api/snapshots",                    putSnapshot],
   ["GET",    "/api/snapshots/:groupId/latest",    getLatestSnapshot],
+  ["GET",    "/api/owner/snapshots/:groupId/history",  listSnapshotHistory],
+  ["POST",   "/api/owner/snapshots/:groupId/restore",  restoreSnapshot],
 ];
 
 export async function handleApi(req, env) {

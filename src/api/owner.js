@@ -80,6 +80,59 @@ export async function listOwnerUsers(req, env) {
   return json({ users });
 }
 
+// GET /api/owner/lookup?email=xxx
+//   Owner-only. Returns the cloud user matching `email` (exact, case-insensitive) plus EVERY
+//   membership they hold, regardless of who owns those groups. Use this to investigate ghost
+//   accounts that exist in the users table but don't appear in /api/owner/users (because they
+//   have no membership in any of the caller's owned groups, or have no memberships at all).
+//
+//   Gated on canCreateGroups=1 — i.e., the caller has at least one owner-tier capability.
+//   Returns 404 if the email isn't in the users table.
+export async function lookupUser(req, env) {
+  const caller = await getSessionUser(env, req);
+  if (!caller) return err(401, "unauthorized");
+  if (!caller.canCreateGroups) return err(403, "forbidden");
+
+  const url = new URL(req.url);
+  const email = normalizeEmail(url.searchParams.get("email") || "");
+  if (!isEmail(email)) return err(400, "invalid_email");
+
+  const u = await q1(
+    env,
+    `SELECT id, email, display_name AS displayName, username, kind,
+            password_hash AS passwordHash, can_create_groups AS canCreateGroups
+       FROM users WHERE email = ?`,
+    email,
+  );
+  if (!u) return err(404, "not_found");
+
+  const memberships = (await env.DB.prepare(
+    `SELECT m.group_id AS groupId, m.role, m.local_uid AS localUid,
+            g.name AS groupName, g.owner_user_id AS ownerUserId
+       FROM memberships m
+       JOIN groups g ON g.id = m.group_id
+      WHERE m.user_id = ?`,
+  ).bind(u.id).all()).results || [];
+
+  // Tag whether the caller owns each group, so the UI can decide whether to offer Edit/Delete.
+  const ownedIds = new Set(await callerOwnedGroupIds(env, caller.id));
+  const tagged = memberships.map(m => ({ ...m, callerOwns: ownedIds.has(m.groupId) }));
+
+  return json({
+    user: {
+      id: u.id,
+      email: u.email,
+      displayName: u.displayName,
+      username: u.username,
+      kind: u.kind,
+      hasPassword: !!u.passwordHash,
+      canCreateGroups: !!u.canCreateGroups,
+    },
+    memberships: tagged,
+    isSelf: u.id === caller.id,
+  });
+}
+
 // PATCH /api/owner/users/:uid  { email?, password? }
 //   Owner-only. Rejects self-edits (use the existing set-password button on the cloud strip).
 //   Email change validates uniqueness; password change hashes and stores.
@@ -134,7 +187,20 @@ export async function deleteOwnerUser(req, env, { uid }) {
   const caller = await getSessionUser(env, req);
   if (!caller) return err(401, "unauthorized");
   if (caller.id === uid) return err(400, "cannot_delete_self");
-  if (!(await callerCanManage(env, caller.id, uid))) return err(403, "forbidden");
+
+  // Authorization: the caller can act on the target if either
+  //   (a) they share an owned group (the normal Accounts-list case), or
+  //   (b) the caller has canCreateGroups AND the target has zero memberships anywhere
+  //       — this lets owners clean up "ghost" cloud users (signed up with the bootstrap
+  //       owner code, never created a group, never joined one) that the lookup endpoint
+  //       surfaces but the regular /api/owner/users list can't see.
+  const sharesGroup = await callerCanManage(env, caller.id, uid);
+  let allowed = sharesGroup;
+  if (!allowed && caller.canCreateGroups) {
+    const anyMembership = await q1(env, "SELECT 1 AS ok FROM memberships WHERE user_id = ? LIMIT 1", uid);
+    if (!anyMembership) allowed = true;
+  }
+  if (!allowed) return err(403, "forbidden");
 
   // Refuse to delete a user who owns any group — would orphan ownership of someone else's data.
   const targetOwnsAny = await q1(
@@ -147,16 +213,17 @@ export async function deleteOwnerUser(req, env, { uid }) {
   const target = await q1(env, "SELECT email FROM users WHERE id = ?", uid);
   if (!target) return err(404, "not_found");
 
+  // 1. Drop memberships in caller's groups (no-op for the orphan-cleanup path where the
+  //    caller doesn't share any groups with the target — they're already memberless).
   const ownedIds = await callerOwnedGroupIds(env, caller.id);
-  if (!ownedIds.length) return err(403, "forbidden");
-
-  // 1. Drop memberships in caller's groups.
-  const placeholders = ownedIds.map(() => "?").join(",");
-  await exec(
-    env,
-    `DELETE FROM memberships WHERE user_id = ? AND group_id IN (${placeholders})`,
-    uid, ...ownedIds,
-  );
+  if (ownedIds.length) {
+    const placeholders = ownedIds.map(() => "?").join(",");
+    await exec(
+      env,
+      `DELETE FROM memberships WHERE user_id = ? AND group_id IN (${placeholders})`,
+      uid, ...ownedIds,
+    );
+  }
 
   // 2. If no memberships remain anywhere, fully tombstone.
   const remaining = await q1(env, "SELECT 1 AS ok FROM memberships WHERE user_id = ? LIMIT 1", uid);
