@@ -1660,6 +1660,7 @@ function ShiftApp() {
     if(!(k in cur)) return;
     const next={...unavailability,[me.id]:{...cur,[k]:reason||null}};
     setUnavailability(next); await persist("unavail",next);
+    trackEvent("unavail.reason", { dateKey: k, reason: reason || null });
   };
 
   const togglePreference = async k => {
@@ -1995,6 +1996,18 @@ function ShiftApp() {
     users.forEach(u => { if(u.role==="provider") pointsAtClose[u.id] = u.points || 0; });
     // Collect open-shift incentive credits for any newly-awarded slots.
     const { credits: incCredits, nextOpenIncentives, mutated: incMutated } = collectIncentiveCredits(finalShifts);
+    // Capture which (dateKey, slotId) entries were consumed so applyEvent can replay the
+    // openIncentives mutation deterministically without re-deriving from shifts state.
+    const consumedIncentives = [];
+    if(incMutated){
+      for(const [k, day] of Object.entries(openIncentives || {})){
+        for(const [sidStr, pts] of Object.entries(day || {})){
+          if(nextOpenIncentives[k]?.[sidStr] == null && pts > 0){
+            consumedIncentives.push({ dateKey: k, slotId: parseInt(sidStr), points: pts });
+          }
+        }
+      }
+    }
     if(Object.keys(deltas).length || Object.keys(incCredits).length || Object.keys(availPenalties).length){
       const nu = users.map(u => {
         const bidDelta = deltas[u.id] || 0;
@@ -2010,11 +2023,16 @@ function ShiftApp() {
     // tracked separately so reset can restore it (and so the block report can attribute the cost).
     // Phase advances to RECON — providers can no longer change availability/topOptions but can confirm/flag.
     await updateCurrentBlock({phase: PHASE.RECON, lastReconcileDeltas:deltas, pointsAtClose, availPenalties});
+    // D.4.B: enriched payload. availPenalties / pointsAtClose / openIncentivesPatch are all
+    // cascaded effects of the reconcile — captured here so applyEvent doesn't have to re-derive.
     trackEvent("block.reconcile", {
       blockId: currentBlock?.id != null ? String(currentBlock.id) : null,
       awards: awarded,
       autoCount,
       deltas,
+      availPenalties,
+      pointsAtClose,
+      openIncentivesPatch: { credits: incCredits, consumed: consumedIncentives },
     });
     flash(`✅ ${awarded.length} Top Option ${awarded.length===1?"award":"awards"} · ${autoCount} auto-filled · block now in Reconciliation`);
     setReconcilePreview(null);
@@ -2027,7 +2045,14 @@ function ShiftApp() {
     // reverse the last reconcile's bid charges + availability penalty deductions.
     const nextShifts = {...shifts};
     let cleared = 0;
-    for(const k of blockDays){ if(nextShifts[k]){ cleared += Object.keys(nextShifts[k]).length; delete nextShifts[k]; } }
+    const clearedDateKeys = [];
+    for(const k of blockDays){
+      if(nextShifts[k]){
+        cleared += Object.keys(nextShifts[k]).length;
+        clearedDateKeys.push(k);
+        delete nextShifts[k];
+      }
+    }
     setShifts(nextShifts); await persist("shifts",nextShifts);
     const restored = currentBlock?.lastReconcileDeltas || {};
     const restoredPenalties = currentBlock?.availPenalties || {};
@@ -2046,6 +2071,14 @@ function ShiftApp() {
     // Reverting to availability invalidates the entering-pts snapshot — a fresh snapshot is taken
     // when assignment runs again. Also clears the phase back to AVAIL so providers can edit.
     await updateCurrentBlock({phase: PHASE.AVAIL, lastReconcileDeltas:{}, pointsAtClose:null, availPenalties:{}});
+    // D.4.B: capture the restored point deltas + penalties + cleared dates so applyEvent can
+    // replay deterministically without re-reading blockMeta.
+    trackEvent("block.reset", {
+      blockId: currentBlock?.id != null ? String(currentBlock.id) : null,
+      restoredDeltas: restored,
+      restoredPenalties,
+      clearedDateKeys,
+    });
     setConfirmReset(false);
     flash(`↺ Block reset · ${cleared} slot${cleared===1?"":"s"} cleared · back to Availability`);
   };
@@ -2176,6 +2209,13 @@ function ShiftApp() {
     );
     if(nm.some((l,i) => l !== marketplace[i])){ setMarketplace(nm); await persist("marketplace", nm); }
     const newUser = users.find(u => u.id === candidateUid);
+    trackEvent("shift.swap-admin", {
+      fromUid: String(originalUid),
+      toUid: String(candidateUid),
+      dateKey,
+      slotId,
+      source: "admin-swap",
+    });
     flash(`✅ Reassigned to ${newUser?.name?.split(" ")[0] || "provider"}`);
   };
 
@@ -2206,6 +2246,14 @@ function ShiftApp() {
     if(nm.some((l,i) => l !== marketplace[i])){ setMarketplace(nm); await persist("marketplace", nm); }
     const flagger = users.find(u => u.id === flaggerUid);
     const partner = users.find(u => u.id === partnerUid);
+    trackEvent("shift.trade-admin", {
+      aUid: String(flaggerUid),
+      bUid: String(partnerUid),
+      aDate: flaggedDateKey,
+      aSlot: flaggedSlotId,
+      bDate: partnerDateKey,
+      bSlot: partnerSlotId,
+    });
     flash(`🔁 Traded · ${flagger?.name?.split(" ")[0]||"flagger"} ↔ ${partner?.name?.split(" ")[0]||"partner"}`);
   };
 
@@ -2396,6 +2444,14 @@ function ShiftApp() {
       ? { ...l, tradeOffers: [...(l.tradeOffers||[]), offer] }
       : l);
     setMarketplace(nm); await persist("marketplace", nm);
+    trackEvent("trade.offer-post", {
+      offerId: offer.id,
+      listingId,
+      fromUid: String(me.id),
+      dateKey: offererDateKey,
+      slotId: offererSlotId,
+      incentivePts: inc,
+    });
     flash(`🔁 Trade offer sent${inc>0?` · +${inc} pt sweetener`:""}`);
     setTradeDraft(null);
   };
@@ -2454,6 +2510,19 @@ function ShiftApp() {
         }
       : l);
     setMarketplace(nm); await persist("marketplace", nm);
+    // pointsTransferred captures the cascaded balance moves so applyEvent can replay
+    // without re-deriving from incentivePts (the listing/offer mutation is also in payload).
+    trackEvent("trade.offer-accept", {
+      offerId,
+      listingId,
+      aDate: listing.dateKey,
+      aSlot: listing.slotId,
+      aUid: String(listing.sellerId),
+      bDate: offer.offererDateKey,
+      bSlot: offer.offererSlotId,
+      bUid: String(offer.offererId),
+      pointsTransferred: { [String(listing.sellerId)]: aDelta, [String(offer.offererId)]: bDelta },
+    });
     flash(`🔁 Trade complete${listing.incentivePts||offer.incentivePts?` · pts settled`:""}`);
   };
 
@@ -2472,6 +2541,7 @@ function ShiftApp() {
       ? { ...l, tradeOffers: l.tradeOffers.map(o => o.id === offerId ? {...o, status:newStatus} : o) }
       : l);
     setMarketplace(nm); await persist("marketplace", nm);
+    trackEvent("trade.offer-decline", { offerId, listingId, status: newStatus });
     flash(newStatus === "withdrawn" ? "Offer withdrawn" : "Offer declined");
   };
 
@@ -2497,6 +2567,7 @@ function ShiftApp() {
       return;  // no change
     }
     setOpenIncentives(next); await persist("openIncentives", next);
+    trackEvent("incentive.open-set", { dateKey, slotId, points: pts });
     flash(pts > 0 ? `Incentive set: +${pts} pt${pts===1?"":"s"}` : "Incentive removed");
   };
 
@@ -2525,12 +2596,19 @@ function ShiftApp() {
   };
 
   /* ── Admin helpers ── */
-  const updateConfig = async patch => { const next={...config,...patch}; setConfig(next); await persist("config",next); };
+  // opts.skipEvent suppresses the config.update event — used by updateCurrentBlock since
+  // every block-phase transition already fires its own specific event (block.reconcile,
+  // block.lock, block.unlock, block.reset). Without the opt-out we'd double-log every transition.
+  const updateConfig = async (patch, opts = {}) => {
+    const next = {...config, ...patch};
+    setConfig(next); await persist("config", next);
+    if(!opts.skipEvent) trackEvent("config.update", { patch });
+  };
   // Patch the currently-active block in-place. No-op if no block is active.
   const updateCurrentBlock = async patch => {
     if(!config.currentBlockId || !Array.isArray(config.blocks)) return;
     const blocks = config.blocks.map(b => b.id===config.currentBlockId ? {...b, ...patch} : b);
-    await updateConfig({blocks});
+    await updateConfig({blocks}, { skipEvent: true });
   };
   // v3.1 admin-assign: entries are now award-only (no per-slot pool field). Setting uid:null
   // simply removes the entry. Setting a uid stamps an admin-source award.
@@ -2560,16 +2638,44 @@ function ShiftApp() {
     }
     flash(incPts > 0 ? `Updated · +${incPts} pt incentive credited` : "Updated");
   };
-  const updateUser = async (uid,patch) => { const next=users.map(u=>u.id===uid?{...u,...patch}:u); setUsers(next); await persist("users",next); };
-  const adjustPoints = async (uid,delta) => { const u=users.find(x=>x.id===uid); await updateUser(uid,{points:Math.max(0,(u?.points||0)+delta)}); };
+  // opts.reason annotates the user.update event so replay/audit can distinguish admin point
+  // adjustments from ordinary profile edits without re-deriving from the patch shape.
+  const updateUser = async (uid, patch, opts = {}) => {
+    const next = users.map(u => u.id===uid ? {...u, ...patch} : u);
+    setUsers(next); await persist("users", next);
+    trackEvent("user.update", {
+      uid: String(uid), patch,
+      ...(opts.reason ? { reason: opts.reason } : {}),
+    });
+  };
+  const adjustPoints = async (uid, delta) => {
+    const u = users.find(x => x.id===uid);
+    await updateUser(uid, { points: Math.max(0, (u?.points||0) + delta) }, { reason: "adjust" });
+  };
   const deleteUser = async uid => {
     if(!confirm("Delete this account?")) return;
-    const nu=users.filter(u=>u.id!==uid);
-    const ns={}; Object.entries(shifts).forEach(([k,day])=>{const c={};Object.entries(day).forEach(([sid,e])=>{if(getUid(e)!==uid)c[sid]=e;});if(Object.keys(c).length)ns[k]=c;});
-    const nun={...unavailability}; delete nun[uid];
-    const npr={...preferences}; delete npr[uid];
-    setUsers(nu);setShifts(ns);setUnavailability(nun);setPreferences(npr);
-    await persist("users",nu);await persist("shifts",ns);await persist("unavail",nun);await persist("prefs",npr);
+    // Capture cascades before the mutation so the event payload carries the full
+    // effect — applyEvent doesn't have to know how to derive them in D.4.C.
+    const cascadeShifts = [];
+    Object.entries(shifts).forEach(([k, day]) => {
+      Object.entries(day).forEach(([sid, e]) => {
+        if(getUid(e) === uid) cascadeShifts.push({ dateKey: k, slotId: parseInt(sid) });
+      });
+    });
+    const cascadeUnavail = unavailability[uid] || null;
+    const cascadePrefs = preferences[uid] || null;
+    const nu = users.filter(u => u.id !== uid);
+    const ns = {}; Object.entries(shifts).forEach(([k,day])=>{const c={};Object.entries(day).forEach(([sid,e])=>{if(getUid(e)!==uid)c[sid]=e;});if(Object.keys(c).length)ns[k]=c;});
+    const nun = {...unavailability}; delete nun[uid];
+    const npr = {...preferences}; delete npr[uid];
+    setUsers(nu); setShifts(ns); setUnavailability(nun); setPreferences(npr);
+    await persist("users",nu); await persist("shifts",ns); await persist("unavail",nun); await persist("prefs",npr);
+    trackEvent("user.delete", {
+      uid: String(uid),
+      cascadeShifts,
+      cascadeUnavail,
+      cascadePrefs,
+    });
     flash("Removed");
   };
 
@@ -2596,6 +2702,7 @@ function ShiftApp() {
       createdAt: Date.now(),
     };
     const next = [...users, nu]; setUsers(next); await persist("users", next);
+    trackEvent("user.create", { user: nu });
     return { user: nu, tempPassword };
   };
 
