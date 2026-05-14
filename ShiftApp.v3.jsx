@@ -904,9 +904,25 @@ export default function ShiftApp() {
   // The snapshot is the entire per-group state plus the local-only group metadata
   // (groupCode, adminCode, etc.) bundled together so a different device can fully recreate
   // the group from cloud.
+  //
+  // Live state goes through a ref so the snapshot uploader always reads the
+  // latest values. Without this, scheduleSnapshotUpload's setTimeout captures
+  // the render's closure at scheduling time — but React batches state updates,
+  // so that closure was created BEFORE the mutating setX(...) call took effect.
+  // Result: every snapshot upload would silently trail live state by one
+  // mutation, surfacing as a one-row divergence in the D.4.C validator.
+  const snapshotStateRef = useRef(null);
+  useEffect(() => {
+    snapshotStateRef.current = {
+      users, config, shifts,
+      unavailability, preferences, marketplace, topOptions, openIncentives,
+    };
+  });
   const buildSnapshotPayload = (gid) => {
     const g = groups.find(x => x.id === gid);
     if (!g) return null;
+    const s = snapshotStateRef.current;
+    if (!s) return null;
     return {
       meta: {
         name: g.name,
@@ -915,9 +931,9 @@ export default function ShiftApp() {
         createdAt: g.createdAt,
         cloudGroupId: g.cloudGroupId,
       },
-      users, config,
-      shifts, unavail: unavailability, prefs: preferences,
-      marketplace, topOptions, openIncentives,
+      users: s.users, config: s.config,
+      shifts: s.shifts, unavail: s.unavailability, prefs: s.preferences,
+      marketplace: s.marketplace, topOptions: s.topOptions, openIncentives: s.openIncentives,
     };
   };
 
