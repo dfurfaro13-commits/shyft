@@ -395,7 +395,12 @@ N=$(grep -n "^export default function ShiftApp" ShiftApp.v3.jsx | cut -d: -f1)
 o=$(grep -o '{' shyft-v3.html | wc -l) && c=$(grep -o '}' shyft-v3.html | wc -l) && echo "braces $o/$c"
 ```
 
-Smoke test (open `shyft-v3.html` in browser):
+**⚠ Opening `shyft-v3.html` from `file://` no longer works post-D.3.** All sign-in paths go through the Worker (`/api/auth/password`, `/api/auth/signup`, `/api/me`), so the auth screen loads but has no way to authenticate without the backend running. Use one of:
+
+- **`npx wrangler dev --remote`** — runs the Worker at `http://localhost:8787` but proxies D1, R2, and secrets to the deployed instances. Real cloud auth, real event log, no production deploy needed. Lowest friction for local smoke testing.
+- **`npx wrangler deploy`** — full production push to `app.shift-scheduling.com`. Use when you're ready to soak against real traffic, or when testing something that only manifests in production (e.g. cookie-domain edge cases, custom-domain CSRF).
+
+Smoke test (against either of the above):
 1. Sign in as admin → Setup → create a block in Availability phase
 2. Sign in as provider → Schedule → tap a day → 🎯 Top Option → bid + slot pref
 3. Repeat for a few providers, some contested
