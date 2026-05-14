@@ -1924,11 +1924,15 @@ function ShiftApp() {
         try {
           const snap = await window.api.fetchJSON(`/api/snapshots/${gid}/latest`);
           if (!snap?.payload) { console.warn("[validator] no snapshot for", gid); return null; }
+          // The wire payload (built by buildSnapshotPayload) renames two slices on upload:
+          //   unavailability → unavail
+          //   preferences    → prefs
+          // Map back here so the reducer's internal state shape matches.
           const base = {
             users: snap.payload.users || [],
             shifts: snap.payload.shifts || {},
-            unavailability: snap.payload.unavailability || {},
-            preferences: snap.payload.preferences || {},
+            unavailability: snap.payload.unavail || {},
+            preferences: snap.payload.prefs || {},
             topOptions: snap.payload.topOptions || {},
             marketplace: snap.payload.marketplace || [],
             openIncentives: snap.payload.openIncentives || {},
