@@ -1154,9 +1154,17 @@ export default function ShiftApp() {
     flash(`✅ "${ng.name}" restored — sign in with your existing credentials`);
   };
 
-  // Phase B: append-only event log helper. Fire-and-forget. No-op when the user isn't
-  // cloud-signed-in or the active group hasn't been mirrored to D1. Errors are swallowed
-  // — localStorage is still source of truth, so a failed log only loses ML signal.
+  // D.4.D1: event dispatcher. Three jobs in one helper:
+  //   1. Build the wire body and post it via window.api.postEvent — that helper
+  //      parks the body in shyft3_evt_outbox on transport failure and retries on
+  //      visibilitychange/online. localStorage is still source of truth, so a
+  //      permanently-dropped event only loses ML/replay signal.
+  //   2. Shadow diff (dev-only, but cheap enough to leave on). Snapshot live
+  //      state synchronously, then on the next tick replay the event through
+  //      `applyEvent` against that snapshot and compare to the now-updated live
+  //      state. Mismatches log to console — the gating signal for D.4.D2.
+  //   3. No-op when the user isn't cloud-signed-in or the active group hasn't
+  //      been mirrored to D1 (nothing to write to and nothing to diff against).
   const trackEvent = (type, payload, opts = {}) => {
     if (!cloudUser || !currentGroup?.cloudGroupId) return;
     const body = {
@@ -1167,7 +1175,43 @@ export default function ShiftApp() {
       blockId: opts.blockId ?? (currentBlock?.id != null ? String(currentBlock.id) : null),
       clientTs: Date.now(),
     };
-    window.api.fetchJSON("/api/events", { method: "POST", body: JSON.stringify(body) }).catch(()=>{});
+
+    // Shadow diff: capture pre-mutation state NOW, then schedule the compare for
+    // after React commits and validatorLiveRef updates. setTimeout(0) defers
+    // past React's render task; queueMicrotask would fire too early. Cheap to
+    // run on every event so we leave it on (one applyEvent + diff ≈ sub-ms).
+    const before = validatorLiveRef.current
+      ? { ...validatorLiveRef.current, appliedEventIds: [] }
+      : null;
+    if (before) {
+      const shadowEvt = {
+        id: `shadow_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        type,
+        payload: body.payload,
+      };
+      setTimeout(() => {
+        try {
+          const after = validatorLiveRef.current || {};
+          const predicted = applyEvent(before, shadowEvt);
+          const diffs = diffState(predicted, after);
+          if (diffs.length > 0) {
+            console.group(`%c[shadow-diff] ❌ ${type} · ${diffs.length} divergence(s)`, "color:crimson;font-weight:bold");
+            console.log("event:", shadowEvt);
+            diffs.forEach(d => {
+              console.group(`slice: ${d.slice}`);
+              console.log("predicted:", d.replayed);
+              console.log("actual:   ", d.live);
+              console.groupEnd();
+            });
+            console.groupEnd();
+          }
+        } catch (err) {
+          console.error("[shadow-diff] threw:", err, "event-type:", type);
+        }
+      }, 0);
+    }
+
+    window.api.postEvent(body);
   };
 
   // D.4.C — offline validator. Cloud-owner only (works during impersonation —
@@ -1183,10 +1227,12 @@ export default function ShiftApp() {
   // Live state is fed in via a ref so the installed validator stays valid
   // across state-driven re-renders (otherwise a re-render during an in-flight
   // run() would tear the validator down and the next call would throw).
+  // Updated at render time (not in an effect) so D.4.D1's shadow diff —
+  // which reads the ref from a setTimeout(0) scheduled inside the same
+  // mutation handler — sees the post-mutation snapshot, not the pre-mutation
+  // one a useEffect would still be holding.
   const validatorLiveRef = useRef(null);
-  useEffect(() => {
-    validatorLiveRef.current = { users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config };
-  });
+  validatorLiveRef.current = { users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config };
   useEffect(() => {
     const isCloudOwner = !!cloudUser && (
       cloudUser.memberships?.some(m => m.role === "owner") ||

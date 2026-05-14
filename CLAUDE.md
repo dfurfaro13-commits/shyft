@@ -199,6 +199,17 @@ Frontend ([ShiftApp.v3.jsx](ShiftApp.v3.jsx)):
 
 Frontend is unchanged. No D.4.A behavior is visible to users — the only observable difference is that `POST /api/events` now returns JSON instead of 204, but the existing fire-and-forget callers ignore the response either way.
 
+**D.4.B (event payload wiring).** Wires 12 new event types into the frontend and enriches several payloads (`block.reconcile` with `awarded`/`cleared`/`points`, `topOption.clear`/`topOption.unlink` with `chainRepair`, `shift.flag` with `listing`). All 26 mutation paths in `ShiftApp.v3.jsx` now fire `trackEvent` so the D1 event log is a complete record of state changes. Pure additive — localStorage still authoritative.
+
+**D.4.C (applyEvent reducer + offline validator).** Pure-function reducer (`applyEvent(state, evt)` in `templates/shyft_head.v3.html`, mirrored reference-only in the JSX preamble) maps each of the 26 event types onto a state transition. Deterministic: no `Date.now()`, no `Math.random()`, no clock reads — all stamping data either lives in payload (D.4.B's enrichments) or is derived from existing state. Idempotency via a FIFO `appliedEventIds` ring (cap 200). Unknown event types are forward-compat no-ops. The companion validator (`window.__shiftValidator.run()`, cloud-owner only) pulls the latest snapshot, replays every event newer than `snap.serverTs` through `applyEvent`, and deep-diffs the result against live state. Shipped a Phase C bug fix on the way in: `buildSnapshotPayload` now reads from a `snapshotStateRef` updated render-time, fixing a stale-closure issue where the 2s debounced upload was uploading pre-mutation state (caught by the validator). 24h soak passed with `✅ 0 divergences` across every event type.
+
+**D.4.D1 (dual-write shadow diff + event outbox).** Two additions, both fully additive — localStorage still authoritative.
+
+- **Shadow diff.** `trackEvent` in `ShiftApp.v3.jsx` is now a dispatcher: it captures live state synchronously (via `validatorLiveRef`, now updated at render time rather than in a useEffect so the deferred compare sees post-mutation state), schedules a `setTimeout(0)` callback to replay the event through `applyEvent` against that snapshot, and diffs the prediction against the now-updated live state. Mismatches log a grouped console error with the event, slice, predicted, and actual values. Runs unconditionally for cloud-signed-in users on cloud-mirrored groups; the cost is one `applyEvent` + one `diffState` per event (sub-ms). This is the gating signal for D.4.D2 — every divergence is a real reducer bug.
+- **Event outbox.** `window.api.postEvent(body)` wraps the `/api/events` POST; on transport failure or 5xx/408/429 the body is pushed to `localStorage.shyft3_evt_outbox` (cap 500). The queue is flushed in order on `visibilitychange→visible`, `online`, and once on script load via `queueMicrotask`. 4xx errors are dropped (replaying won't help). Idempotency caveat: the server still mints event ids, so a retry that already committed creates a duplicate row — fine for D.4.D1 because the outbox only fires on genuine transport failures (the request never reached the server). D.4.D2 will tighten this with client-issued ids + INSERT-IGNORE.
+
+Soak gate before D.4.D2: 3+ days of normal use with zero `[shadow-diff]` errors in console.
+
 ---
 
 ## Token efficiency rules
