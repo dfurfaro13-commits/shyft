@@ -14,12 +14,10 @@ The interface must be **clean, professional, simple, and intuitive.** This is th
 
 ## Project scope & constraints
 
-- **Hobby project.** David is building this on his own time. **Keep recurring costs near zero.** No paid SaaS dependencies, no per-seat licenses, no managed services that charge by request volume. Default to self-hostable / free-tier / open-source choices. If something must cost money, flag it with a cost estimate before implementing.
-- **No backend yet.** All state is in browser localStorage. This is intentional and fine for the current single-user-per-browser hobby phase.
-- **Future direction (not yet started):**
-  - **Backend that auto-logs all scheduling data** so the model can learn from it (which providers bid what, how reconciliations played out, who flagged shifts, etc.). Persistent server-side store, append-only log shape preferred. Treat this as a near-term ambition — design new features so they're easy to mirror server-side later.
-  - **Hosted as a website** so anyone can visit it. Static-host-friendly (the current single-file build is already there). Likely target: GitHub Pages / Cloudflare Pages / Netlify free tier.
-- **Don't pre-build the backend.** The frontend is still the active surface. When designing new features, just keep the data model clean and append-friendly so the eventual backend port is straightforward.
+- **Hobby project.** David is building this on his own time. Recurring costs ≈ $0 — Cloudflare's free tier covers Workers, D1, and R2 at our current scale. No paid SaaS, no per-seat licenses. Flag anything that would change that.
+- **localStorage is still authoritative; cloud mirrors.** Phases A–C added cloud auth + event log + snapshot sync; Phase D is the in-flight migration to make cloud the source of truth. Until D.4.D2 ships, every state mutation writes to localStorage first; the event log + snapshot uploads run in parallel.
+- **Hosted as a website.** Deployed to Cloudflare Pages + Worker at `app.shift-scheduling.com`.
+- **Design for cloud-mirroring from day one.** New mutations should fire `trackEvent` and the data shape should pass cleanly through `applyEvent` so the eventual D.4.D2 cutover stays cheap.
 
 ---
 
@@ -89,6 +87,7 @@ Common things that need both updates:
 - `phaseOf`, `isAvailabilityOpen`, `isReconciling`, `isLocked`
 - `getUid`, `isAuto`, `getSource`
 - `currentBlockOf`, `inBlock`
+- `applyEvent` + `EVENT_HANDLERS` + `diffState` (D.4.C reducer family)
 - Date helpers, color tables, etc.
 
 Component-local helpers (anything inside `function ShiftApp(...)`) only need updating in the JSX — they're inside the slice that gets included.
@@ -100,13 +99,13 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | Path | Role |
 |------|------|
 | `ShiftApp.v3.jsx` | Source of truth for all v3 code. Edit this. |
-| `templates/shyft_head.v3.html` | Runtime preamble (DOCTYPE, Tailwind config, migration, module-scope helpers). Mirror constants here. |
+| `templates/shyft_head.v3.html` | Runtime preamble (DOCTYPE, Tailwind config, migration, module-scope helpers, `applyEvent` reducer). Mirror module-scope code here. |
 | `templates/shyft_tail.v3.html` | Runtime postamble. Just `<ReactDOM>.render()`. Don't touch. |
 | `shyft-v3.html` | Built artifact. **Never edit by hand** — gets overwritten. Cloudflare Pages serves this. |
 | `index.html` | Tiny redirect to `shyft-v3.html` so the root URL of the deployed site loads the app. |
-| `wrangler.jsonc` | Cloudflare Worker config. Now also binds the API Worker (`_worker.js`), D1 (`DB`), and R2 (`R2`). |
+| `wrangler.jsonc` | Cloudflare Worker config. Binds the API Worker (`_worker.js`), D1 (`DB`), and R2 (`R2`). |
 | `_worker.js` | Worker entrypoint. Routes `/api/*` to the API; everything else falls through to static assets via `env.ASSETS.fetch`. |
-| `src/api/` | API handlers (`auth.js`, `groups.js`) + `router.js`. Phase A only — no event/snapshot endpoints yet. |
+| `src/api/` | API handlers + `router.js`. Modules: `auth`, `signup`, `users`, `groups`, `owner`, `events`, `snapshots`. |
 | `src/lib/` | Backend helpers (`db`, `session`, `cookies`, `email`, `csrf`, `ids`, `ratelimit`, `http`). |
 | `migrations/0001_init.sql` | D1 schema for Phase A: `users`, `groups`, `memberships`, `invites`, `login_tokens`, `sessions`. |
 | `migrations/0002_events.sql` | Phase B append-only event log (`events` table). |
@@ -114,101 +113,88 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | `migrations/0004_users_passwords.sql` | Phase D.1: adds `users.password_hash`, `users.kind`, and `password_attempts` rate-limit table. |
 | `migrations/0005_username_owner.sql` | Phase D.3: adds `users.username` (partial unique), `users.can_create_groups`, `groups.group_code`, `groups.admin_code`, plus `signup_attempts`. Backfills owner permission + group/admin codes from snapshots. |
 | `Phases for Shyft and Rules for shift assignment.docx` | The spec. Source of truth for behavior. Re-read when in doubt. |
-| `legacy/` | Archived v1/v2 source + built HTML, plus v1-era assignment-algorithm simulators (`simulate.js`, `simulate.py`). **Do not read or grep into.** |
+| `legacy/` | Archived v1/v2 source + built HTML, plus v1-era assignment-algorithm simulators. **Do not read or grep into.** |
 | `~/.claude/plans/*.md` | Planning artifacts. Look for the most recent one for context on the latest change. |
 
 ---
 
-## Backend (Phase A)
+## Backend (Phase A → D.4.D1, all shipped)
 
-Phase A added a Cloudflare Worker + D1 backend for **magic-link auth and owner-issued invite links** — nothing more. localStorage is still source of truth for all scheduling data; the cloud session is purely additive.
+The Cloudflare Worker fronts a D1 database + R2 bucket. localStorage is still the source of truth in the app; the cloud mirror runs in parallel until D.4.D2 inverts the relationship.
 
 - **Deploy:** `npx wrangler deploy` (after `wrangler login`, `d1 create shift-db`, paste id into `wrangler.jsonc`, run each `migrations/000*.sql` file via `d1 execute shift-db --remote --file=…`, `r2 bucket create shift-events`, and `wrangler secret put RESEND_API_KEY`, `SESSION_PEPPER`, `OWNER_BOOTSTRAP_CODE`).
 - **Local dev:** `npx wrangler dev`. Create `.dev.vars` (gitignored) with `RESEND_API_KEY=...` and `DEV_EMAIL=console` to log magic links instead of sending.
 - **Email sender:** custom domain is live (`app.shift-scheduling.com` via Resend). `EMAIL_FROM` is configured; magic links deliver to any address.
 - **CSRF:** every state-changing API call must send `X-Requested-With: shift`. The `window.api.fetchJSON` shim in `templates/shyft_head.v3.html` adds it automatically.
 - **Sessions:** opaque `shift_sid` cookie. Server stores `SHA-256(SESSION_PEPPER + raw)`; raw value never persisted.
-- **Auth model post-D.3:** cloud is the source of truth. Auth screen has 2 tabs (Sign in / Sign up); both call cloud APIs. The local-session path in `me` only fires during owner impersonation; otherwise `me` is derived from `cloudUser`. The `OWNER_BOOTSTRAP_CODE` Worker secret (currently `Shyft-Kai-Dave`) gates group creation via the optional Owner code field on Sign up.
-
-Phase C (snapshot sync) is not implemented.
+- **Deploy hygiene.** The Worker's `assets.directory` is `./` (worktree root), so anything not excluded by `.assetsignore` ships as a public asset. Current `.assetsignore` excludes `*.sql`, `*.sqlite*`, `.git`, `.git/`, `.dev.vars`, `src/`, `migrations/`, etc. Before any deploy, sanity-check what `wrangler deploy` reports as new uploads.
 
 ### Phase B — append-only event log
 
-Every meaningful state mutation also fires a `POST /api/events` to D1 — the primary ML training corpus. localStorage is still source of truth; the event log is parallel, fire-and-forget, and silently no-ops when the user isn't cloud-signed-in or the active group hasn't been mirrored. The component-local helper `trackEvent(type, payload, opts?)` (in `ShiftApp.v3.jsx`, near the cloud helpers) is the only call surface — search for `trackEvent(` to find every wired call site.
-
-Currently logged event types: `topOption.set`, `topOption.clear`, `topOption.link`, `topOption.unlink`, `preference.toggle`, `unavail.toggle`, `block.reconcile`, `block.lock`, `block.unlock`, `shift.confirm`, `shift.flag`, `marketplace.post`, `marketplace.take`, `marketplace.cancel`. The Worker rejects unknown types — to add a new event type, append to `ALLOWED_TYPES` in `src/api/events.js` first. (D.4.A added a batch of types reserved for D.4.B wiring — see the D.4.A subsection below.)
-
-R2 archival of the event log (originally part of the Phase B plan) is deferred — D1 is queryable directly and we'll dump monthly archives to R2 only when the corpus gets large enough to need it.
+Every meaningful state mutation fires `POST /api/events` to D1. The component-local helper `trackEvent(type, payload, opts?)` in `ShiftApp.v3.jsx` is the only call surface. The Worker rejects unknown types — to add a new event type, append it to `ALLOWED_TYPES` in `src/api/events.js` first. 26 wired types currently — see D.4.A/B subsections below for the full list. R2 archival of the event log is deferred — D1 is queryable directly and we'll dump monthly archives only when the corpus gets large enough to need it.
 
 ### Phase C — snapshot sync
 
-After every per-group `persist()`, a debounced uploader (~2s) fires `POST /api/snapshots` with the entire per-group state plus the local-only group metadata (`groupCode`, `adminCode`, `name`, `createdAt`). D1 stores the latest (one row per group, last-write-wins). R2 stores history (one immutable object per write at `snapshots/<groupId>/<server_ts>-<client_ts>.json`).
+After every per-group `persist()`, a debounced uploader (~2s) fires `POST /api/snapshots` with the entire per-group state plus the local-only group metadata (`groupCode`, `adminCode`, `name`, `createdAt`). D1 stores the latest (one row per group, last-write-wins); R2 stores history at `snapshots/<groupId>/<server_ts>-<client_ts>.json`. Two consumer flows:
 
-Two consumer flows on the frontend:
+- **Sync banner.** When a cloud-signed-in user opens a cloud-mirrored group and `checkCloudSyncOffer` sees cloud is meaningfully newer than this device's `shyft3_g<gid>_lastModified`, an amber banner offers "Sync now" — `applySnapshot` overwrites the 8 per-group keys and reloads the group.
+- **First-device-claim.** On the auth screen, any cloud membership not matched to a local `groups[]` entry renders a "Restore" card; clicking it pulls the latest snapshot and creates the local group from `payload.meta`.
 
-- **Sync banner.** When a cloud-signed-in user opens a cloud-mirrored group, `checkCloudSyncOffer` compares the server's `client_ts` to this device's `shyft3_g<gid>_lastModified`. If cloud is meaningfully newer, an amber banner appears at the top of the in-group shell offering "Sync now" — which calls `applySnapshot` to overwrite the 8 per-group keys and reload the group.
-- **First-device-claim.** On the auth screen, `cloudUser.memberships` is filtered against local `groups[]` (matched by `cloudGroupId`). Any unclaimed cloud group renders a "Restore" card; clicking it pulls the latest snapshot, creates a new local `groups[]` entry from `payload.meta`, and writes the 8 per-group keys. The user then signs in locally with credentials that came back inside the snapshot's `users` array.
-
-The uploader silently no-ops when the user isn't cloud-signed-in or the active group has no `cloudGroupId`. localStorage remains source of truth — Phase C is mirroring, not migration.
-
-### Phase D — backend-as-truth (D.1 + D.2 + D.2.5 + D.3 + D.4.A shipped)
-
-**D.1 (password auth + cloud user creation).** Cloud users now carry an optional PBKDF2 `password_hash` (SHA-256 with 310k iters, 16-byte salt; format `pbkdf2$310000$<salt>$<hash>`) and a `kind ∈ ('real','test')` designator. New endpoint `POST /api/auth/password` issues a session for `email + password`; rate-limited at 10/hr per `(email, ip)` via the new `password_attempts` table. Endpoint `POST /api/users` lets an owner/admin create a cloud user + membership — `kind='test'` mints a synthetic `<localId>@<cloudGroupId>.test.invalid` email and a temp password returned in the response; `kind='real'` validates the supplied email and pre-issues a magic-link via Resend.
-
-The admin "+ Add user" modal in PeoplePage now creates BOTH a local user (existing flow) AND, when the active group is cloud-mirrored AND admin is cloud-signed-in, a cloud user via `POST /api/users`. The modal gains a "Test user (synthetic email, no magic-link sent)" checkbox visible only when cloud creation is possible. `NewUserInfoModal` shows local credentials and, if the cloud user was also created, the cloud credentials in a separate panel. The auth-screen Cloud tab gained a password field — leaving it empty falls through to the existing magic-link flow.
-
-**D.2 (one-shot migration).** `POST /api/groups/:gid/migrate` creates a cloud group, marks the caller `owner`, creates one `kind='test'` user per local user with a synthetic email + freshly-generated PBKDF2 password (returned in response so admin can hand them out), and uploads the supplied snapshot directly to D1 + R2. The SuperDashboard renders a **"Migrate to cloud"** button on every local-only group when the admin is cloud-signed-in. The confirm-modal lists the users about to be migrated; on success, the result-modal lists each user with their email + temp password (only shown once).
-
-**D.2.5 (cloud-owner bridge + owner impersonation).** Two pre-D.3 changes that make the local-auth tabs deletable without locking the owner out or losing the test-user-switching workflow:
-
-- **Cloud-owner bridge.** The `me` useMemo in `ShiftApp.v3.jsx` (~line 343) now derives `me.role === "super"` from `cloudUser.memberships.some(m => m.role === "owner")` when no local session is present. The auth-screen guard (~line 2154) was changed from `if(!session||!me)` to `if(!me)` so a cloud-only owner reaches SuperDashboard. Precedence is: impersonation > local session > cloud-owner bridge — a local sign-in always wins so signing in as a test user works mid-cloud-session.
-- **Owner impersonation.** Each group card in SuperDashboard has a **"👁 View as"** button → `ImpersonatePickerModal` lists admins+providers for that group (read directly from localStorage via `readGroupKey`, no group-load required) → `startImpersonate(gid, localUid)` awaits `loadGroup` then sets the `impersonate` state. State shape: `{groupId, localUid}`, persisted in `sessionStorage` under `shyft3_impersonate` so it survives reloads in the same tab. While impersonating, an amber sticky banner at the top of the main app shows "👤 Impersonating <name> · Stop" — Stop calls `stopImpersonate` which clears state, clears group context, and returns to SuperDashboard via the cloud bridge. Component-local helpers, no head-template mirror needed. **Caveat:** events fired during impersonation hit `/api/events` as if from the impersonated user — fine for test groups, revisit if real users get onboarded pre-D.3.
-
-**D.3 (cloud-backed auth).** Local Sign in / Sign up are gone; their replacements are cloud-backed and live on the same two-tab auth screen. Migration `0005_username_owner.sql` adds `users.username` (nullable, unique-when-not-null partial index), `users.can_create_groups`, `groups.group_code`, `groups.admin_code`, plus a `signup_attempts` rate-limit table. The migration grandfathers existing owners by setting `can_create_groups = 1` for everyone with an `owner` membership, and backfills `groups.group_code` / `admin_code` from the latest snapshot's `payload.meta`.
-
-- **`POST /api/auth/signup`** ([src/api/signup.js](src/api/signup.js)): self-serve. Body `{ displayName, email, username, password, groupCode?, adminCode?, ownerCode? }`. Owner code is matched against the `OWNER_BOOTSTRAP_CODE` Worker secret; valid → `can_create_groups = 1` AND group code becomes optional (cold-start owner). With a group code, the user joins as `provider`; supplying a matching admin code elevates to `admin`. PBKDF2 password hash (same params as D.1). Rate-limited 10/hr per IP via `signup_attempts`.
-- **`POST /api/auth/password`** updated to look up by `email OR username` (single `emailOrUsername` field on the wire). Backwards-compat alias `email` is still accepted by the body parser. Response now includes `username` and `canCreateGroups`.
-- **`POST /api/groups`** and **`POST /api/groups/:gid/migrate`**: gated on `can_create_groups`; 403 otherwise. Both also persist `group_code` and `admin_code` on the row (migrate pulls them from `payload.meta`).
-- **`getSessionUser` / `GET /api/me`**: now returns `username` and `canCreateGroups` on the user object.
-- **`OWNER_BOOTSTRAP_CODE` secret**: currently `Shyft-Kai-Dave`. Set via `wrangler secret put OWNER_BOOTSTRAP_CODE` and in `.dev.vars` for local dev.
-
-Frontend ([ShiftApp.v3.jsx](ShiftApp.v3.jsx)):
-
-- Auth screen has 2 tabs (Sign in / Sign up); the old Owner and Cloud tabs are gone.
-- Sign in: single "Email or username" field + password + "Or email me a sign-in link instead" link (magic-link fallback only fires when the input contains `@`).
-- Sign up: name + email + username + password + group code + admin code + owner code. Group code is required unless the owner code is present (cold-start owner case).
-- `handleAuth` is now a thin dispatcher to `signInCloud` / `signUpCloud`. The `signUpCloud` response has the `/api/me` shape and is dropped straight into `cloudUser`.
-- **`enterGroupAsCloudMember`** is the post-auth navigation helper for non-owner roles. After a successful sign in or sign up, if the user has a non-owner membership it: pulls the latest cloud snapshot for the group (or creates an empty mirror if none), inserts a local `groups[]` entry + a local `users[gid][i]` entry tagged with `cloudUserId`, and sets `session = {groupId, userId}` so the `me` useMemo resolves. Without this helper, providers/admins land on the auth screen with a "Restore" card and no way in. Owners are a no-op — the cloud bridge takes them to SuperDashboard.
-- The `me` useMemo's `session?.superId` branch is gone. The cloud bridge now triggers on `cloudUser.memberships.some(m => m.role === "owner") || cloudUser.user.canCreateGroups` — the latter handles a brand-new owner who hasn't created their first group yet.
-- `SUPER_BOOTSTRAP` (in both the JSX preamble and `templates/shyft_head.v3.html`), the `supers` state, the local-only `signInWithPassword` helper, the standalone `signOutCloud` helper, and the `cloudEmail` / `cloudPassword` state are all deleted. The unified `signOut` revokes the cloud session AND clears local + impersonation state in one call. The pre-D.3 `shyft3_supers` localStorage key is pruned on first load via a one-shot block in `templates/shyft_head.v3.html` (marker `shyft3_migrate_prune_supers`).
-- The "X owner accounts" footer and the redundant blue "Sign out (cloud)" strip in SuperDashboard are removed; one Sign out button per UI surface.
+`buildSnapshotPayload` reads from a `snapshotStateRef` updated render-time (not via useEffect). This fixes a stale-closure bug where the 2s debounced upload was uploading pre-mutation state — caught by D.4.C's validator.
 
 **Concurrency control.** `POST /api/snapshots` accepts `If-Match: <serverTs>` and returns 409 with the current serverTs when stale. The frontend doesn't yet send `If-Match` — backwards-compatible last-write-wins is preserved. Making it mandatory remains deferred.
 
-**Accounts management.** Owner-only surface in SuperDashboard (top-right "Accounts" button). Backend: [src/api/owner.js](src/api/owner.js) exposes `GET /api/owner/users` (list users in caller's owned groups, self excluded, memberships rolled up), `PATCH /api/owner/users/:uid` (change email and/or password — backend rejects self-edit, email collisions, short passwords), and `DELETE /api/owner/users/:uid` (drops memberships in caller's owned groups; if no memberships remain anywhere, fully tombstones — anonymizes email/display_name, NULLs username + password_hash, deletes sessions + login_tokens + password_attempts; refuses to delete a user who owns any group). Frontend: `AccountsModal` lists users with kind/magic-link badges and (group, role) chips; `AccountsEditModal` and `AccountsDeleteModal` are the action surfaces. Tombstoned users naturally drop out of the list (no memberships → JOIN excludes). Cherry-picked from the now-stale `wip/parallel-d3-with-accounts` branch.
+### Phase D — backend-as-truth (D.1 + D.2 + D.2.5 + D.3 + D.4.A + D.4.B + D.4.C + D.4.D1 shipped)
 
-**Deploy hygiene.** The Worker's `assets.directory` is `./` (worktree root), so any file in the root that isn't excluded by `.assetsignore` ships as a public asset. During the D.3 deploy a D1 backup (`backup-pre-d3-*.sql`) and the `.git` worktree pointer briefly leaked at the public origin before the rule was tightened. Current `.assetsignore` excludes `*.sql`, `*.sqlite*`, the `.git` file (and `.git/` directory form), `.dev.vars`, `src/`, `migrations/`, etc. Before any future deploy, sanity-check what `wrangler deploy` reports as new uploads.
+**D.1 (password auth + cloud user creation).** PBKDF2 password hashes on `users` (310k iters, SHA-256, 16-byte salt; format `pbkdf2$310000$<salt>$<hash>`) and a `kind ∈ ('real','test')` designator. `POST /api/auth/password` issues a session for email+password, rate-limited 10/hr per (email, ip) via `password_attempts`. `POST /api/users` is the admin create-cloud-user surface: `kind='test'` mints a synthetic `<localId>@<cloudGroupId>.test.invalid` email + temp password; `kind='real'` pre-issues a magic link via Resend. The "+ Add user" modal in PeoplePage wires both flows; `NewUserInfoModal` surfaces local + cloud credentials in separate panels.
 
-**D.4.A (backend foundation).** Pure additive Worker change with no frontend wiring yet — sets the stage for the full D.4 event-sourcing cutover (plan: `~/.claude/plans/crispy-twirling-nest.md`).
+**D.2 (one-shot migration).** `POST /api/groups/:gid/migrate` creates a cloud group, marks the caller `owner`, creates one `kind='test'` user per local user, and uploads the supplied snapshot to D1 + R2. SuperDashboard renders a "Migrate to cloud" button on local-only groups; the result modal shows the email+temp-password for each migrated user (only once).
 
-- **`ALLOWED_TYPES` expanded** in [src/api/events.js](src/api/events.js) with 12 D.4.B types (`user.create`, `user.update`, `user.delete`, `block.reset`, `shift.swap-admin`, `shift.trade-admin`, `trade.offer-post`, `trade.offer-accept`, `trade.offer-decline`, `incentive.open-set`, `config.update`, `unavail.reason`) plus a `snapshot.bootstrap` placeholder. Allow-listing now lets the backend accept these events the moment the frontend starts emitting in D.4.B — no second deploy in the middle of that change.
-- **`POST /api/events` response** now returns `{ id, serverTs }` (via `INSERT ... RETURNING server_ts`) instead of 204. `serverTs` is the canonical ordering key consumers will use as the `since` cursor.
-- **`MAX_PAYLOAD_BYTES` bumped** 16 KB → 64 KB to absorb cascade payloads from `user.delete` / `block.reconcile` on long-tenured users.
-- **`GET /api/events?gid=&since=&limit=&type=`** is the new event-tail endpoint. Auth = member of `gid`. Returns `{ events: [...], nextCursor: serverTs|null }`, ordered `(server_ts ASC, id ASC)`. Default `limit` 500, max 2000; soft 512 KB response cap. `nextCursor` is the last returned `serverTs` (inclusive) — consumers MUST dedupe by event `id` because `server_ts` is second-granularity and several events can share a tick.
-- No schema migration: D1's `unixepoch()` is second-granularity but `id` is a TEXT PK with stable lexicographic comparison, so `(server_ts, id)` is a total order already.
+**D.2.5 (cloud-owner bridge + owner impersonation).**
 
-Frontend is unchanged. No D.4.A behavior is visible to users — the only observable difference is that `POST /api/events` now returns JSON instead of 204, but the existing fire-and-forget callers ignore the response either way.
+- **Cloud-owner bridge.** The `me` useMemo derives `me.role === "super"` from `cloudUser.memberships.some(m => m.role === "owner") || cloudUser.user.canCreateGroups` when no local session is present. Precedence: impersonation > local session > cloud-owner bridge — local sign-in always wins so test-user switching works mid-cloud-session.
+- **Owner impersonation.** SuperDashboard's "👁 View as" button → `ImpersonatePickerModal` lists admins+providers for that group (read directly from localStorage via `readGroupKey`, no group-load required) → `startImpersonate(gid, localUid)` awaits `loadGroup` then sets the `impersonate` state. State `{groupId, localUid}` persists in `sessionStorage` under `shyft3_impersonate`. An amber sticky banner shows "👤 Impersonating <name> · Stop" while active. **Caveat:** events during impersonation attribute to the impersonated `localUid`. Acceptable for test groups; revisit when real providers are using the app.
 
-**D.4.B (event payload wiring).** Wires 12 new event types into the frontend and enriches several payloads (`block.reconcile` with `awarded`/`cleared`/`points`, `topOption.clear`/`topOption.unlink` with `chainRepair`, `shift.flag` with `listing`). All 26 mutation paths in `ShiftApp.v3.jsx` now fire `trackEvent` so the D1 event log is a complete record of state changes. Pure additive — localStorage still authoritative.
+**D.3 (cloud-backed auth).** Local Sign in / Sign up are gone; their replacements are cloud-backed on a 2-tab auth screen. Migration `0005_username_owner.sql` adds `users.username` (nullable, unique-when-not-null partial index), `users.can_create_groups`, `groups.group_code`, `groups.admin_code`, plus `signup_attempts`. Grandfathers existing owners (`can_create_groups = 1` for everyone with an `owner` membership), backfills `groups.group_code` / `admin_code` from the latest snapshot's `payload.meta`.
 
-**D.4.C (applyEvent reducer + offline validator).** Pure-function reducer (`applyEvent(state, evt)` in `templates/shyft_head.v3.html`, mirrored reference-only in the JSX preamble) maps each of the 26 event types onto a state transition. Deterministic: no `Date.now()`, no `Math.random()`, no clock reads — all stamping data either lives in payload (D.4.B's enrichments) or is derived from existing state. Idempotency via a FIFO `appliedEventIds` ring (cap 200). Unknown event types are forward-compat no-ops. The companion validator (`window.__shiftValidator.run()`, cloud-owner only) pulls the latest snapshot, replays every event newer than `snap.serverTs` through `applyEvent`, and deep-diffs the result against live state. Shipped a Phase C bug fix on the way in: `buildSnapshotPayload` now reads from a `snapshotStateRef` updated render-time, fixing a stale-closure issue where the 2s debounced upload was uploading pre-mutation state (caught by the validator). 24h soak passed with `✅ 0 divergences` across every event type.
+- **`POST /api/auth/signup`** ([src/api/signup.js](src/api/signup.js)): self-serve. `{ displayName, email, username, password, groupCode?, adminCode?, ownerCode? }`. Owner code matched against `OWNER_BOOTSTRAP_CODE` Worker secret; valid → `can_create_groups = 1` AND group code becomes optional (cold-start owner). With a group code → `provider`; matching admin code elevates to `admin`. Rate-limited 10/hr per IP.
+- **`POST /api/auth/password`** looks up by `email OR username` (single `emailOrUsername` field; legacy `email` alias still accepted). Response includes `username` and `canCreateGroups`.
+- **`POST /api/groups`** and **`POST /api/groups/:gid/migrate`** are gated on `can_create_groups`; both persist `group_code` and `admin_code` on the row.
+- **`OWNER_BOOTSTRAP_CODE`** secret currently `Shyft-Kai-Dave`. Set via `wrangler secret put` and in `.dev.vars` for local dev.
 
-**D.4.D1 (dual-write shadow diff + event outbox).** Two additions, both fully additive — localStorage still authoritative.
+Frontend changes:
 
-- **Shadow diff.** `trackEvent` in `ShiftApp.v3.jsx` is now a dispatcher: it captures live state synchronously (via `validatorLiveRef`, now updated at render time rather than in a useEffect so the deferred compare sees post-mutation state), schedules a `setTimeout(0)` callback to replay the event through `applyEvent` against that snapshot, and diffs the prediction against the now-updated live state. Mismatches log a grouped console error with the event, slice, predicted, and actual values. Runs unconditionally for cloud-signed-in users on cloud-mirrored groups; the cost is one `applyEvent` + one `diffState` per event (sub-ms). This is the gating signal for D.4.D2 — every divergence is a real reducer bug.
-- **Event outbox.** `window.api.postEvent(body)` wraps the `/api/events` POST; on transport failure or 5xx/408/429 the body is pushed to `localStorage.shyft3_evt_outbox` (cap 500). The queue is flushed in order on `visibilitychange→visible`, `online`, and once on script load via `queueMicrotask`. 4xx errors are dropped (replaying won't help). Idempotency caveat: the server still mints event ids, so a retry that already committed creates a duplicate row — fine for D.4.D1 because the outbox only fires on genuine transport failures (the request never reached the server). D.4.D2 will tighten this with client-issued ids + INSERT-IGNORE.
+- Auth screen has 2 tabs (Sign in / Sign up); the old Owner and Cloud tabs are gone.
+- Sign in: single "Email or username" + password + "Or email me a sign-in link instead" (magic-link fallback only fires when the input contains `@`).
+- Sign up: name + email + username + password + group code + admin code + owner code. Group code required unless owner code is present.
+- **`enterGroupAsCloudMember`** is the post-auth navigation helper for non-owner roles: pulls the latest snapshot, inserts local `groups[]` + `users[gid][i]` entries tagged with `cloudUserId`, and sets `session` so `me` resolves. Owners are a no-op (cloud bridge handles them).
+- The unified `signOut` revokes the cloud session AND clears local + impersonation state.
+- Pre-D.3 `shyft3_supers` localStorage key is pruned on first load via a one-shot block in `templates/shyft_head.v3.html` (marker `shyft3_migrate_prune_supers`).
 
-Soak gate before D.4.D2: 3+ days of normal use with zero `[shadow-diff]` errors in console.
+**Accounts management.** Owner-only surface in SuperDashboard (top-right "Accounts" button). [src/api/owner.js](src/api/owner.js) exposes:
+- `GET /api/owner/users` — lists users in caller's owned groups (self excluded, memberships rolled up).
+- `PATCH /api/owner/users/:uid` — change email and/or password (rejects self-edit, email collisions, short passwords).
+- `DELETE /api/owner/users/:uid` — drops memberships in caller's owned groups; if no memberships remain anywhere, fully tombstones (anonymizes email/display_name, NULLs username + password_hash, deletes sessions + login_tokens + password_attempts). Refuses to delete a user who owns any group.
+
+Frontend: `AccountsModal` lists users with kind/magic-link badges + (group, role) chips; `AccountsEditModal` and `AccountsDeleteModal` are the action surfaces.
+
+**D.4.A (backend foundation).** Allow-listed 13 event types in [src/api/events.js](src/api/events.js): the 12 wired in D.4.B (`user.create`, `user.update`, `user.delete`, `block.reset`, `shift.swap-admin`, `shift.trade-admin`, `trade.offer-post`, `trade.offer-accept`, `trade.offer-decline`, `incentive.open-set`, `config.update`, `unavail.reason`) plus a `snapshot.bootstrap` placeholder. `POST /api/events` now returns `{ id, serverTs }` (via `INSERT … RETURNING server_ts`). `MAX_PAYLOAD_BYTES` 16K → 64K to absorb cascade payloads. New `GET /api/events?gid=&since=&limit=&type=` paginated event tail (default 500, max 2000, soft 512 KB cap), ordered `(server_ts ASC, id ASC)`. **Consumers MUST dedupe by event `id`** because `server_ts` is second-granularity and several events can share a tick. `nextCursor` is the last returned `serverTs` (inclusive).
+
+**D.4.B (event payload wiring).** Wires the 12 new event types into the frontend and enriches several payloads:
+- `block.reconcile` carries `awarded` / `cleared` / `pointsDeltas` / `availPenalties` / `pointsAtClose` / `openIncentivesPatch` so the reducer doesn't have to re-derive the cascade.
+- `topOption.clear` and `topOption.unlink` carry `chainRepair` so the reducer can replay a chain split without `Math.random`.
+- `shift.flag` carries the auto-posted `listing` (created or pre-existing) so the reducer can replay the marketplace side effect.
+
+All 26 mutation paths in `ShiftApp.v3.jsx` now fire `trackEvent`, so the D1 event log is a complete record of state changes.
+
+**D.4.C (applyEvent reducer + offline validator).** Pure-function reducer (`applyEvent(state, evt)` in `templates/shyft_head.v3.html`, mirrored reference-only in the JSX preamble) maps each of the 26 event types onto a state transition. Deterministic: no `Date.now()`, no `Math.random()`, no clock reads — all stamping data either lives in payload (D.4.B's enrichments) or is derived from existing state. Idempotency via a FIFO `appliedEventIds` ring (cap 200). Unknown event types are forward-compat no-ops. Validator: `window.__shiftValidator.run()` (cloud-owner only) pulls the latest snapshot, replays every newer event through `applyEvent`, and deep-diffs the result against live state. Soak passed `✅ 0 divergences` across all event types.
+
+**D.4.D1 (dual-write shadow diff + event outbox).** Two additive pieces — localStorage still authoritative.
+
+- **Shadow diff.** `trackEvent` is now a dispatcher: snapshots live state synchronously (via `validatorLiveRef`, updated render-time so the deferred compare sees post-mutation state), schedules a `setTimeout(0)` to replay the event through `applyEvent` against that snapshot, and diffs against the now-updated live state. Mismatches log a grouped `[shadow-diff] ❌` console error. Runs unconditionally for cloud-signed-in users on cloud-mirrored groups. Cost ≈ sub-ms per event. Every divergence = a real reducer bug.
+- **Event outbox.** `window.api.postEvent(body)` wraps the `/api/events` POST; on transport failure or 5xx/408/429 the body is parked in `localStorage.shyft3_evt_outbox` (cap 500). Flushed in order on `visibilitychange→visible`, `online`, and once on load via `queueMicrotask`. 4xx errors are dropped. Idempotency caveat: server still mints event ids, so a retry that already committed creates a duplicate row — fine here because the outbox only fires on genuine transport failures (request never reached the server). D.4.D2 will tighten this with client-issued ids + INSERT-IGNORE.
+
+**Soak gate before D.4.D2:** 3+ days of normal use with zero `[shadow-diff]` errors in console.
 
 ---
 
@@ -219,28 +205,28 @@ This is a hobby project on a personal token budget. Follow these rules to keep i
 **Never read the wrong files**
 - **`legacy/` is off-limits.** Never Read, never grep. v1/v2 are frozen archives kept only for git history.
 - **Never Read `shyft-v3.html`** (the built artifact). It's regenerated by the build script and is just `head + JSX + tail` concatenated. To inspect content, Read `ShiftApp.v3.jsx` (or the head/tail templates). The *only* valid use of `shyft-v3.html` is the brace-count sanity pipe.
-- **Never Read `Phases for Shyft and Rules for shift assignment.docx`, `Test logins.xlsx`, `svg code for logos.docx`, or any image** unless explicitly asked. They are large, binary-ish, and rarely useful for code work.
+- **Never Read `Phases for Shyft and Rules for shift assignment.docx`, `Test logins.xlsx`, `svg code for logos.docx`, or any image** unless explicitly asked.
 
 **Read large files in slices**
-- `ShiftApp.v3.jsx` is ~7000 lines. **Always grep first** to find line numbers, then Read with `offset` + `limit`. A whole-file Read is almost always wasteful.
-- Same rule applies to `templates/shyft_head.v3.html` (~600 lines) when in doubt.
+- `ShiftApp.v3.jsx` is ~6300 lines. **Always grep first** to find line numbers, then Read with `offset` + `limit`.
+- Same rule applies to `templates/shyft_head.v3.html` (~1100 lines) when in doubt.
 
 **Filter your greps**
-- Default include filters: `--include="*.jsx" --include="*.html" --include="*.md"`. This skips the .docx/.xlsx/.png assets, the simulators, and the test-logins file.
+- Default include filters: `--include="*.jsx" --include="*.html" --include="*.md"`. Skips .docx/.xlsx/.png assets and the test-logins file.
 - Adding `--exclude-dir=legacy` belt-and-suspenders if grepping recursively.
 
 **Don't repeat work**
-- If you greped for a symbol earlier in the session and saw the line numbers, **don't grep for it again.** Note line numbers from earlier output and Read directly.
+- If you greped for a symbol earlier and saw the line numbers, **don't grep for it again.** Read directly.
 - After a rebuild, **don't Read the built artifact to verify.** The brace-count pipe + a targeted grep for new symbols is sufficient.
 
 **Tool choice**
-- For multi-occurrence renames, use `Edit` with `replace_all: true` (one tool call), not many small Edits.
+- For multi-occurrence renames, use `Edit` with `replace_all: true` (one tool call).
 - Skip `TodoWrite` for ≤3-step tasks.
 - Prefer `Edit` (sends the diff) over `Write` (sends the whole file) when modifying existing files.
 
 **Keep prose tight**
 - Skip long preambles ("let me check X, then Y, then Z"). Just do it.
-- For design discussions, cap proposed alternatives at ~3 short bullets each, not nested sub-lists.
+- For design discussions, cap proposed alternatives at ~3 short bullets each.
 
 ---
 
@@ -334,17 +320,18 @@ Each entry can carry `confirm: "ok"|"flagged"` and `flagReason: string`. Provide
 
 `computeAutoSwap(dateKey, slotId, originalUid)` returns the best swap candidate or `null`. Filters: prefers the date, below max, not blocked, has seniority, not already on this day. Tiebreak: highest `snapshotPtsForReconcile()` then lowest uid.
 
-### Marketplace (take-style trades)
+### Marketplace (take + two-sided trades)
 
 ```js
 marketplace[i] = {
   id, dateKey, slotId, sellerId, incentivePts,
   postedAt, status: "open"|"taken"|"cancelled",
-  takenBy?, takenAt?, autoPosted?, flagReason?
+  takenBy?, takenAt?, autoPosted?, flagReason?,
+  offers?: [{ id, offererId, offererDateKey, offererSlotId, incentivePts, status }]
 }
 ```
 
-Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`. Listings appear in the **Trades** page (in nav for both providers and admin). Open count badged on nav. Two-sided swaps NOT implemented (only one-sided post-for-take).
+Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`, `offerTrade`, `acceptTradeOffer`, `declineTradeOffer`. Listings appear in the **Trades** page (in nav for both providers and admin). Open count badged on nav.
 
 ---
 
@@ -356,6 +343,7 @@ Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`. Listing
 - **No external state libs.** Plain `useState`. Persistence via `window.storage` (a thin localStorage wrapper).
 - **Compact code, dense comments.** The codebase favors slightly-dense JSX with explanatory comments above complex blocks rather than spreading things out. Match this style.
 - **Source-tag awarded entries.** When awarding a shift, set `source` to one of: `pool` | `pool-solo` | `cascade` | `preferred-auto` | `available-auto` | `auto-swap` | `marketplace` | `admin`. The block report attributes by source.
+- **Determinism for `applyEvent`.** Anything inside an `EVENT_HANDLERS` branch must be pure — no `Date.now()`, no `Math.random()`, no clock reads. If a handler needs entropy or a timestamp, the producer in `ShiftApp.v3.jsx` must capture it into the event payload (see D.4.B's `chainRepair`, `listing`, `awarded` enrichments).
 - **No emojis in code unless they're already part of the UX vocabulary** (🎯 ⭐ ✕ ⚙ 📣). User explicitly favors emoji UI for state markers.
 
 ---
@@ -369,23 +357,36 @@ Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`. Listing
 - ✅ Confirm/Flag UI on My Shifts
 - ✅ Auto-swap engine on flag
 - ✅ Take-style marketplace + Trades page + nav badge
+- ✅ Two-sided trades (post-offer / accept / decline)
+- ✅ Admin-added incentive points on open shifts (`openIncentives` slice)
 - ✅ Calendar/ScheduleList read-only mode in Reconciliation+ (hide personal preferred/blocked overlays)
 - ✅ Lock/Unlock confirm modals
 - ✅ Block report (source-bucketed per-provider counts)
 - ✅ Alerts module on admin dashboard
 - ✅ **v3.1: Top Option model replacing per-slot pools**
+- ✅ Phase A backend: magic-link auth, owner-issued invites (Cloudflare Worker + D1 + R2)
+- ✅ Phase B event log (`POST /api/events` + 26 wired types)
+- ✅ Phase C snapshot sync (debounced upload + Sync banner + Restore card)
+- ✅ Phase D.1/D.2/D.2.5: password auth, one-shot migration, cloud-owner bridge + impersonation
+- ✅ Phase D.3: cloud-backed signup + sign in, owner Accounts page
+- ✅ Phase D.4.A: backend foundation (allow-list, `GET /api/events` tail, payload-size bump)
+- ✅ Phase D.4.B: full `trackEvent` coverage + payload enrichments
+- ✅ Phase D.4.C: `applyEvent` reducer + offline validator
+- 🟡 Phase D.4.D1: dual-write shadow diff + event outbox (shipped, **in soak**)
 
 ### Pending (deferred by user)
-- ⏳ **Lock-time point crediting** ("Step 2"). Today, points credit at reconcile via `users.points` directly. Spec wants `users.points` (locked balance) split from `pendingPoints[blockId]` (this block's accruals), with pending → locked at the Lock transition. Marketplace incentive points already move at take-time, but the snapshot-vs-live points distinction isn't fully wired.
-- ⏳ Two-sided trades (swap my Friday for your Sunday). Currently only one-sided takes.
-- ⏳ Admin-added incentive points on open shifts (separate from marketplace seller incentives).
+- ⏳ **Lock-time point crediting** ("Step 2"). Today points credit at reconcile via `users.points` directly. Spec wants `users.points` (locked balance) split from `pendingPoints[blockId]` (this block's accruals), with pending → locked at the Lock transition.
 - ⏳ Schedule snapshot at Lock (frozen "My final schedule" view per user, persisted with the block).
+- ⏳ Phase D.4.D2: cloud-authoritative cutover. Plan in `~/.claude/plans/crispy-twirling-nest.md`.
+- ⏳ Phase D.4.E: polish (UUID event ids, retired `Date.now()` ids, etc.).
+- ⏳ R2 monthly event-log archival (deferred until corpus grows).
+- ⏳ Mandatory `If-Match` on snapshot uploads (concurrency control beyond last-write-wins).
 
 ---
 
 ## Verification quick reference
 
-Build + brace check + symbol presence:
+Build + brace check:
 
 ```bash
 # Run from the project root (the folder that contains ShiftApp.v3.jsx and templates/).
@@ -402,6 +403,11 @@ Smoke test (open `shyft-v3.html` in browser):
 5. Provider → Mine → confirm one shift, flag another (try both auto-swap and no-candidate paths)
 6. Trades page → take a listed shift as another provider
 7. Admin → Lock block
+
+D.4 verification (cloud-signed-in owner only):
+- DevTools console should stay quiet — any `[shadow-diff] ❌` line is a real reducer bug. Screenshot + diagnose before shipping the next change.
+- After a batch of events, run `await window.__shiftValidator.run()` in DevTools; expect `✅ 0 divergences`.
+- Outbox check: DevTools → Network → Offline → fire one event → Online → confirm `localStorage.getItem("shyft3_evt_outbox") === "[]"` after the flush.
 
 ---
 
