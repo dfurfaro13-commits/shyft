@@ -1163,6 +1163,14 @@ export default function ShiftApp() {
   // for moving to D.4.D1 is "0 divergences across normal use for one full day."
   // Requires an active group (currentGroup.cloudGroupId) so there's live state
   // to compare against — on SuperDashboard there's nothing loaded to diff.
+  //
+  // Live state is fed in via a ref so the installed validator stays valid
+  // across state-driven re-renders (otherwise a re-render during an in-flight
+  // run() would tear the validator down and the next call would throw).
+  const validatorLiveRef = useRef(null);
+  useEffect(() => {
+    validatorLiveRef.current = { users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config };
+  });
   useEffect(() => {
     const isCloudOwner = !!cloudUser && (
       cloudUser.memberships?.some(m => m.role === "owner") ||
@@ -1207,7 +1215,9 @@ export default function ShiftApp() {
           }
           let state = base;
           for (const evt of all) state = applyEvent(state, evt);
-          const live = { users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config };
+          // Always read live state via the ref so we get the latest snapshot
+          // even if the component re-rendered during the in-flight fetch.
+          const live = validatorLiveRef.current || {};
           const diffs = diffState(state, live);
           if (diffs.length === 0) {
             console.log(`%c[validator] ✅ 0 divergences · replayed ${all.length} events from snap@${snap.serverTs}`, "color:green;font-weight:bold");
@@ -1228,7 +1238,7 @@ export default function ShiftApp() {
       },
     };
     return () => { if (typeof window !== "undefined" && window.__shiftValidator) delete window.__shiftValidator; };
-  }, [cloudUser, currentGroup?.cloudGroupId, users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config]);
+  }, [cloudUser, currentGroup?.cloudGroupId]);
 
   /* ── Super-admin helpers ── */
   const createGroup = async (name) => {
