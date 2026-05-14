@@ -1154,13 +1154,21 @@ export default function ShiftApp() {
     window.api.fetchJSON("/api/events", { method: "POST", body: JSON.stringify(body) }).catch(()=>{});
   };
 
-  // D.4.C — offline validator. Owner-only. No UI; access from DevTools as
+  // D.4.C — offline validator. Cloud-owner only (works during impersonation —
+  // `me.role` flips to admin/provider then, so we gate on cloudUser owner
+  // membership instead). No UI; access from DevTools as
   // `await window.__shiftValidator.run()`. Pulls the latest snapshot, replays
   // every event newer than its server_ts through applyEvent, and deep-diffs the
   // result against the current live state. Logs to console. Acceptance gate
   // for moving to D.4.D1 is "0 divergences across normal use for one full day."
+  // Requires an active group (currentGroup.cloudGroupId) so there's live state
+  // to compare against — on SuperDashboard there's nothing loaded to diff.
   useEffect(() => {
-    if (!cloudUser || !currentGroup?.cloudGroupId || me?.role !== "super") {
+    const isCloudOwner = !!cloudUser && (
+      cloudUser.memberships?.some(m => m.role === "owner") ||
+      cloudUser.user?.canCreateGroups
+    );
+    if (!isCloudOwner || !currentGroup?.cloudGroupId) {
       if (typeof window !== "undefined" && window.__shiftValidator) delete window.__shiftValidator;
       return;
     }
@@ -1216,7 +1224,7 @@ export default function ShiftApp() {
       },
     };
     return () => { if (typeof window !== "undefined" && window.__shiftValidator) delete window.__shiftValidator; };
-  }, [cloudUser, currentGroup?.cloudGroupId, me?.role, users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config]);
+  }, [cloudUser, currentGroup?.cloudGroupId, users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config]);
 
   /* ── Super-admin helpers ── */
   const createGroup = async (name) => {
