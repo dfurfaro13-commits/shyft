@@ -421,8 +421,143 @@ export default function ShiftApp() {
     })();
   }, []);
 
+  // D.4.D2 Phase 1: cloud-authoritative load. Returns internal-shape state
+  // (unavailability/preferences keys) or null on any failure — caller falls
+  // through to the localStorage-only path. Reverse-sync guard: if local
+  // lastModified is newer than the cloud snapshot, push local up first so we
+  // don't lose offline edits captured during the D.4.B → D.4.D2 window.
+  // Read the local groups list from React state, falling back to localStorage
+  // for the boot race where setGroups hasn't yet committed when loadGroup fires.
+  const findLocalGroup = (gid) => {
+    const fromState = groups.find(g => g.id === gid);
+    if (fromState) return fromState;
+    try {
+      const raw = localStorage.getItem("shyft3_groups");
+      if (raw) return (JSON.parse(raw) || []).find(g => g.id === gid) || null;
+    } catch {}
+    return null;
+  };
+
+  const loadGroupFromCloud = async (gid, cloudGid) => {
+    try {
+      // 1. Fetch the latest snapshot (or 404 → null).
+      let snap = null;
+      try {
+        snap = await window.api.fetchJSON("/api/snapshots/" + encodeURIComponent(cloudGid) + "/latest");
+      } catch (e) {
+        if (e?.status !== 404) throw e;
+      }
+
+      // 2. Reverse-sync guard. If local is newer than cloud (or cloud is empty),
+      // upload local first and use the resulting serverTs as the replay baseline.
+      let localLastModified = 0;
+      try { localLastModified = parseInt(localStorage.getItem("shyft3_g" + gid + "_lastModified") || "0", 10) || 0; } catch {}
+      const cloudClientTs = snap?.clientTs || 0;
+      if (!snap || localLastModified > cloudClientTs) {
+        const g = findLocalGroup(gid);
+        if (g) {
+          const local = readGroupStateFromStorage(gid);
+          const payload = {
+            meta: {
+              name: g.name, groupCode: g.groupCode, adminCode: g.adminCode,
+              createdAt: g.createdAt, cloudGroupId: g.cloudGroupId,
+            },
+            ...local,
+          };
+          const clientTs = Date.now();
+          try {
+            const r = await window.api.fetchJSON("/api/snapshots", {
+              method: "POST",
+              body: JSON.stringify({ groupId: cloudGid, payload, clientTs }),
+            });
+            snap = { payload, clientTs, serverTs: r?.serverTs ?? 0 };
+          } catch {
+            // Upload failed — if we have a cloud snapshot, trust it; otherwise bail.
+            if (!snap?.payload) return null;
+          }
+        }
+      }
+      if (!snap?.payload) return null;
+
+      // 3. Build base state from snapshot (map wire keys → internal keys).
+      let state = {
+        users: snap.payload.users || [],
+        config: snap.payload.config || DEFAULT_CONFIG,
+        shifts: snap.payload.shifts || {},
+        unavailability: snap.payload.unavail || {},
+        preferences: snap.payload.prefs || {},
+        topOptions: snap.payload.topOptions || {},
+        marketplace: snap.payload.marketplace || [],
+        openIncentives: snap.payload.openIncentives || {},
+        appliedEventIds: [],
+      };
+
+      // 4. Pull events strictly newer than snap.serverTs and replay through applyEvent.
+      let cursor = (snap.serverTs ?? 0) + 1;
+      const all = [];
+      for (let i = 0; i < 50; i++) {
+        const r = await window.api.fetchJSON("/api/events?gid=" + encodeURIComponent(cloudGid) + "&since=" + cursor + "&limit=2000");
+        const batch = r?.events || [];
+        if (!batch.length) break;
+        all.push(...batch);
+        if (!r.nextCursor) break;
+        cursor = r.nextCursor + 1;
+      }
+      for (const evt of all) state = applyEvent(state, evt);
+
+      // 5. Stamp cursor for Phase 2's polling loop and align lastModified to the snapshot.
+      const lastSeenTs = all.length ? all[all.length - 1].serverTs : (snap.serverTs ?? 0);
+      try { localStorage.setItem("shyft3_g" + gid + "_lastSeenServerTs", String(lastSeenTs)); } catch {}
+      try { localStorage.setItem("shyft3_g" + gid + "_lastModified", String(snap.clientTs || Date.now())); } catch {}
+
+      return state;
+    } catch (e) {
+      console.warn("[loadGroupFromCloud] failed, falling back to local:", e?.message || e);
+      return null;
+    }
+  };
+
+  // Write the post-replay (or post-snapshot) state back to localStorage so the
+  // existing local-only code paths and the next loadGroup keep working without
+  // a network round-trip. Same key shape as buildSnapshotPayload's wire format
+  // (unavail/prefs), not the internal React shape.
+  const writeGroupStateToStorage = (gid, state) => {
+    const writeKey = (k, v) => { try { localStorage.setItem("shyft3_" + gKey(gid, k), JSON.stringify(v)); } catch {} };
+    writeKey("users",          state.users || []);
+    writeKey("config",         state.config || DEFAULT_CONFIG);
+    writeKey("shifts",         state.shifts || {});
+    writeKey("unavail",        state.unavailability || {});
+    writeKey("prefs",          state.preferences || {});
+    writeKey("marketplace",    state.marketplace || []);
+    writeKey("topOptions",     state.topOptions || {});
+    writeKey("openIncentives", state.openIncentives || {});
+  };
+
   const loadGroup = async (gid) => {
     setGroupId(gid);
+
+    // D.4.D2 Phase 1: if the group is cloud-mirrored AND the user is cloud-signed-in,
+    // load from cloud (snapshot + event-tail replay) and write through to localStorage.
+    // Falls through to the local-only path on any failure so we degrade gracefully when
+    // offline or the Worker is unavailable.
+    const localGroup = findLocalGroup(gid);
+    if (cloudUser && localGroup?.cloudGroupId) {
+      const cloudState = await loadGroupFromCloud(gid, localGroup.cloudGroupId);
+      if (cloudState) {
+        writeGroupStateToStorage(gid, cloudState);
+        setUsers(cloudState.users || []);
+        setConfig({ ...DEFAULT_CONFIG, ...(cloudState.config || {}) });
+        setShifts(cloudState.shifts || {});
+        setUnavailability(cloudState.unavailability || {});
+        setPreferences(cloudState.preferences || {});
+        setTopOptions(cloudState.topOptions || {});
+        setMarketplace(cloudState.marketplace || []);
+        setOpenIncentives(cloudState.openIncentives || {});
+        return;
+      }
+      // cloudState === null → fall through to local path below
+    }
+
     try { const r = await window.storage.get(gKey(gid,"users"),true).catch(()=>null); setUsers(r?JSON.parse(r.value):[]); } catch{ setUsers([]); }
     try {
       const r = await window.storage.get(gKey(gid,"config"),true).catch(()=>null);
