@@ -1277,33 +1277,40 @@ function ShiftApp() {
         if (e?.status !== 404) throw e;
       }
 
-      // 2. Reverse-sync guard. If local is newer than cloud (or cloud is empty),
-      // upload local first and use the resulting serverTs as the replay baseline.
-      let localLastModified = 0;
-      try { localLastModified = parseInt(localStorage.getItem("shyft3_g" + gid + "_lastModified") || "0", 10) || 0; } catch {}
-      const cloudClientTs = snap?.clientTs || 0;
-      if (!snap || localLastModified > cloudClientTs) {
+      // 2. Reverse-sync guard. ONLY bootstrap from local when cloud has no snapshot
+      // at all AND local has actual data — never just because local's lastModified
+      // is numerically larger. The "newer timestamp" heuristic wiped a group on
+      // 2026-05-12: local's lastModified can be stamped without the per-group data
+      // keys being populated (Phase C's empty-payload bug, or any future analog),
+      // and reverse-syncing in that state pushes an empty payload up. New rule:
+      // trust cloud whenever it has a payload; otherwise check local has real data
+      // before uploading. Any unsent edits should live in the D.4.D1 event outbox
+      // and will flush via visibilitychange.
+      if (!snap?.payload) {
         const g = findLocalGroup(gid);
-        if (g) {
-          const local = readGroupStateFromStorage(gid);
-          const payload = {
-            meta: {
-              name: g.name, groupCode: g.groupCode, adminCode: g.adminCode,
-              createdAt: g.createdAt, cloudGroupId: g.cloudGroupId,
-            },
-            ...local,
-          };
-          const clientTs = Date.now();
-          try {
-            const r = await window.api.fetchJSON("/api/snapshots", {
-              method: "POST",
-              body: JSON.stringify({ groupId: cloudGid, payload, clientTs }),
-            });
-            snap = { payload, clientTs, serverTs: r?.serverTs ?? 0 };
-          } catch {
-            // Upload failed — if we have a cloud snapshot, trust it; otherwise bail.
-            if (!snap?.payload) return null;
-          }
+        if (!g) return null;
+        const local = readGroupStateFromStorage(gid);
+        const hasLocalData =
+          (Array.isArray(local.users) && local.users.length > 0) ||
+          (local.shifts && Object.keys(local.shifts).length > 0) ||
+          (local.config && Array.isArray(local.config.blocks) && local.config.blocks.length > 0);
+        if (!hasLocalData) return null; // Nothing on cloud, nothing locally — let caller fall through.
+        const payload = {
+          meta: {
+            name: g.name, groupCode: g.groupCode, adminCode: g.adminCode,
+            createdAt: g.createdAt, cloudGroupId: g.cloudGroupId,
+          },
+          ...local,
+        };
+        const clientTs = Date.now();
+        try {
+          const r = await window.api.fetchJSON("/api/snapshots", {
+            method: "POST",
+            body: JSON.stringify({ groupId: cloudGid, payload, clientTs }),
+          });
+          snap = { payload, clientTs, serverTs: r?.serverTs ?? 0 };
+        } catch {
+          return null;
         }
       }
       if (!snap?.payload) return null;
@@ -1350,7 +1357,24 @@ function ShiftApp() {
   // existing local-only code paths and the next loadGroup keep working without
   // a network round-trip. Same key shape as buildSnapshotPayload's wire format
   // (unavail/prefs), not the internal React shape.
+  //
+  // Safety guard (incident 2026-05-12): if the incoming cloud state has no
+  // users / no shifts / no blocks AND local already has data, refuse to
+  // overwrite. Cloud being empty means either a legitimate empty group
+  // (handled separately by the load fallback) or a corrupted snapshot we
+  // shouldn't propagate. Better to keep stale local than to wipe.
   const writeGroupStateToStorage = (gid, state) => {
+    const incomingEmpty =
+      (!Array.isArray(state.users) || state.users.length === 0) &&
+      (!state.shifts || Object.keys(state.shifts).length === 0) &&
+      (!state.config || !Array.isArray(state.config.blocks) || state.config.blocks.length === 0);
+    if (incomingEmpty) {
+      const existingUsers = (() => { try { return JSON.parse(localStorage.getItem("shyft3_" + gKey(gid, "users")) || "[]"); } catch { return []; } })();
+      if (existingUsers.length > 0) {
+        console.warn("[writeGroupStateToStorage] refusing to overwrite non-empty local with empty cloud state for", gid);
+        return;
+      }
+    }
     const writeKey = (k, v) => { try { localStorage.setItem("shyft3_" + gKey(gid, k), JSON.stringify(v)); } catch {} };
     writeKey("users",          state.users || []);
     writeKey("config",         state.config || DEFAULT_CONFIG);
@@ -1908,6 +1932,19 @@ function ShiftApp() {
     try {
       const payload = buildSnapshotPayload(groupId);
       if (!payload) return;
+      // Safety guard (incident 2026-05-12): never upload an empty snapshot. The Phase C
+      // uploader captures live state via snapshotStateRef and posts on a 2s debounce —
+      // if the user navigates away mid-debounce and React state goes empty before the
+      // timer fires, this would otherwise wipe the cloud group. Phase C must never
+      // destroy data; if a group genuinely needs to be cleared it goes through Delete.
+      const isEmpty =
+        (!Array.isArray(payload.users) || payload.users.length === 0) &&
+        (!payload.shifts || Object.keys(payload.shifts).length === 0) &&
+        (!payload.config || !Array.isArray(payload.config.blocks) || payload.config.blocks.length === 0);
+      if (isEmpty) {
+        console.warn("[uploadSnapshot] refusing to upload empty payload for group", groupId);
+        return;
+      }
       const clientTs = Date.now();
       try { localStorage.setItem(`shyft3_g${groupId}_lastModified`, String(clientTs)); } catch {}
       await window.api.fetchJSON("/api/snapshots", {
