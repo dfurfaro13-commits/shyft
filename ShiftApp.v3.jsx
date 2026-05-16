@@ -1509,7 +1509,17 @@ export default function ShiftApp() {
       cloudUser.user?.canCreateGroups
     );
     if (!isCloudOwner || !currentGroup?.cloudGroupId) {
-      if (typeof window !== "undefined" && window.__shiftValidator) delete window.__shiftValidator;
+      // Install a stub so the call doesn't throw an unhelpful "Cannot read
+      // properties of undefined". Common case: owner is on SuperDashboard and
+      // tries to run the validator before opening / impersonating into a group.
+      if (typeof window !== "undefined") {
+        window.__shiftValidator = {
+          async run() {
+            console.warn("[validator] no active group — open or impersonate into a cloud-mirrored group first");
+            return null;
+          },
+        };
+      }
       return;
     }
     const gid = currentGroup.cloudGroupId;
