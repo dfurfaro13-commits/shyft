@@ -31,6 +31,106 @@ async function callerCanManage(env, callerId, targetId) {
   return !!row;
 }
 
+// GET /api/owner/snapshots/:gid/r2-list
+//   Lists R2 snapshot history for a group the caller owns. Used for manual recovery
+//   when the latest D1 snapshot has been corrupted (e.g. an empty-payload wipe). Returns
+//   up to `limit` (default 50, max 500) keys, sorted server_ts descending.
+export async function listSnapshotHistory(req, env, { gid }) {
+  const caller = await getSessionUser(env, req);
+  if (!caller) return err(401, "unauthorized");
+  const ownedIds = await callerOwnedGroupIds(env, caller.id);
+  if (!ownedIds.includes(gid)) return err(403, "not_owner");
+  if (!env.R2) return err(503, "r2_unavailable");
+
+  const url = new URL(req.url);
+  const limitRaw = +url.searchParams.get("limit");
+  const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, Math.floor(limitRaw))) : 50;
+
+  const prefix = `snapshots/${gid}/`;
+  const result = await env.R2.list({ prefix, limit: 1000 });
+  const all = (result.objects || []).map(o => ({
+    key: o.key,
+    size: o.size,
+    uploaded: o.uploaded,
+    serverTs: parseInt(o.customMetadata?.serverTs || "0", 10) || 0,
+    clientTs: parseInt(o.customMetadata?.clientTs || "0", 10) || 0,
+  }));
+  all.sort((a, b) => b.serverTs - a.serverTs);
+  return json({
+    groupId: gid,
+    count: all.length,
+    items: all.slice(0, limit),
+    truncated: !!result.truncated,
+  });
+}
+
+// POST /api/owner/snapshots/:gid/restore  { r2Key }
+//   Reads the named R2 object and writes its payload back as both the latest D1 snapshot
+//   AND a fresh R2 history entry. Owner-only. Path-scoped: the r2Key must be under this
+//   group's prefix, so an owner of group A cannot read group B's history.
+export async function restoreSnapshot(req, env, { gid }) {
+  const csrf = requireCsrfHeader(req);
+  if (csrf) return csrf;
+  const caller = await getSessionUser(env, req);
+  if (!caller) return err(401, "unauthorized");
+  const ownedIds = await callerOwnedGroupIds(env, caller.id);
+  if (!ownedIds.includes(gid)) return err(403, "not_owner");
+  if (!env.R2) return err(503, "r2_unavailable");
+
+  const body = await readJson(req);
+  const r2Key = String(body.r2Key || "");
+  const expectedPrefix = `snapshots/${gid}/`;
+  if (!r2Key.startsWith(expectedPrefix)) return err(400, "key_not_for_this_group");
+
+  const obj = await env.R2.get(r2Key);
+  if (!obj) return err(404, "r2_object_not_found");
+
+  const payloadStr = await obj.text();
+  let payload;
+  try { payload = JSON.parse(payloadStr); } catch { return err(400, "r2_object_not_json"); }
+
+  const clientTs = Date.now();
+  const serverTs = nowSec();
+
+  await exec(
+    env,
+    `INSERT INTO snapshots (group_id, user_id, payload, client_ts, server_ts)
+       VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(group_id) DO UPDATE SET
+       user_id   = excluded.user_id,
+       payload   = excluded.payload,
+       client_ts = excluded.client_ts,
+       server_ts = excluded.server_ts`,
+    gid, caller.id, payloadStr, clientTs, serverTs,
+  );
+
+  const newKey = `snapshots/${gid}/${serverTs}-${clientTs}.json`;
+  try {
+    await env.R2.put(newKey, payloadStr, {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        groupId: gid,
+        userId: caller.id,
+        clientTs: String(clientTs),
+        serverTs: String(serverTs),
+        restoredFrom: r2Key,
+      },
+    });
+  } catch (e) {
+    console.error("R2 put on restore failed:", newKey, e?.message || e);
+  }
+
+  return json({
+    groupId: gid,
+    restoredFrom: r2Key,
+    newKey,
+    serverTs,
+    clientTs,
+    users: Array.isArray(payload?.users) ? payload.users.length : 0,
+    blocks: Array.isArray(payload?.config?.blocks) ? payload.config.blocks.length : 0,
+  });
+}
+
 // GET /api/owner/users
 //   Returns every user in the caller's owned groups, with their per-group memberships rolled
 //   into one entry. Excludes the caller themselves (owner manages everyone except self via this).

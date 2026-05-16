@@ -5,7 +5,7 @@ import { authRequest, authVerify, authPassword, authLogout, me } from "./auth.js
 import { authSignup } from "./signup.js";
 import { createGroup, createInvite, getInvite, migrateGroup } from "./groups.js";
 import { createUser } from "./users.js";
-import { listOwnerUsers, updateOwnerUser, deleteOwnerUser } from "./owner.js";
+import { listOwnerUsers, updateOwnerUser, deleteOwnerUser, listSnapshotHistory, restoreSnapshot } from "./owner.js";
 import { logEvent, listEvents } from "./events.js";
 import { putSnapshot, getLatestSnapshot } from "./snapshots.js";
 import { err } from "../lib/http.js";
@@ -29,6 +29,8 @@ const routes = [
   ["GET",    "/api/events",                       listEvents],
   ["POST",   "/api/snapshots",                    putSnapshot],
   ["GET",    "/api/snapshots/:groupId/latest",    getLatestSnapshot],
+  ["GET",    "/api/owner/snapshots/:gid/r2-list", listSnapshotHistory],
+  ["POST",   "/api/owner/snapshots/:gid/restore", restoreSnapshot],
 ];
 
 export async function handleApi(req, env) {
