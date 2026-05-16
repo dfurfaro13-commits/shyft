@@ -1230,6 +1230,104 @@ export default function ShiftApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupId, cloudUser, currentGroup?.cloudGroupId]);
 
+  // D.4.D2 Phase 2: periodic poll for cross-device sync. Pulls events newer than
+  // shyft3_g<gid>_lastSeenServerTs every 15s while the document is visible, replays
+  // each through applyEvent against current live state, and writes the result back
+  // through to React state + localStorage. Own events (localUid == me.id) are
+  // filtered out — they were already applied imperatively when this device fired
+  // them, so re-applying them via applyEvent would double-apply non-idempotent
+  // events like preference.toggle. Two-tabs-same-user is a known limitation:
+  // changes in tab A won't surface in tab B's poll until tab B reloads.
+  //
+  // Includes me?.id in deps so impersonation toggles restart the loop with the
+  // right "own events" filter; cheap (just one extra immediate poll).
+  useEffect(() => {
+    if (!groupId || !cloudUser || !currentGroup?.cloudGroupId) return;
+    const cloudGid = currentGroup.cloudGroupId;
+    const localGid = groupId;
+    const myId = me?.id;
+    let stopped = false;
+    let intervalId = null;
+    let inflight = false;
+
+    const poll = async () => {
+      if (stopped || inflight) return;
+      inflight = true;
+      try {
+        let cursor = 0;
+        try { cursor = parseInt(localStorage.getItem("shyft3_g" + localGid + "_lastSeenServerTs") || "0", 10) || 0; } catch {}
+        let nextCursor = cursor;
+        const otherEvents = [];
+        let cur = cursor + 1;
+        for (let i = 0; i < 20; i++) {
+          let r = null;
+          try {
+            r = await window.api.fetchJSON("/api/events?gid=" + encodeURIComponent(cloudGid) + "&since=" + cur + "&limit=500");
+          } catch {
+            return; // Transport error — try again next tick.
+          }
+          const batch = r?.events || [];
+          if (batch.length === 0) break;
+          for (const e of batch) {
+            if (e.localUid != null && String(e.localUid) === String(myId)) continue;
+            otherEvents.push(e);
+          }
+          nextCursor = batch[batch.length - 1].serverTs;
+          if (!r.nextCursor) break;
+          cur = r.nextCursor + 1;
+        }
+        if (stopped) return;
+
+        // Advance cursor even if everything was filtered out — we've "seen" them.
+        if (nextCursor > cursor) {
+          try { localStorage.setItem("shyft3_g" + localGid + "_lastSeenServerTs", String(nextCursor)); } catch {}
+        }
+        if (otherEvents.length === 0) return;
+
+        // Replay against current live state via the ref so we use post-render
+        // values (not stale closure values from when the effect ran).
+        const live = validatorLiveRef.current;
+        if (!live) return;
+        let state = { ...live, appliedEventIds: [] };
+        for (const evt of otherEvents) state = applyEvent(state, evt);
+        if (state.users         !== live.users)         setUsers(state.users);
+        if (state.shifts        !== live.shifts)        setShifts(state.shifts);
+        if (state.unavailability!== live.unavailability)setUnavailability(state.unavailability);
+        if (state.preferences   !== live.preferences)   setPreferences(state.preferences);
+        if (state.topOptions    !== live.topOptions)    setTopOptions(state.topOptions);
+        if (state.marketplace   !== live.marketplace)   setMarketplace(state.marketplace);
+        if (state.openIncentives!== live.openIncentives)setOpenIncentives(state.openIncentives);
+        if (state.config        !== live.config)        setConfig(state.config);
+        writeGroupStateToStorage(localGid, state);
+      } finally {
+        inflight = false;
+      }
+    };
+
+    const start = () => {
+      if (intervalId) return;
+      poll();
+      intervalId = setInterval(poll, 15000);
+    };
+    const stop = () => {
+      if (intervalId) { clearInterval(intervalId); intervalId = null; }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") start();
+      else stop();
+    };
+
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      stopped = true;
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupId, cloudUser, currentGroup?.cloudGroupId, me?.id]);
+
   // Phase D.2: read a non-active group's full state from localStorage so we can ship it
   // up during migration. (`buildSnapshotPayload` only works for the active group because
   // it sources from React state.)
@@ -6133,12 +6231,40 @@ export default function ShiftApp() {
   };
 
   // Phase D: "View as user" picker. Opened from a group card in SuperDashboard. Reads users
-  // for that group from localStorage (the group may not be loaded into state yet) and lists
-  // admins first, then providers, alpha by name. Click a user → startImpersonate.
+  // for that group from localStorage first; on a fresh device where local hasn't been
+  // populated yet (D.4.D2 cloud-first reads), falls back to pulling the cloud snapshot
+  // and reading users from there. Lists admins first, then providers, alpha by name.
+  // Click a user → startImpersonate (which calls loadGroup, which seeds localStorage
+  // from cloud properly).
   const ImpersonatePickerModal = () => {
+    const [cloudFallbackUsers, setCloudFallbackUsers] = useState(null);
+    const [cloudFallbackLoading, setCloudFallbackLoading] = useState(false);
+
+    useEffect(() => {
+      if (!impersonatePicker) { setCloudFallbackUsers(null); setCloudFallbackLoading(false); return; }
+      const { gid } = impersonatePicker;
+      const localUsers = readGroupKey(gid, "users", []);
+      if (localUsers.length > 0) return; // Local has data — no fetch needed.
+      const g = findLocalGroup(gid);
+      if (!g?.cloudGroupId || !cloudUser) return;
+      let cancelled = false;
+      setCloudFallbackLoading(true);
+      (async () => {
+        try {
+          const snap = await window.api.fetchJSON("/api/snapshots/" + encodeURIComponent(g.cloudGroupId) + "/latest");
+          if (!cancelled && Array.isArray(snap?.payload?.users)) setCloudFallbackUsers(snap.payload.users);
+        } catch {} finally {
+          if (!cancelled) setCloudFallbackLoading(false);
+        }
+      })();
+      return () => { cancelled = true; };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [impersonatePicker?.gid]);
+
     if (!impersonatePicker) return null;
     const { gid, gname } = impersonatePicker;
-    const gusers = readGroupKey(gid, "users", []);
+    const localUsers = readGroupKey(gid, "users", []);
+    const gusers = localUsers.length > 0 ? localUsers : (cloudFallbackUsers || []);
     const sorted = gusers.slice().sort((a,b) => {
       if (a.role !== b.role) return a.role === "admin" ? -1 : 1;
       return (a.name||"").localeCompare(b.name||"");
@@ -6150,7 +6276,9 @@ export default function ShiftApp() {
           <div className="font-semibold text-xl mb-1">View as user</div>
           <p className="text-sm text-slate-500 mb-3">Pick a user from <span className="font-medium">{gname}</span> to view the app as them. Use this to test functionality. Stop anytime via the banner at the top.</p>
           {sorted.length === 0 ? (
-            <div className="text-sm text-slate-500 italic py-4 text-center">No users in this group yet.</div>
+            <div className="text-sm text-slate-500 italic py-4 text-center">
+              {cloudFallbackLoading ? "Loading users from cloud…" : "No users in this group yet."}
+            </div>
           ) : (
             <div className="space-y-1.5 mb-3">
               {sorted.map(u => (
