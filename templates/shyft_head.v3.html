@@ -402,6 +402,19 @@
 
     const APPLIED_EVENTS_CAP = 200;
 
+    // Normalize a uid coming off the wire (where producers stringify defensively, and the
+    // Worker's events.js also stores localUid as TEXT) back to the numeric form used in
+    // state. user.id throughout v3 is a Date.now()-style integer; entry.uid and the
+    // swappedFrom/takenFrom/sellerId fields all need to match that type or shadow-diff
+    // catches a string-vs-number mismatch. Non-numeric values (future UUIDs) pass through
+    // unchanged so the helper stays safe if we ever broaden the id space.
+    function uidVal(v) {
+      if (v == null) return null;
+      if (typeof v === "number") return v;
+      const n = +v;
+      return Number.isFinite(n) ? n : v;
+    }
+
     function trackAppliedEventId(prev, id) {
       const arr = Array.isArray(prev) ? prev : [];
       if (arr.includes(id)) return arr;
@@ -770,7 +783,7 @@
             ...s.shifts,
             [dateKey]: {
               ...day,
-              [slotId]: { ...entry, uid: toUid, source: "auto-swap", swappedFrom: fromUid, confirm: null, flagReason: null },
+              [slotId]: { ...entry, uid: uidVal(toUid), source: "auto-swap", swappedFrom: uidVal(fromUid), confirm: null, flagReason: null },
             },
           },
           marketplace: closeAutoListingFor(s.marketplace, dateKey, slotId),
@@ -789,8 +802,8 @@
           ...s,
           shifts: {
             ...s.shifts,
-            [aDate]: { ...aDay, [aSlot]: { ...aEntry, uid: bUid, source: "auto-trade", swappedFrom: aUid, confirm: null, flagReason: null } },
-            [bDate]: { ...(s.shifts[bDate] || {}), [bSlot]: { ...bEntry, uid: aUid, source: "auto-trade", swappedFrom: bUid, confirm: null, flagReason: null } },
+            [aDate]: { ...aDay, [aSlot]: { ...aEntry, uid: uidVal(bUid), source: "auto-trade", swappedFrom: uidVal(aUid), confirm: null, flagReason: null } },
+            [bDate]: { ...(s.shifts[bDate] || {}), [bSlot]: { ...bEntry, uid: uidVal(aUid), source: "auto-trade", swappedFrom: uidVal(bUid), confirm: null, flagReason: null } },
           },
           marketplace: closeAutoListingFor(s.marketplace, aDate, aSlot),
         };
@@ -819,7 +832,7 @@
 
       "marketplace.take": (s, e) => {
         const { listingId } = e.payload || {};
-        const taker = e.localUid;
+        const taker = uidVal(e.localUid);
         if (!listingId || taker == null) return s;
         const listing = s.marketplace.find(l => l.id === listingId);
         if (!listing || listing.status !== "open") return s;
@@ -920,8 +933,8 @@
           ...s,
           shifts: {
             ...s.shifts,
-            [aDate]: { ...aDay, [aSlot]: { ...aEntry, uid: bUid, source: "trade", swappedFrom: aUid, confirm: null, flagReason: null } },
-            [bDate]: { ...(s.shifts[bDate] || {}), [bSlot]: { ...bEntry, uid: aUid, source: "trade", swappedFrom: bUid, confirm: null, flagReason: null } },
+            [aDate]: { ...aDay, [aSlot]: { ...aEntry, uid: uidVal(bUid), source: "trade", swappedFrom: uidVal(aUid), confirm: null, flagReason: null } },
+            [bDate]: { ...(s.shifts[bDate] || {}), [bSlot]: { ...bEntry, uid: uidVal(aUid), source: "trade", swappedFrom: uidVal(bUid), confirm: null, flagReason: null } },
           },
         };
         if (pointsTransferred && Object.keys(pointsTransferred).length) {
