@@ -94,6 +94,24 @@ const inBlock = (k, cfg) => { const b = currentBlockOf(cfg); return !!(b && k >=
 const gKey = (gid, k) => `g${gid}_${k}`;
 const genCode = (len=6) => { const c="ABCDEFGHJKMNPQRSTUVWXYZ23456789"; let s=""; for(let i=0;i<len;i++) s+=c[Math.floor(Math.random()*c.length)]; return s; };
 
+// D.4.D2 Phase 2.1 — per-tab client ID (reference-only mirror; runtime copy in head template).
+// Stamped into every event payload by trackEvent. Cross-device poll uses it to skip events this
+// exact tab fired (filter that replaces the previous `localUid == me.id` false-positive that
+// kept two-windows-of-the-same-user from syncing).
+const SHYFT_CLIENT_ID = (() => {
+  try {
+    const k = "shyft3_client_id";
+    let v = sessionStorage.getItem(k);
+    if (!v) {
+      v = (crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : (Date.now() + "-" + Math.random().toString(36).slice(2));
+      sessionStorage.setItem(k, v);
+    }
+    return v;
+  } catch { return null; }
+})();
+
 // ════════════════════════════════════════════════════════════════════════════
 // D.4.C — applyEvent reducer (REFERENCE-ONLY MIRROR)
 //
@@ -1233,14 +1251,17 @@ export default function ShiftApp() {
   // D.4.D2 Phase 2: periodic poll for cross-device sync. Pulls events newer than
   // shyft3_g<gid>_lastSeenServerTs every 15s while the document is visible, replays
   // each through applyEvent against current live state, and writes the result back
-  // through to React state + localStorage. Own events (localUid == me.id) are
-  // filtered out — they were already applied imperatively when this device fired
-  // them, so re-applying them via applyEvent would double-apply non-idempotent
-  // events like preference.toggle. Two-tabs-same-user is a known limitation:
-  // changes in tab A won't surface in tab B's poll until tab B reloads.
+  // through to React state + localStorage.
+  //
+  // Own-tab filter (D.4.D2 Phase 2.1): events stamped with this tab's SHYFT_CLIENT_ID
+  // are skipped — they were already applied imperatively on this exact tab and
+  // applyEvent isn't idempotent for toggles. Events with a different clientId (other
+  // tab, other device, same user or not) replay normally. Pre-2.1 events that lack
+  // a clientId fall back to the legacy `localUid == me.id` filter so events still in
+  // the polling window after a deploy aren't double-applied.
   //
   // Includes me?.id in deps so impersonation toggles restart the loop with the
-  // right "own events" filter; cheap (just one extra immediate poll).
+  // right legacy-fallback filter; cheap (just one extra immediate poll).
   useEffect(() => {
     if (!groupId || !cloudUser || !currentGroup?.cloudGroupId) return;
     const cloudGid = currentGroup.cloudGroupId;
@@ -1269,7 +1290,16 @@ export default function ShiftApp() {
           const batch = r?.events || [];
           if (batch.length === 0) break;
           for (const e of batch) {
-            if (e.localUid != null && String(e.localUid) === String(myId)) continue;
+            const evtClientId = e.payload?.clientId;
+            if (evtClientId) {
+              // Modern path (Phase 2.1+): trust the per-tab stamp.
+              if (evtClientId === SHYFT_CLIENT_ID) continue;
+            } else {
+              // Legacy fallback: pre-2.1 events have no clientId. Approximate with
+              // the user-identity filter (loses two-windows-same-user sync, same as
+              // pre-2.1 behavior — acceptable for in-flight events at deploy time).
+              if (e.localUid != null && String(e.localUid) === String(myId)) continue;
+            }
             otherEvents.push(e);
           }
           nextCursor = batch[batch.length - 1].serverTs;
@@ -1437,10 +1467,14 @@ export default function ShiftApp() {
   //      been mirrored to D1 (nothing to write to and nothing to diff against).
   const trackEvent = (type, payload, opts = {}) => {
     if (!cloudUser || !currentGroup?.cloudGroupId) return;
+    // D.4.D2 Phase 2.1: stamp clientId into every payload so the cross-device
+    // poll on other tabs/devices can identify (and skip) events this tab fired.
+    // Untouched by the reducer — applyEvent only reads named slice fields.
+    const stampedPayload = { ...(payload || {}), clientId: SHYFT_CLIENT_ID };
     const body = {
       groupId: currentGroup.cloudGroupId,
       type,
-      payload: payload || {},
+      payload: stampedPayload,
       localUid: me?.id || null,
       blockId: opts.blockId ?? (currentBlock?.id != null ? String(currentBlock.id) : null),
       clientTs: Date.now(),
