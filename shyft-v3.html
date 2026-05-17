@@ -2303,13 +2303,17 @@ function ShiftApp() {
   //      state. Mismatches log to console — the gating signal for D.4.D2.
   //   3. No-op when the user isn't cloud-signed-in or the active group hasn't
   //      been mirrored to D1 (nothing to write to and nothing to diff against).
-  const trackEvent = (type, payload, opts = {}) => {
-    if (!cloudUser || !currentGroup?.cloudGroupId) return;
+  // Builds the wire-format event body. Extracted so applyAndTrack (D.4.D2 Phase 3)
+  // can reuse it AND share the same clientTs across the local applyEvent and the POST,
+  // keeping reducer output deterministic across both consumers. Returns null when
+  // the group isn't cloud-mirrored (no surface to post to).
+  const buildEventBody = (type, payload, opts = {}) => {
+    if (!cloudUser || !currentGroup?.cloudGroupId) return null;
     // D.4.D2 Phase 2.1: stamp clientId into every payload so the cross-device
     // poll on other tabs/devices can identify (and skip) events this tab fired.
     // Untouched by the reducer — applyEvent only reads named slice fields.
     const stampedPayload = { ...(payload || {}), clientId: SHYFT_CLIENT_ID };
-    const body = {
+    return {
       groupId: currentGroup.cloudGroupId,
       type,
       payload: stampedPayload,
@@ -2317,6 +2321,11 @@ function ShiftApp() {
       blockId: opts.blockId ?? (currentBlock?.id != null ? String(currentBlock.id) : null),
       clientTs: Date.now(),
     };
+  };
+
+  const trackEvent = (type, payload, opts = {}) => {
+    const body = buildEventBody(type, payload, opts);
+    if (!body) return;
 
     // Shadow diff: capture pre-mutation state NOW, then schedule the compare for
     // after React commits and validatorLiveRef updates. setTimeout(0) defers
@@ -2354,6 +2363,64 @@ function ShiftApp() {
     }
 
     window.api.postEvent(body);
+  };
+
+  // D.4.D2 Phase 3: reducer-routed mutation dispatcher. The slice-by-slice
+  // refactor target. Replaces the legacy `setX(next); persist(); trackEvent(...)`
+  // pattern with a single helper that:
+  //   1. Builds the wire body (so applyEvent and the POST share one clientTs).
+  //   2. Runs applyEvent against live state via validatorLiveRef → next.
+  //   3. Diffs next against before and dispatches setX + persist only for
+  //      changed slices (object identity check — reducer always returns the
+  //      same reference for untouched slices).
+  //   4. Posts the same body we just applied (skipping trackEvent's shadow-diff
+  //      because, post-Phase-3, predicted == actual by construction).
+  //
+  // For non-cloud-mirrored groups, body is null but we still apply the event
+  // through the reducer and dispatch — the reducer is pure and works on any
+  // group. trackEvent would have no-op'd the POST anyway, so this preserves
+  // the existing local-only behavior.
+  //
+  // Callers stay responsible for eligibility checks (returning early with
+  // flash on bad input) and for computing any non-payload-derivable values
+  // (ids, point deltas, the listing object for shift.flag, etc.) before
+  // calling. The reducer trusts the payload.
+  const applyAndTrack = async (type, payload, opts = {}) => {
+    const body = buildEventBody(type, payload, opts);
+    // Synthesize a minimal evt for non-cloud-mirrored groups so applyEvent
+    // still runs. clientTs matches body.clientTs when body exists.
+    const evt = body || {
+      type,
+      payload: payload || {},
+      localUid: me?.id || null,
+      clientTs: Date.now(),
+    };
+    const before = validatorLiveRef.current;
+    if (!before) return null;
+    const cleanBefore = { ...before, appliedEventIds: [] };
+    let next;
+    try { next = applyEvent(cleanBefore, evt); }
+    catch (err) { console.error("[applyAndTrack] reducer threw:", err, "type:", type); return null; }
+
+    const dispatches = [];
+    if (next.shifts          !== before.shifts)          { setShifts(next.shifts);                   dispatches.push(persist("shifts", next.shifts)); }
+    if (next.marketplace     !== before.marketplace)     { setMarketplace(next.marketplace);         dispatches.push(persist("marketplace", next.marketplace)); }
+    if (next.users           !== before.users)           { setUsers(next.users);                     dispatches.push(persist("users", next.users)); }
+    if (next.unavailability  !== before.unavailability)  { setUnavailability(next.unavailability);   dispatches.push(persist("unavailability", next.unavailability)); }
+    if (next.preferences     !== before.preferences)     { setPreferences(next.preferences);         dispatches.push(persist("preferences", next.preferences)); }
+    if (next.topOptions      !== before.topOptions)      { setTopOptions(next.topOptions);           dispatches.push(persist("topOptions", next.topOptions)); }
+    if (next.openIncentives  !== before.openIncentives)  { setOpenIncentives(next.openIncentives);   dispatches.push(persist("openIncentives", next.openIncentives)); }
+    if (next.config          !== before.config)          { setConfig(next.config);                   dispatches.push(persist("config", next.config)); }
+    await Promise.all(dispatches);
+
+    // POST using the SAME body the reducer consumed. Skipping trackEvent's
+    // shadow-diff is intentional: applyEvent already ran with this exact
+    // payload, so predicted == actual is a tautology now. Future regressions
+    // will surface either through the periodic poll (which also runs applyEvent
+    // and would diverge if state on cloud disagrees) or through the offline
+    // validator. Outbox still kicks in on transport failure.
+    if (body) window.api.postEvent(body);
+    return next;
   };
 
   // D.4.C — offline validator. Cloud-owner only (works during impersonation —
@@ -3541,47 +3608,36 @@ function ShiftApp() {
   // Provider flags an awarded shift. v3.2: silent auto-swap removed — every flag goes to admin
   // for review. Shift is marked flagged and auto-posted to the marketplace at zero incentive so
   // self-service trade is also possible. Admin sees a recommendations panel on the dashboard.
+  // D.4.D2 Phase 3: routed through applyAndTrack. We construct (or reuse) the auto-post listing
+  // inline so the shift.flag event carries it for the reducer to apply atomically with the
+  // shift state change. Reducer is idempotent on the marketplace append (listingId dedup).
   const flagShift = async (dateKey, slotId, reason) => {
     const entry = shifts[dateKey]?.[slotId];
     if(!entry || getUid(entry) !== me.id) return;
-    const next = {...shifts};
-    next[dateKey] = {...next[dateKey], [slotId]: {...entry, confirm: "flagged", flagReason: reason || null}};
-    setShifts(next); await persist("shifts", next);
-    // D.4.B/C: include the listing (newly-created OR pre-existing) so applyEvent can replay
-    // the auto-posted cascade without re-rolling the id/postedAt. Idempotent in the reducer
-    // (no-op append if listing.id is already in marketplace state).
-    const listing = await _postListing(dateKey, slotId, 0, { autoPosted: true, flagReason: reason || null });
-    trackEvent("shift.flag", {
+    const sellerId = getUid(entry);
+    const existing = marketplace.find(l => l.dateKey === dateKey && l.slotId === slotId && l.status === "open");
+    const listing = existing || {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+      dateKey, slotId, sellerId,
+      incentivePts: 0,
+      postedAt: Date.now(),
+      status: "open",
+      autoPosted: true,
+      flagReason: reason || null,
+    };
+    await applyAndTrack("shift.flag", {
       dateKey, slotId, reason: reason || null,
-      ...(listing ? { listing } : {}),
+      listing,
     });
     flash("⚠️ Flagged · admin notified, also posted to marketplace");
     setFlagDraft(null);
   };
 
-  // Internal listing creator (no eligibility checks beyond ownership). Used by flag auto-post
-  // and by the user's explicit "post for take" action.
-  const _postListing = async (dateKey, slotId, incentivePts, opts = {}) => {
-    const entry = shifts[dateKey]?.[slotId];
-    if(!entry) return null;
-    const sellerId = getUid(entry);
-    if(!sellerId) return null;
-    // Don't double-list — if there's already an open listing for this slot, just no-op.
-    const existing = marketplace.find(l => l.dateKey === dateKey && l.slotId === slotId && l.status === "open");
-    if(existing) return existing;
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-    const listing = {
-      id, dateKey, slotId, sellerId,
-      incentivePts: Math.max(0, parseInt(incentivePts)||0),
-      postedAt: Date.now(),
-      status: "open",
-      autoPosted: !!opts.autoPosted,
-      flagReason: opts.flagReason || null,
-    };
-    const next = [...marketplace, listing];
-    setMarketplace(next); await persist("marketplace", next);
-    return listing;
-  };
+  // D.4.D2 Phase 3: _postListing is gone. Its two callers (postForTake here,
+  // flagShift below) now build the listingId or the full listing object inline,
+  // and the reducer's marketplace.post / shift.flag handlers own the append.
+  // The reducer is idempotent — if a listing with the chosen id is already in
+  // marketplace, it no-ops the append.
 
   // Provider posts their own awarded shift for take, with optional incentive points.
   const postForTake = async (dateKey, slotId, incentivePts) => {
@@ -3590,23 +3646,27 @@ function ShiftApp() {
     if(!entry || getUid(entry) !== me.id) { flash("⚠️ You don't own this shift"); return; }
     const cap = Math.max(0, Math.floor(me.points || 0));
     const inc = Math.max(0, Math.min(cap, parseInt(incentivePts)||0));
-    const listing = await _postListing(dateKey, slotId, inc, {});
-    if(listing) {
-      trackEvent("marketplace.post", { dateKey, slotId, incentivePts: inc, listingId: listing.id });
-      flash(`📣 Listed${inc>0?` · ${inc} pt incentive`:""}`);
-    }
+    // Reuse an open listing's id if one already exists for this slot, so the reducer's
+    // (listingId-keyed) dedup no-ops the append instead of creating a duplicate.
+    const existing = marketplace.find(l => l.dateKey === dateKey && l.slotId === slotId && l.status === "open");
+    const listingId = existing?.id || `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+    await applyAndTrack("marketplace.post", { dateKey, slotId, incentivePts: inc, listingId });
+    flash(`📣 Listed${inc>0?` · ${inc} pt incentive`:""}`);
     setListDraft(null);
   };
 
   // Anyone eligible can claim an open listing. Reassigns the shift, transfers incentive points.
+  // D.4.D2 Phase 3: routed through applyAndTrack. The reducer's marketplace.take handler
+  // owns all three slice mutations (shifts + users + marketplace) and derives the taker
+  // from evt.localUid (so buildEventBody's me?.id stamp drives it).
+  // Note: in Reconciliation+ (the only phase where listings exist), blocked-day and max-shift
+  // caps are intentionally NOT enforced — the user is actively choosing to take this shift.
   const takeListing = async (listingId) => {
     const listing = marketplace.find(l => l.id === listingId);
     if(!listing || listing.status !== "open") return;
     if(listing.sellerId === me.id) { flash("⚠️ Can't take your own listing"); return; }
     if(me.role !== "provider") { flash("⚠️ Only providers can take shifts"); return; }
     if(!me.seniorityId) { flash("⚠️ Seniority not assigned"); return; }
-    // Note: in Reconciliation+ (the only phase where listings exist), blocked-day and max-shift
-    // caps are intentionally NOT enforced — the user is actively choosing to take this shift.
     // Already on this day? (Each provider gets at most one slot per date.)
     if(Object.values(shifts[listing.dateKey]||{}).some(e => getUid(e) === me.id)) {
       flash("⚠️ You already have a shift this day"); return;
@@ -3616,31 +3676,7 @@ function ShiftApp() {
     if(!entry || getUid(entry) !== listing.sellerId) {
       flash("⚠️ Listing is stale — refresh"); return;
     }
-    // Reassign the shift.
-    const ns = {...shifts};
-    ns[listing.dateKey] = {...ns[listing.dateKey], [listing.slotId]: {
-      ...entry, uid: me.id, source: "marketplace", takenFrom: listing.sellerId, confirm: null,
-    }};
-    setShifts(ns); await persist("shifts", ns);
-    // Move incentive points from seller → taker (only when > 0).
-    if(listing.incentivePts > 0){
-      const nu = users.map(u => {
-        if(u.id === listing.sellerId) return {...u, points: Math.max(0, (u.points||0) - listing.incentivePts)};
-        if(u.id === me.id) return {...u, points: (u.points||0) + listing.incentivePts};
-        return u;
-      });
-      setUsers(nu); await persist("users", nu);
-    }
-    // Mark listing taken; any pending trade offers become stale (the shift is no longer up).
-    const nm = marketplace.map(l => l.id === listingId ? {
-      ...l,
-      status: "taken",
-      takenBy: me.id,
-      takenAt: Date.now(),
-      tradeOffers: (l.tradeOffers||[]).map(o => o.status==="pending" ? {...o, status:"stale"} : o),
-    } : l);
-    setMarketplace(nm); await persist("marketplace", nm);
-    trackEvent("marketplace.take", {
+    await applyAndTrack("marketplace.take", {
       dateKey: listing.dateKey,
       slotId: listing.slotId,
       listingId,
@@ -3651,17 +3687,13 @@ function ShiftApp() {
 
   // Seller (or admin) cancels an open listing. Doesn't unassign the shift.
   // Any pending trade offers on it become "stale".
+  // D.4.D2 Phase 3: routed through applyAndTrack — the reducer's marketplace.cancel
+  // handler owns the cancellation + offer-stale cascade.
   const cancelListing = async (listingId) => {
     const listing = marketplace.find(l => l.id === listingId);
     if(!listing || listing.status !== "open") return;
     if(listing.sellerId !== me.id && me.role !== "admin") { flash("⚠️ Not your listing"); return; }
-    const nm = marketplace.map(l => l.id === listingId ? {
-      ...l,
-      status: "cancelled",
-      tradeOffers: (l.tradeOffers||[]).map(o => o.status==="pending" ? {...o, status:"stale"} : o),
-    } : l);
-    setMarketplace(nm); await persist("marketplace", nm);
-    trackEvent("marketplace.cancel", { listingId });
+    await applyAndTrack("marketplace.cancel", { listingId });
     flash("Listing cancelled");
   };
 
@@ -3689,6 +3721,8 @@ function ShiftApp() {
 
   // Provider B offers to swap one of their awarded shifts in exchange for the listing.
   // Optional incentive points B will give A on accept (a sweetener).
+  // D.4.D2 Phase 3: routed through applyAndTrack. Reducer's trade.offer-post handler
+  // owns the offer append; we just supply the offerId (deterministic stamp for replay).
   const offerTrade = async (listingId, offererDateKey, offererSlotId, incentivePts) => {
     if(!me || me.role !== "provider") return;
     const listing = marketplace.find(l => l.id === listingId);
@@ -3708,20 +3742,9 @@ function ShiftApp() {
     }
     const cap = Math.max(0, Math.floor(me.points || 0));
     const inc = Math.max(0, Math.min(cap, parseInt(incentivePts)||0));
-    const offer = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
-      offererId: me.id,
-      offererDateKey, offererSlotId,
-      incentivePts: inc,
-      postedAt: Date.now(),
-      status: "pending",
-    };
-    const nm = marketplace.map(l => l.id === listingId
-      ? { ...l, tradeOffers: [...(l.tradeOffers||[]), offer] }
-      : l);
-    setMarketplace(nm); await persist("marketplace", nm);
-    trackEvent("trade.offer-post", {
-      offerId: offer.id,
+    const offerId = `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+    await applyAndTrack("trade.offer-post", {
+      offerId,
       listingId,
       fromUid: String(me.id),
       dateKey: offererDateKey,
@@ -3733,6 +3756,9 @@ function ShiftApp() {
   };
 
   // Listing owner accepts a pending trade offer. Atomic shift swap + bidirectional point transfer.
+  // D.4.D2 Phase 3: routed through applyAndTrack. Reducer's trade.offer-accept handler owns
+  // all three slice mutations (shifts × 2 + users + marketplace) using the pointsTransferred
+  // payload as the cascade contract — no re-derivation in the reducer.
   const acceptTradeOffer = async (listingId, offerId) => {
     if(!me || me.role !== "provider") return;
     const listing = marketplace.find(l => l.id === listingId);
@@ -3750,45 +3776,12 @@ function ShiftApp() {
     if(!sellerOk.ok) { flash(`⚠️ Can't accept: ${sellerOk.why}`); return; }
     const offererOk = canHoldShift(offer.offererId, listing.dateKey, listing.slotId, offer.offererDateKey);
     if(!offererOk.ok) { flash(`⚠️ Can't accept: ${offererOk.why} (offerer)`); return; }
-    // Swap atomically. Each shift's uid flips; source becomes "trade"; confirm resets.
-    const ns = {...shifts};
-    ns[listing.dateKey] = {...ns[listing.dateKey], [listing.slotId]: {
-      ...aEntry, uid: offer.offererId, source: "trade", swappedFrom: listing.sellerId, confirm: null, flagReason: null,
-    }};
-    if(!ns[offer.offererDateKey]) ns[offer.offererDateKey] = {};
-    ns[offer.offererDateKey] = {...ns[offer.offererDateKey], [offer.offererSlotId]: {
-      ...bEntry, uid: listing.sellerId, source: "trade", swappedFrom: offer.offererId, confirm: null, flagReason: null,
-    }};
-    setShifts(ns); await persist("shifts", ns);
-    // Bidirectional incentive point transfer:
-    //   listing.incentivePts (A's sweetener)  → offerer (B)
-    //   offer.incentivePts   (B's sweetener)  → seller  (A)
+    // Bidirectional incentive transfer:
+    //   listing.incentivePts (A's sweetener) → offerer (B)
+    //   offer.incentivePts   (B's sweetener) → seller  (A)
     const aDelta = (offer.incentivePts||0) - (listing.incentivePts||0);
     const bDelta = (listing.incentivePts||0) - (offer.incentivePts||0);
-    if(aDelta !== 0 || bDelta !== 0){
-      const nu = users.map(u => {
-        if(u.id === listing.sellerId) return {...u, points: Math.max(0, (u.points||0) + aDelta)};
-        if(u.id === offer.offererId) return {...u, points: Math.max(0, (u.points||0) + bDelta)};
-        return u;
-      });
-      setUsers(nu); await persist("users", nu);
-    }
-    // Mark listing traded; auto-decline any other pending offers on it.
-    const nm = marketplace.map(l => l.id === listingId
-      ? {
-          ...l,
-          status: "traded",
-          takenBy: offer.offererId,
-          takenAt: Date.now(),
-          tradeOffers: (l.tradeOffers||[]).map(o =>
-            o.id === offerId ? {...o, status:"accepted"} : (o.status==="pending" ? {...o, status:"declined"} : o)
-          ),
-        }
-      : l);
-    setMarketplace(nm); await persist("marketplace", nm);
-    // pointsTransferred captures the cascaded balance moves so applyEvent can replay
-    // without re-deriving from incentivePts (the listing/offer mutation is also in payload).
-    trackEvent("trade.offer-accept", {
+    await applyAndTrack("trade.offer-accept", {
       offerId,
       listingId,
       aDate: listing.dateKey,
@@ -3804,6 +3797,7 @@ function ShiftApp() {
 
   // Listing owner declines a single offer. Other pending offers stay alive.
   // Offerer can also withdraw their own offer (same code path; admin too).
+  // D.4.D2 Phase 3: routed through applyAndTrack.
   const declineTradeOffer = async (listingId, offerId) => {
     if(!me) return;
     const listing = marketplace.find(l => l.id === listingId);
@@ -3813,11 +3807,7 @@ function ShiftApp() {
     const allowed = (listing.sellerId === me.id) || (offer.offererId === me.id) || (me.role === "admin");
     if(!allowed) return;
     const newStatus = offer.offererId === me.id ? "withdrawn" : "declined";
-    const nm = marketplace.map(l => l.id === listingId
-      ? { ...l, tradeOffers: l.tradeOffers.map(o => o.id === offerId ? {...o, status:newStatus} : o) }
-      : l);
-    setMarketplace(nm); await persist("marketplace", nm);
-    trackEvent("trade.offer-decline", { offerId, listingId, status: newStatus });
+    await applyAndTrack("trade.offer-decline", { offerId, listingId, status: newStatus });
     flash(newStatus === "withdrawn" ? "Offer withdrawn" : "Offer declined");
   };
 
