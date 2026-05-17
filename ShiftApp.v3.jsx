@@ -383,14 +383,24 @@ export default function ShiftApp() {
   // Phase D.2 migration UI: { localGroupId, name, users: [{name,email,tempPassword,role}] }
   // when the SuperDashboard's confirm-migration modal is open or showing the result.
   const [migrateState, setMigrateState] = useState(null);
-  // Phase C: snapshot sync. cloudSyncOffer = { groupId, cloudGroupId, clientTs, serverTs } when
-  // the cloud has data newer than this device's last persist for the active group.
-  const [cloudSyncOffer, setCloudSyncOffer] = useState(null);
+  // D.4.D2 Phase 5: cloudSyncOffer state + checkCloudSyncOffer helper + the dependent
+  // useEffect + acceptCloudSync + the amber banner JSX were all deleted here. The 15s
+  // periodic poll (Phase 2) handles cross-device sync continuously now; the manual
+  // "Newer version available · Sync now" banner only existed because polling didn't.
+  // applySnapshot survives — it's still used by the first-device-claim Restore card and
+  // the owner-auto-restore useEffect.
   // unclaimedCloudGroups = cloud groups in `cloudUser.memberships` that have no matching local
   // group (matched by cloudGroupId). Shown on the auth screen as "Restore" cards.
   const [unclaimedCloudGroups, setUnclaimedCloudGroups] = useState([]);
   const snapshotUploadTimer = useRef(null);
   const snapshotUploadInflight = useRef(false);
+  // D.4.D2 Phase 4: snapshot becomes a compaction optimization, not the primary persistence
+  // path. uploadSnapshot only fires when this ref is true, set by persist() on any state-touching
+  // write and cleared by a successful upload. Combined with the 30s debounce (was 2s), this
+  // collapses bursts of writes into one snapshot and avoids redundant uploads when state hasn't
+  // changed since the last one. The event log + cross-device poll are now authoritative for
+  // syncing mutations between sessions; snapshot is the rehydration baseline.
+  const snapshotDirty = useRef(false);
 
   useEffect(() => {
     (async () => {
@@ -703,6 +713,10 @@ export default function ShiftApp() {
     try { await window.storage.set(gKey(groupId,key), JSON.stringify(val), true); } catch { flash("⚠️ Save failed"); }
     // Phase C: stamp a local-modified time and schedule a debounced cloud snapshot.
     try { localStorage.setItem(`shyft3_g${groupId}_lastModified`, String(Date.now())); } catch {}
+    // D.4.D2 Phase 4: mark snapshot dirty so the next scheduled upload actually fires (gate
+    // in uploadSnapshot). Without this, the 30s debounce would still upload on every persist;
+    // we want the snapshot to skip when nothing's changed since the last upload.
+    snapshotDirty.current = true;
     scheduleSnapshotUpload();
   };
   const persistRoot = async (key, val) => {
@@ -1167,15 +1181,19 @@ export default function ShiftApp() {
   const uploadSnapshot = async () => {
     if (!cloudUser || !currentGroup?.cloudGroupId || !groupId) return;
     if (snapshotUploadInflight.current) return;
+    // D.4.D2 Phase 4: skip if no state-touching write since the last upload. The event log
+    // + cross-device poll are authoritative for mutations now; snapshot is just the
+    // rehydration baseline. No dirty = no point re-uploading the same payload.
+    if (!snapshotDirty.current) return;
     snapshotUploadInflight.current = true;
     try {
       const payload = buildSnapshotPayload(groupId);
       if (!payload) return;
-      // Safety guard (incident 2026-05-12): never upload an empty snapshot. The Phase C
-      // uploader captures live state via snapshotStateRef and posts on a 2s debounce —
-      // if the user navigates away mid-debounce and React state goes empty before the
-      // timer fires, this would otherwise wipe the cloud group. Phase C must never
-      // destroy data; if a group genuinely needs to be cleared it goes through Delete.
+      // Safety guard (incident 2026-05-12): never upload an empty snapshot. The uploader
+      // captures live state via snapshotStateRef and posts on a debounce — if the user
+      // navigates away mid-debounce and React state goes empty before the timer fires,
+      // this would otherwise wipe the cloud group. The uploader must never destroy data;
+      // if a group genuinely needs to be cleared it goes through Delete.
       const isEmpty =
         (!Array.isArray(payload.users) || payload.users.length === 0) &&
         (!payload.shifts || Object.keys(payload.shifts).length === 0) &&
@@ -1190,6 +1208,9 @@ export default function ShiftApp() {
         method: "POST",
         body: JSON.stringify({ groupId: currentGroup.cloudGroupId, payload, clientTs }),
       });
+      // Clear dirty only after a successful POST. If POST fails (caught below), keep dirty so
+      // the next scheduled upload retries.
+      snapshotDirty.current = false;
     } catch {} finally {
       snapshotUploadInflight.current = false;
     }
@@ -1197,7 +1218,10 @@ export default function ShiftApp() {
   const scheduleSnapshotUpload = () => {
     if (!cloudUser || !currentGroup?.cloudGroupId) return;
     if (snapshotUploadTimer.current) clearTimeout(snapshotUploadTimer.current);
-    snapshotUploadTimer.current = setTimeout(uploadSnapshot, 2000);
+    // D.4.D2 Phase 4: 2s → 30s debounce. Snapshot is a compaction optimization now —
+    // a longer window collapses bursts of writes into one upload. Event log handles
+    // realtime cross-device sync via the periodic poll.
+    snapshotUploadTimer.current = setTimeout(uploadSnapshot, 30000);
   };
 
   // Apply a snapshot payload to localStorage and React state for a given local groupId.
@@ -1215,29 +1239,6 @@ export default function ShiftApp() {
     writeKey("openIncentives", payload.openIncentives || {});
     // If the calling group is the active one, refresh React state so the UI reflects the new data.
     if (gid === groupId) await loadGroup(gid);
-  };
-
-  // Pull /api/snapshots/:cloudGroupId/latest and decide whether to offer a sync. Called after
-  // loadGroup completes for any cloud-mirrored group.
-  const checkCloudSyncOffer = async (gid, cloudGid) => {
-    if (!cloudUser || !cloudGid) return;
-    let snap = null;
-    try { snap = await window.api.fetchJSON("/api/snapshots/" + encodeURIComponent(cloudGid) + "/latest"); }
-    catch (e) { return; /* 404 = no remote yet, ignore */ }
-    if (!snap?.payload) return;
-    let localTs = 0;
-    try { localTs = parseInt(localStorage.getItem(`shyft3_g${gid}_lastModified`)||"0", 10) || 0; } catch {}
-    if ((snap.clientTs||0) > localTs + 1000) {
-      // Cloud is meaningfully newer (1s slack to avoid loop on round-trips).
-      setCloudSyncOffer({ groupId: gid, cloudGroupId: cloudGid, clientTs: snap.clientTs, serverTs: snap.serverTs, payload: snap.payload });
-    }
-  };
-  const acceptCloudSync = async () => {
-    if (!cloudSyncOffer) return;
-    await applySnapshot(cloudSyncOffer.groupId, cloudSyncOffer.payload);
-    try { localStorage.setItem(`shyft3_g${cloudSyncOffer.groupId}_lastModified`, String(cloudSyncOffer.clientTs)); } catch {}
-    setCloudSyncOffer(null);
-    flash("✅ Synced from cloud");
   };
 
   // First-device-claim: build the list of cloud groups (from cloudUser.memberships) that don't
@@ -1289,14 +1290,6 @@ export default function ShiftApp() {
       }
     })();
   }, [cloudUser, groups]);
-
-  // After a group is loaded AND cloud session is known, check whether the cloud has newer data.
-  // Re-runs whenever the active group changes or the cloud session boots.
-  useEffect(() => {
-    if (!groupId || !cloudUser || !currentGroup?.cloudGroupId) { setCloudSyncOffer(null); return; }
-    checkCloudSyncOffer(groupId, currentGroup.cloudGroupId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groupId, cloudUser, currentGroup?.cloudGroupId]);
 
   // D.4.D2 Phase 2: periodic poll for cross-device sync. Pulls events newer than
   // shyft3_g<gid>_lastSeenServerTs every 15s while the document is visible, replays
@@ -6494,23 +6487,6 @@ export default function ShiftApp() {
       </div>
     )}
     <div className="min-h-screen bg-canvas text-ink-900 lg:flex pb-20 lg:pb-0">
-      {/* Phase C cloud-sync banner — fires when /api/snapshots/:gid/latest reports a clientTs
-          newer than this device's last persist. User clicks "Sync now" to overwrite local
-          state with the cloud snapshot. */}
-      {cloudSyncOffer&&(
-        <div className="fixed top-0 inset-x-0 z-50 bg-amber-50 border-b border-amber-200 px-4 py-2.5 flex items-center justify-between gap-3 text-sm">
-          <div className="text-amber-900">
-            <span className="font-medium">Newer version of this group available</span>
-            <span className="text-amber-700"> from another device.</span>
-          </div>
-          <div className="flex items-center gap-2 flex-shrink-0">
-            <button onClick={()=>setCloudSyncOffer(null)}
-              className="text-xs font-medium text-amber-700 hover:text-amber-900 px-2 py-1">Dismiss</button>
-            <button onClick={acceptCloudSync}
-              className="text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded-lg">Sync now</button>
-          </div>
-        </div>
-      )}
       {/* Desktop sidebar */}
       <aside className="hidden lg:flex lg:flex-col w-[260px] flex-shrink-0 bg-surface border-r border-slate-200 px-4 py-5 sticky top-0 h-screen">
         <div className="mb-6 px-2">
