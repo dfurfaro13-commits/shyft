@@ -2826,7 +2826,7 @@ export default function ShiftApp() {
   const takeListing = async (listingId) => {
     const listing = marketplace.find(l => l.id === listingId);
     if(!listing || listing.status !== "open") return;
-    if(listing.sellerId === me.id) { flash("⚠️ Can't take your own listing"); return; }
+    if(String(listing.sellerId) === String(me.id)) { flash("⚠️ Can't take your own listing"); return; }
     if(me.role !== "provider") { flash("⚠️ Only providers can take shifts"); return; }
     if(!me.seniorityId) { flash("⚠️ Seniority not assigned"); return; }
     // Already on this day? (Each provider gets at most one slot per date.)
@@ -2835,7 +2835,7 @@ export default function ShiftApp() {
     }
     // Verify the shift is still owned by the seller.
     const entry = shifts[listing.dateKey]?.[listing.slotId];
-    if(!entry || getUid(entry) !== listing.sellerId) {
+    if(!entry || String(getUid(entry)) !== String(listing.sellerId)) {
       flash("⚠️ Listing is stale — refresh"); return;
     }
     await applyAndTrack("marketplace.take", {
@@ -2854,7 +2854,7 @@ export default function ShiftApp() {
   const cancelListing = async (listingId) => {
     const listing = marketplace.find(l => l.id === listingId);
     if(!listing || listing.status !== "open") return;
-    if(listing.sellerId !== me.id && me.role !== "admin") { flash("⚠️ Not your listing"); return; }
+    if(String(listing.sellerId) !== String(me.id) && me.role !== "admin") { flash("⚠️ Not your listing"); return; }
     await applyAndTrack("marketplace.cancel", { listingId });
     flash("Listing cancelled");
   };
@@ -2889,17 +2889,23 @@ export default function ShiftApp() {
     if(!me || me.role !== "provider") return;
     const listing = marketplace.find(l => l.id === listingId);
     if(!listing || listing.status !== "open") { flash("⚠️ Listing closed"); return; }
-    if(listing.sellerId === me.id) { flash("⚠️ Can't offer trade on your own listing"); return; }
+    if(String(listing.sellerId) === String(me.id)) { flash("⚠️ Can't offer trade on your own listing"); return; }
     // Verify B owns the offered shift.
     const myEntry = shifts[offererDateKey]?.[offererSlotId];
     if(!myEntry || getUid(myEntry) !== me.id) { flash("⚠️ You don't own that shift"); return; }
     // Pre-validate the swap (both sides must be valid holders).
-    const sellerCanHoldB = canHoldShift(listing.sellerId, offererDateKey, offererSlotId, offererDateKey);
+    // canHoldShift uses strict-equality on uids internally; normalize any wire-format string.
+    const sellerUidNorm = typeof listing.sellerId === "string" ? (Number(listing.sellerId) || listing.sellerId) : listing.sellerId;
+    const sellerCanHoldB = canHoldShift(sellerUidNorm, offererDateKey, offererSlotId, offererDateKey);
     if(!sellerCanHoldB.ok) { flash(`⚠️ Seller can't take your shift: ${sellerCanHoldB.why}`); return; }
     const meCanHoldA = canHoldShift(me.id, listing.dateKey, listing.slotId, listing.dateKey);
     if(!meCanHoldA.ok) { flash(`⚠️ You can't take their shift: ${meCanHoldA.why}`); return; }
     // Don't double-offer the same shift on the same listing.
-    if((listing.tradeOffers||[]).some(o => o.status==="pending" && o.offererId===me.id && o.offererDateKey===offererDateKey && o.offererSlotId===offererSlotId)){
+    // String() defensive: offers created in the brief window between fb493ea (Phase 3
+    // marketplace) and this commit stored offererId as the wire-format string. The
+    // reducer is fixed going forward; the String coercion here makes existing data
+    // still dedupe correctly.
+    if((listing.tradeOffers||[]).some(o => o.status==="pending" && String(o.offererId)===String(me.id) && o.offererDateKey===offererDateKey && o.offererSlotId===offererSlotId)){
       flash("⚠️ You already offered that shift"); return;
     }
     const cap = Math.max(0, Math.floor(me.points || 0));
@@ -2925,18 +2931,24 @@ export default function ShiftApp() {
     if(!me || me.role !== "provider") return;
     const listing = marketplace.find(l => l.id === listingId);
     if(!listing || listing.status !== "open") { flash("⚠️ Listing closed"); return; }
-    if(listing.sellerId !== me.id) { flash("⚠️ Only the lister can accept"); return; }
+    if(String(listing.sellerId) !== String(me.id)) { flash("⚠️ Only the lister can accept"); return; }
     const offer = (listing.tradeOffers||[]).find(o => o.id === offerId);
     if(!offer || offer.status !== "pending") { flash("⚠️ Offer no longer pending"); return; }
     // Re-verify both shifts still owned correctly.
     const aEntry = shifts[listing.dateKey]?.[listing.slotId];
     const bEntry = shifts[offer.offererDateKey]?.[offer.offererSlotId];
-    if(!aEntry || getUid(aEntry) !== listing.sellerId) { flash("⚠️ Your shift moved — listing stale"); return; }
-    if(!bEntry || getUid(bEntry) !== offer.offererId) { flash("⚠️ Their shift moved — offer stale"); return; }
+    // String() defensive comparisons + normalize offererId / sellerId before passing to
+    // canHoldShift: pre-fix offers in storage have wire-format STRING offererId, but
+    // getUid(entry) and canHoldShift's internal users.find(u => u.id === uid) operate on
+    // numeric uids.
+    if(!aEntry || String(getUid(aEntry)) !== String(listing.sellerId)) { flash("⚠️ Your shift moved — listing stale"); return; }
+    if(!bEntry || String(getUid(bEntry)) !== String(offer.offererId)) { flash("⚠️ Their shift moved — offer stale"); return; }
     // Re-check eligibility (state may have changed since offer was made).
-    const sellerOk = canHoldShift(listing.sellerId, offer.offererDateKey, offer.offererSlotId, listing.dateKey);
+    const offererUidNorm = typeof offer.offererId === "string" ? (Number(offer.offererId) || offer.offererId) : offer.offererId;
+    const sellerUidNorm  = typeof listing.sellerId === "string" ? (Number(listing.sellerId) || listing.sellerId) : listing.sellerId;
+    const sellerOk = canHoldShift(sellerUidNorm, offer.offererDateKey, offer.offererSlotId, listing.dateKey);
     if(!sellerOk.ok) { flash(`⚠️ Can't accept: ${sellerOk.why}`); return; }
-    const offererOk = canHoldShift(offer.offererId, listing.dateKey, listing.slotId, offer.offererDateKey);
+    const offererOk = canHoldShift(offererUidNorm, listing.dateKey, listing.slotId, offer.offererDateKey);
     if(!offererOk.ok) { flash(`⚠️ Can't accept: ${offererOk.why} (offerer)`); return; }
     // Bidirectional incentive transfer:
     //   listing.incentivePts (A's sweetener) → offerer (B)
@@ -2966,9 +2978,13 @@ export default function ShiftApp() {
     if(!listing) return;
     const offer = (listing.tradeOffers||[]).find(o => o.id === offerId);
     if(!offer || offer.status !== "pending") return;
-    const allowed = (listing.sellerId === me.id) || (offer.offererId === me.id) || (me.role === "admin");
+    // String() defensive: see acceptTradeOffer for context — pre-fix offers stored offererId
+    // as the wire-format string, which broke strict-equality against numeric me.id.
+    const isSeller  = String(listing.sellerId) === String(me.id);
+    const isOfferer = String(offer.offererId) === String(me.id);
+    const allowed = isSeller || isOfferer || (me.role === "admin");
     if(!allowed) return;
-    const newStatus = offer.offererId === me.id ? "withdrawn" : "declined";
+    const newStatus = isOfferer ? "withdrawn" : "declined";
     await applyAndTrack("trade.offer-decline", { offerId, listingId, status: newStatus });
     flash(newStatus === "withdrawn" ? "Offer withdrawn" : "Offer declined");
   };
@@ -3911,7 +3927,7 @@ export default function ShiftApp() {
     if(!listing) { setTradeDraft(null); return null; }
     const lSlot = config.shiftSlots.find(s => s.id === listing.slotId);
     const lDate = parseDk(listing.dateKey);
-    const seller = users.find(u => u.id === listing.sellerId);
+    const seller = users.find(u => String(u.id) === String(listing.sellerId));
     // The user's own awarded shifts in this block, eligible to be offered.
     const myShifts = [];
     Object.entries(shifts).forEach(([k, day]) => {
@@ -5377,13 +5393,13 @@ export default function ShiftApp() {
   // Anyone eligible can take an open listing; sellers/admins can cancel.
   const MarketplacePage = () => {
     const open = marketplace.filter(l => l.status === "open").sort((a,b) => a.dateKey.localeCompare(b.dateKey));
-    const myOpen = open.filter(l => l.sellerId === me.id);
-    const otherOpen = open.filter(l => l.sellerId !== me.id);
+    const myOpen = open.filter(l => String(l.sellerId) === String(me.id));
+    const otherOpen = open.filter(l => String(l.sellerId) !== String(me.id));
     const recentDone = marketplace.filter(l => l.status !== "open").sort((a,b) => (b.takenAt||0) - (a.takenAt||0)).slice(0, 8);
     // Eligibility precheck for "Take" button — purely cosmetic disable; takeListing also re-checks.
     const canTake = (l) => {
       if(me.role !== "provider") return { ok:false, why:"Admin can't take shifts" };
-      if(l.sellerId === me.id) return { ok:false, why:"This is yours" };
+      if(String(l.sellerId) === String(me.id)) return { ok:false, why:"This is yours" };
       if(!me.seniorityId) return { ok:false, why:"No seniority assigned" };
       // Blocked-day and max-shift caps intentionally NOT enforced in Reconciliation+ — the user
       // is actively choosing to take this shift.
@@ -5396,7 +5412,7 @@ export default function ShiftApp() {
     // and trust the per-shift modal + offerTrade reducer to enforce the rest).
     const canOffer = (l) => {
       if(me.role !== "provider") return { ok:false, why:"Admin can't offer trades" };
-      if(l.sellerId === me.id) return { ok:false, why:"This is yours" };
+      if(String(l.sellerId) === String(me.id)) return { ok:false, why:"This is yours" };
       if(!me.seniorityId) return { ok:false, why:"No seniority assigned" };
       // Blocked-day cap intentionally NOT enforced — see canTake.
       if(Object.values(shifts[l.dateKey]||{}).some(e => getUid(e) === me.id)) return { ok:false, why:"Already on this day" };
@@ -5412,13 +5428,13 @@ export default function ShiftApp() {
     const renderListing = (l) => {
       const slot = config.shiftSlots.find(s => s.id === l.slotId);
       const date = parseDk(l.dateKey);
-      const seller = users.find(u => u.id === l.sellerId);
-      const mine = l.sellerId === me.id;
+      const seller = users.find(u => String(u.id) === String(l.sellerId));
+      const mine = String(l.sellerId) === String(me.id);
       const elig = !mine ? canTake(l) : null;
       const offerElig = !mine ? canOffer(l) : null;
       const pendingOffers = (l.tradeOffers||[]).filter(o => o.status === "pending");
       // Has the viewer already offered on this listing?
-      const myPendingOffer = !mine ? pendingOffers.find(o => o.offererId === me.id) : null;
+      const myPendingOffer = !mine ? pendingOffers.find(o => String(o.offererId) === String(me.id)) : null;
       return (
         <div key={l.id} className="bg-surface rounded-xl border border-slate-200 overflow-hidden">
           <div className="p-3 flex items-center gap-3">
@@ -5465,14 +5481,17 @@ export default function ShiftApp() {
             <div className="border-t border-slate-100 bg-slate-50/60 p-3 space-y-1.5">
               <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider">Pending offers</div>
               {pendingOffers.map(o => {
-                const offerer = users.find(u => u.id === o.offererId);
+                const offerer = users.find(u => String(u.id) === String(o.offererId));
                 const oSlot = config.shiftSlots.find(s => s.id === o.offererSlotId);
                 const oDate = parseDk(o.offererDateKey);
-                const isMyOffer = o.offererId === me.id;
+                const isMyOffer = String(o.offererId) === String(me.id);
                 if(!mine && !isMyOffer) return null; // hide other people's offers from non-owner
+                // offererId may be string-form (pre-fix); Number(...) || 0 keeps the avatar
+                // color stable instead of NaN'ing the modulo.
+                const offererColorIdx = (Number(o.offererId) || 0) % COLORS.length;
                 return (
                   <div key={o.id} className="bg-white border border-slate-200 rounded-lg p-2.5 flex items-center gap-2.5">
-                    <div className="w-9 h-9 rounded-full text-white flex items-center justify-center text-xs font-semibold flex-shrink-0" style={{background:COLORS[(o.offererId)%COLORS.length]}}>{initials(offerer?.name||"?")}</div>
+                    <div className="w-9 h-9 rounded-full text-white flex items-center justify-center text-xs font-semibold flex-shrink-0" style={{background:COLORS[offererColorIdx]}}>{initials(offerer?.name||"?")}</div>
                     <div className="flex-1 min-w-0">
                       <div className="text-xs font-medium text-ink-900">
                         {offerer?.name||"?"} {isMyOffer?"(you) ":""}offers their{" "}
@@ -5523,8 +5542,10 @@ export default function ShiftApp() {
           <div className="space-y-1">{recentDone.map(l => {
             const slot = config.shiftSlots.find(s => s.id === l.slotId);
             const date = parseDk(l.dateKey);
-            const seller = users.find(u => u.id === l.sellerId);
-            const taker = l.takenBy ? users.find(u => u.id === l.takenBy) : null;
+            // String() defensive: trade.offer-accept pre-fix stored takenBy as the wire-format
+            // string; sellerId is consistently numeric, but coerce both for safety.
+            const seller = users.find(u => String(u.id) === String(l.sellerId));
+            const taker = l.takenBy ? users.find(u => String(u.id) === String(l.takenBy)) : null;
             return (
               <div key={l.id} className="text-xs text-slate-600 flex items-center gap-2 px-3 py-1.5 bg-slate-50 rounded-lg">
                 <span className="text-slate-400 w-16 flex-shrink-0">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}</span>

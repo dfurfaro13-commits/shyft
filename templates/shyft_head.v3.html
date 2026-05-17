@@ -930,7 +930,10 @@
         if ((listing.tradeOffers || []).some(o => o.id === offerId)) return s;
         const offer = {
           id: offerId,
-          offererId: fromUid,
+          // Producer stamps fromUid as String(me.id) for wire-format consistency; normalize
+          // back to numeric so downstream strict-equality checks (offer.offererId === me.id)
+          // and users.find(u => u.id === ...) lookups work without per-callsite stringification.
+          offererId: uidVal(fromUid),
           offererDateKey: dateKey,
           offererSlotId: slotId,
           incentivePts: Math.max(0, parseInt(incentivePts) || 0),
@@ -980,7 +983,7 @@
             ? {
                 ...l,
                 status: "traded",
-                takenBy: bUid,
+                takenBy: uidVal(bUid),
                 takenAt: e.clientTs,
                 tradeOffers: (l.tradeOffers || []).map(o =>
                   o.id === offerId ? { ...o, status: "accepted" }
