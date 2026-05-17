@@ -2417,12 +2417,17 @@ function ShiftApp() {
     try { next = applyEvent(cleanBefore, evt); }
     catch (err) { console.error("[applyAndTrack] reducer threw:", err, "type:", type); return null; }
 
+    // NB: persist() key names use the historical short forms ("prefs", "unavail") —
+    // these are the localStorage keys loadGroup reads from. Don't change them to match
+    // the state field names; doing so would silently fork the storage layout and the
+    // next reload would read stale prefs/unavail. writeGroupStateToStorage uses these
+    // same short forms for the same reason.
     const dispatches = [];
     if (next.shifts          !== before.shifts)          { setShifts(next.shifts);                   dispatches.push(persist("shifts", next.shifts)); }
     if (next.marketplace     !== before.marketplace)     { setMarketplace(next.marketplace);         dispatches.push(persist("marketplace", next.marketplace)); }
     if (next.users           !== before.users)           { setUsers(next.users);                     dispatches.push(persist("users", next.users)); }
-    if (next.unavailability  !== before.unavailability)  { setUnavailability(next.unavailability);   dispatches.push(persist("unavailability", next.unavailability)); }
-    if (next.preferences     !== before.preferences)     { setPreferences(next.preferences);         dispatches.push(persist("preferences", next.preferences)); }
+    if (next.unavailability  !== before.unavailability)  { setUnavailability(next.unavailability);   dispatches.push(persist("unavail", next.unavailability)); }
+    if (next.preferences     !== before.preferences)     { setPreferences(next.preferences);         dispatches.push(persist("prefs", next.preferences)); }
     if (next.topOptions      !== before.topOptions)      { setTopOptions(next.topOptions);           dispatches.push(persist("topOptions", next.topOptions)); }
     if (next.openIncentives  !== before.openIncentives)  { setOpenIncentives(next.openIncentives);   dispatches.push(persist("openIncentives", next.openIncentives)); }
     if (next.config          !== before.config)          { setConfig(next.config);                   dispatches.push(persist("config", next.config)); }
@@ -2805,6 +2810,9 @@ function ShiftApp() {
   // slotPref is a slot id, or null/undefined for "Either". Bid is capped at the user's totalPts.
   // Implicitly marks the day preferred (signal that they want it). Idempotent — calling again
   // updates bid/slotPref in place. Use clearTopOption to walk away.
+  // D.4.D2 Phase 3: routed through applyAndTrack. The reducer's topOption.set handler owns
+  // both the topOptions write AND the auto-preferred cascade (first-time only). wasIn is
+  // computed pre-dispatch only for the flash text — the reducer recomputes it internally.
   const setTopOption = async (dateKey, slotPref, rawBid) => {
     if(!me || me.role !== "provider") return;
     if(!isAvailabilityOpen(currentBlock)) { flash("⚠️ Availability is closed for this block"); return; }
@@ -2815,36 +2823,23 @@ function ShiftApp() {
     const bid = Math.max(0, Math.min(cap, parseInt(rawBid)||TOP_OPTION_DEFAULT_BID));
     const sp = (slotPref==null) ? null : parseInt(slotPref);
     const wasIn = inTopOption(dateKey, me.id);
-    const nextTops = {...topOptions, [dateKey]: {...(topOptions[dateKey]||{}), [me.id]: {bid, slotPref: sp}}};
-    setTopOptions(nextTops); await persist("topOptions", nextTops);
-    // Top Option implies preferred — auto-mark the day. (Leaving doesn't auto-unmark.)
-    if(!wasIn){
-      const pcur = preferences[me.id]||[];
-      if(!pcur.includes(dateKey)){
-        const pnext = {...preferences,[me.id]:[...pcur,dateKey]};
-        setPreferences(pnext); await persist("prefs",pnext);
-      }
-    }
-    trackEvent("topOption.set", { dateKey, slotPref: sp, bid });
+    await applyAndTrack("topOption.set", { dateKey, slotPref: sp, bid });
     flash(wasIn ? `Top Option updated · bid ${bid}` : `🎯 Top Option set · bid ${bid} pt${bid===1?"":"s"}`);
   };
 
   // Walks the user away from a Top Option commitment for a day. Doesn't touch preference state.
   // If the day was part of a link chain, fix up the remainder: end-removal leaves the rest linked;
   // middle-removal splits into two halves (each gets a fresh linkId; size-1 halves drop linkId).
+  // D.4.D2 Phase 3: routed through applyAndTrack. The reducer applies the removal AND, if
+  // chainRepair is supplied, restamps the surviving halves. We still compute chainRepair here
+  // because the new linkId is Math.random-derived — must be captured in the payload so the
+  // reducer (pure) can replay deterministically across devices.
   const clearTopOption = async (dateKey) => {
     if(!me || me.role !== "provider") return;
     if(!isAvailabilityOpen(currentBlock)) { flash("⚠️ Availability is closed for this block"); return; }
     if(!inTopOption(dateKey, me.id)) return;
     const lid = getLinkId(dateKey, me.id);
     const chain = lid ? getLinkChain(dateKey, me.id) : [];
-    const dayMap = {...(topOptions[dateKey]||{})};
-    delete dayMap[me.id];
-    const nextTops = {...topOptions};
-    if(Object.keys(dayMap).length) nextTops[dateKey] = dayMap;
-    else delete nextTops[dateKey];
-    // D.4.B/C: capture the chain split decisions so applyEvent can replay deterministically
-    // (newLinkId is Math.random-based and can't be re-derived from prior state).
     let chainRepair = null;
     if(chain.length){
       const idx = chain.indexOf(dateKey);
@@ -2852,27 +2847,15 @@ function ShiftApp() {
       const right = chain.slice(idx + 1);
       const leftLid = left.length >= 2 ? lid : null;
       const rightLid = right.length >= 2 ? newLinkId() : null;
-      const stamp = (dk, newLid) => {
-        const e = nextTops[dk]?.[me.id];
-        if(!e) return;
-        if(newLid){
-          nextTops[dk] = {...nextTops[dk], [me.id]: {...e, linkId: newLid}};
-        } else {
-          const {linkId: _drop, ...rest} = e;
-          nextTops[dk] = {...nextTops[dk], [me.id]: rest};
-        }
-      };
-      for(const d of left) stamp(d, leftLid);
-      for(const d of right) stamp(d, rightLid);
       chainRepair = { left, right, leftLid, rightLid };
     }
-    setTopOptions(nextTops); await persist("topOptions", nextTops);
-    trackEvent("topOption.clear", { dateKey, ...(chainRepair ? { chainRepair } : {}) });
+    await applyAndTrack("topOption.clear", { dateKey, ...(chainRepair ? { chainRepair } : {}) });
     flash("Top Option removed");
   };
 
   // Update just the bid for an existing Top Option. Clamped to [0, floor(totalPts)].
   // No-op (with toast) if the user isn't currently Top-Optioning the day or if availability is closed.
+  // D.4.D2 Phase 3: routed through applyAndTrack. Reducer merges with existing slotPref/linkId.
   const setBid = async (dateKey, rawAmount) => {
     if(!me || me.role !== "provider") return;
     if(!isAvailabilityOpen(currentBlock)) { flash("⚠️ Availability is closed for this block"); return; }
@@ -2880,27 +2863,26 @@ function ShiftApp() {
     const cap = Math.max(0, Math.floor(totalPts(me.id)));
     const bid = Math.max(0, Math.min(cap, parseInt(rawAmount)||0));
     const cur = topOptions[dateKey][me.id];
-    const nextTops = {...topOptions, [dateKey]: {...topOptions[dateKey], [me.id]: {...cur, bid}}};
-    setTopOptions(nextTops); await persist("topOptions", nextTops);
-    trackEvent("topOption.set", { dateKey, slotPref: cur.slotPref, bid });
+    await applyAndTrack("topOption.set", { dateKey, slotPref: cur.slotPref, bid });
   };
 
   // Update slot preference on the user's existing Top Option for a day.
+  // D.4.D2 Phase 3: routed through applyAndTrack.
   const setSlotPref = async (dateKey, slotPref) => {
     if(!me || me.role !== "provider") return;
     if(!isAvailabilityOpen(currentBlock)) { flash("⚠️ Availability is closed for this block"); return; }
     if(!inTopOption(dateKey, me.id)) return;
     const sp = (slotPref==null) ? null : parseInt(slotPref);
     const cur = topOptions[dateKey][me.id];
-    const nextTops = {...topOptions, [dateKey]: {...topOptions[dateKey], [me.id]: {...cur, slotPref: sp}}};
-    setTopOptions(nextTops); await persist("topOptions", nextTops);
-    trackEvent("topOption.set", { dateKey, slotPref: sp, bid: cur.bid });
+    await applyAndTrack("topOption.set", { dateKey, slotPref: sp, bid: cur.bid });
   };
 
   // Link `dateKey` with the next day into one all-or-nothing chain. Both must already
   // be Top-Optioned by `me`. If either side already has a linkId, the chain absorbs
   // the other side; if both sides have different linkIds (two existing chains), they unify
   // under the left side's id.
+  // D.4.D2 Phase 3: routed through applyAndTrack. The linkId — captured here because it
+  // may use Math.random — is supplied in payload so the pure reducer can replay deterministically.
   const linkToNextDay = async (dateKey) => {
     if(!me || me.role !== "provider") return;
     if(!isAvailabilityOpen(currentBlock)) { flash("⚠️ Availability is closed for this block"); return; }
@@ -2912,28 +2894,14 @@ function ShiftApp() {
     const bLid = getLinkId(nextKey, me.id);
     if(aLid && aLid === bLid) return;  // already linked
     const linkId = aLid || bLid || newLinkId();
-    const nextTops = {...topOptions};
-    // Unify any existing chains on either side under the chosen id.
-    for(const dk of Object.keys(nextTops)){
-      const e = nextTops[dk]?.[me.id];
-      if(!e || !e.linkId) continue;
-      if(e.linkId === aLid || e.linkId === bLid){
-        nextTops[dk] = {...nextTops[dk], [me.id]: {...e, linkId}};
-      }
-    }
-    // Stamp the two endpoints if they weren't already in a chain.
-    for(const dk of [dateKey, nextKey]){
-      const e = nextTops[dk]?.[me.id];
-      if(!e || e.linkId === linkId) continue;
-      nextTops[dk] = {...nextTops[dk], [me.id]: {...e, linkId}};
-    }
-    setTopOptions(nextTops); await persist("topOptions", nextTops);
-    trackEvent("topOption.link", { dateKey, withDateKey: nextKey, linkId });
+    await applyAndTrack("topOption.link", { dateKey, withDateKey: nextKey, linkId });
     flash("🔗 Linked — all or nothing");
   };
 
   // Split a chain at the gap between `dateKey` and the next day. Each remaining half
   // keeps its members linked; halves of size 1 drop linkId entirely.
+  // D.4.D2 Phase 3: routed through applyAndTrack. chainRepair captures the split decisions
+  // (including the Math.random-derived rightLid) so the pure reducer can replay across devices.
   const unlinkFromNextDay = async (dateKey) => {
     if(!me || me.role !== "provider") return;
     if(!isAvailabilityOpen(currentBlock)) { flash("⚠️ Availability is closed for this block"); return; }
@@ -2947,22 +2915,7 @@ function ShiftApp() {
     const right = chain.slice(idx);
     const leftLid = left.length >= 2 ? lid : null;
     const rightLid = right.length >= 2 ? newLinkId() : null;
-    const nextTops = {...topOptions};
-    const stamp = (dk, newLid) => {
-      const e = nextTops[dk]?.[me.id];
-      if(!e) return;
-      if(newLid){
-        nextTops[dk] = {...nextTops[dk], [me.id]: {...e, linkId: newLid}};
-      } else {
-        const {linkId: _drop, ...rest} = e;
-        nextTops[dk] = {...nextTops[dk], [me.id]: rest};
-      }
-    };
-    for(const d of left) stamp(d, leftLid);
-    for(const d of right) stamp(d, rightLid);
-    setTopOptions(nextTops); await persist("topOptions", nextTops);
-    // D.4.B/C: chainRepair lets applyEvent replay the split without calling Math.random.
-    trackEvent("topOption.unlink", {
+    await applyAndTrack("topOption.unlink", {
       dateKey, splitAtNext: true,
       chainRepair: { left, right, leftLid, rightLid },
     });
