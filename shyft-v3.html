@@ -1882,6 +1882,12 @@ function ShiftApp() {
     }
   };
   // Owner-only: DELETE membership in caller's groups. Server tombstones if no other memberships.
+  // After cloud-side success, sweep every affected group's LOCAL state so the user disappears
+  // from the per-group users[] / shifts / unavail / prefs (the cloud delete doesn't touch local
+  // caches and the snapshot on D1 is stale until the next mutation from any device). For the
+  // currently-loaded group we route through applyAndTrack so a user.delete event fires for
+  // cross-device propagation; for non-loaded groups we hand-edit localStorage (limitation:
+  // cloud snapshot stays stale until that group is opened or mutated by another device).
   const submitAccountsDelete = async () => {
     if (!accountsDelete) return;
     setAccountsDelete(s => ({ ...s, busy: true, error: "" }));
@@ -1889,6 +1895,50 @@ function ShiftApp() {
       const r = await window.api.fetchJSON("/api/owner/users/" + encodeURIComponent(accountsDelete.uid), {
         method: "DELETE",
       });
+      // Local cascade per affected group.
+      for (const mem of (accountsDelete.memberships || [])) {
+        const localGroup = groups.find(g => g.cloudGroupId === mem.groupId);
+        if (!localGroup || mem.localUid == null) continue;
+        const localUid = mem.localUid;
+        if (groupId === localGroup.id) {
+          // Currently loaded — drive cleanup through the reducer so the user.delete event
+          // fires (cross-device propagation) and React state updates atomically.
+          const cascadeShifts = [];
+          Object.entries(shifts).forEach(([k, day]) => {
+            Object.entries(day).forEach(([sid, e]) => {
+              if (String(getUid(e)) === String(localUid)) cascadeShifts.push({ dateKey: k, slotId: parseInt(sid) });
+            });
+          });
+          await applyAndTrack("user.delete", { uid: String(localUid), cascadeShifts });
+        } else {
+          // Not loaded — hand-edit localStorage so next open shows correct state.
+          try {
+            const gkey = k => `shyft3_g${localGroup.id}_${k}`;
+            const readJ = (k, dflt) => { try { return JSON.parse(localStorage.getItem(gkey(k)) || dflt); } catch { return JSON.parse(dflt); } };
+            const usersArr = readJ("users", "[]").filter(u => String(u.id) !== String(localUid));
+            const shiftsObj = readJ("shifts", "{}");
+            const cleanShifts = {};
+            for (const [k, day] of Object.entries(shiftsObj)) {
+              const c = {};
+              for (const [sid, e] of Object.entries(day)) {
+                const uid = e && typeof e === "object" ? e.uid : e;
+                if (String(uid) !== String(localUid)) c[sid] = e;
+              }
+              if (Object.keys(c).length) cleanShifts[k] = c;
+            }
+            const unavailObj = readJ("unavail", "{}");
+            delete unavailObj[localUid]; delete unavailObj[String(localUid)];
+            const prefsObj = readJ("prefs", "{}");
+            delete prefsObj[localUid]; delete prefsObj[String(localUid)];
+            localStorage.setItem(gkey("users"),  JSON.stringify(usersArr));
+            localStorage.setItem(gkey("shifts"), JSON.stringify(cleanShifts));
+            localStorage.setItem(gkey("unavail"),JSON.stringify(unavailObj));
+            localStorage.setItem(gkey("prefs"),  JSON.stringify(prefsObj));
+          } catch (err) {
+            console.error("[accountsDelete] local cleanup failed for group", localGroup.id, err);
+          }
+        }
+      }
       setAccountsDelete(null);
       flash(r?.fullyDeleted ? "🗑 Account deleted" : "🗑 Removed from your groups");
       await loadAccounts();
@@ -7030,7 +7080,7 @@ function ShiftApp() {
                 <div className="flex flex-col gap-1.5 flex-shrink-0">
                   <button onClick={()=>setAccountsEdit({ uid:u.id, name:u.displayName||u.email, email:"", password:"", busy:false, error:"" })}
                     className="text-xs font-semibold px-2.5 py-1 border border-slate-200 rounded-lg hover:bg-slate-50">Edit</button>
-                  <button onClick={()=>setAccountsDelete({ uid:u.id, name:u.displayName||u.email, busy:false, error:"" })}
+                  <button onClick={()=>setAccountsDelete({ uid:u.id, name:u.displayName||u.email, memberships:u.memberships||[], busy:false, error:"" })}
                     className="text-xs font-semibold px-2.5 py-1 border border-red-200 text-red-700 rounded-lg hover:bg-red-50">Delete</button>
                 </div>
               </div>
