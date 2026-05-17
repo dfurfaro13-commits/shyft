@@ -2390,14 +2390,26 @@ function ShiftApp() {
   // calling. The reducer trusts the payload.
   const applyAndTrack = async (type, payload, opts = {}) => {
     const body = buildEventBody(type, payload, opts);
+    // applyEvent's first guard is `if (!evt || !evt.id) return state` — it bails on
+    // missing id. The server mints the real event id on POST, so we don't have one
+    // here yet. Stamp a local-only id used only for this call's applyEvent / dedup
+    // ring; the body POSTed to the server doesn't carry it, so the server still mints
+    // its own. Without this stamp applyEvent no-ops, no setX dispatches, and the local
+    // tab's UI never reflects the mutation (poll on OTHER tabs picks up the
+    // server-minted-id event normally and works fine — which is exactly the bug
+    // pattern: B sees A's decline but A doesn't).
+    const localEvtId = `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     // Synthesize a minimal evt for non-cloud-mirrored groups so applyEvent
     // still runs. clientTs matches body.clientTs when body exists.
-    const evt = body || {
-      type,
-      payload: payload || {},
-      localUid: me?.id || null,
-      clientTs: Date.now(),
-    };
+    const evt = body
+      ? { ...body, id: localEvtId }
+      : {
+          id: localEvtId,
+          type,
+          payload: payload || {},
+          localUid: me?.id || null,
+          clientTs: Date.now(),
+        };
     const before = validatorLiveRef.current;
     if (!before) return null;
     const cleanBefore = { ...before, appliedEventIds: [] };
