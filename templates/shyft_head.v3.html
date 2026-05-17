@@ -489,9 +489,11 @@
       for (const a of awards) {
         if (!a || !a.dateKey || a.uid == null) continue;
         const day = next[a.dateKey] ? { ...next[a.dateKey] } : {};
+        // `auto` defaults to false (Top Option awards), true for auto-assign cells —
+        // producer must stamp it explicitly when chaining auto-assign onto reconcile.
         day[a.slotId] = {
           uid: a.uid,
-          auto: false,
+          auto: !!a.auto,
           source: a.source || "pool",
           ...(a.bid != null ? { bid: a.bid } : {}),
           confirm: null,

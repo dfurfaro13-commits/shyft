@@ -172,7 +172,7 @@ function applyAwardsToShifts(shifts, awards) {
     if (!a || !a.dateKey || a.uid == null) continue;
     const day = next[a.dateKey] ? { ...next[a.dateKey] } : {};
     day[a.slotId] = {
-      uid: a.uid, auto: false, source: a.source || "pool",
+      uid: a.uid, auto: !!a.auto, source: a.source || "pool",
       ...(a.bid != null ? { bid: a.bid } : {}),
       confirm: null,
     };
@@ -2432,6 +2432,20 @@ export default function ShiftApp() {
   // v3 "Close & assign" — runs reconcile + two-pass auto-assign as one atomic transition.
   // Pool resolution comes from the preview; auto-assign is computed fresh against the post-reconcile
   // shifts so it can fill any newly-revealed open slots. Phase lands in Reconciliation when done.
+  // D.4.D2 Phase 3: routed through applyAndTrack. Reducer's block.reconcile handler owns the
+  // shifts + users + openIncentives + config cascade in one transaction.
+  //
+  // Two payload-shape fixes folded in (pre-Phase-3 latent bugs that shadow-diff missed because
+  // applyReconcile's awaits made validatorLiveRef post-mutation by the time trackEvent ran,
+  // turning the diff vacuous for shifts/openIncentives and only-real for users):
+  //   1. `awards` was passing the raw `awarded` array shape (.winner, .slot) which the reducer's
+  //      applyAwardsToShifts skips on its `a.uid == null` guard — so the reducer was a no-op for
+  //      shifts. We rebuild a flat awards array in the reducer-expected shape AND include the
+  //      auto-assign cells (the previous payload only carried reconcile-side awards, dropping
+  //      auto-assigns from any replaying device). Diff finalShifts vs current shifts to find
+  //      every newly-filled cell in one consistent shape.
+  //   2. applyAwardsToShifts hardcoded `auto: false`; now respects `a.auto` so auto-assign cells
+  //      keep their `auto: true` flag through replay.
   const applyReconcile = async () => {
     if(!reconcilePreview) return;
     const { result: reconResult, awarded, deltas } = reconcilePreview;
@@ -2439,29 +2453,20 @@ export default function ShiftApp() {
     const auto = computeAutoAssign(reconResult);
     const finalShifts = auto.result;
     const autoCount = auto.newAssignments.length;
-    setShifts(finalShifts); await persist("shifts",finalShifts);
-    // Snapshot the availability penalty for every provider BEFORE clearing topOptions —
-    // getAvailInfo unions topOptions into the preferred-day count, so we have to read the
-    // pending penalty while topOptions is still set. This is the moment the penalty becomes
-    // real: providers had the whole AVAIL phase to clear it; now it bites.
+    // Snapshot availability penalty BEFORE topOptions is touched — getAvailInfo unions topOptions
+    // into the preferred-day count, so we need the pending penalty while it's still set.
     const availPenalties = {};
     users.forEach(u => {
       if(u.role!=="provider") return;
       const p = getAvailInfo(u.id).penalty || 0;
       if(p > 0) availPenalties[u.id] = p;
     });
-    // Top Options are kept intact through close so an admin reset returns to the same provider
-    // input. computeReconcile is idempotent against an already-awarded day (it skips slots that
-    // are already filled), so leaving them set doesn't double-award if admin re-closes without
-    // resetting first — it just means the second close sees nothing left to do.
-    // Snapshot pointsAtClose for every provider BEFORE deducting bid spend, so future re-reconciles
-    // (e.g. after admin reset+reclose) tiebreak against the same entering-block balance.
+    // Snapshot pointsAtClose BEFORE bid deductions, so future re-reconciles tiebreak against
+    // the same entering-block balance.
     const pointsAtClose = {};
     users.forEach(u => { if(u.role==="provider") pointsAtClose[u.id] = u.points || 0; });
     // Collect open-shift incentive credits for any newly-awarded slots.
     const { credits: incCredits, nextOpenIncentives, mutated: incMutated } = collectIncentiveCredits(finalShifts);
-    // Capture which (dateKey, slotId) entries were consumed so applyEvent can replay the
-    // openIncentives mutation deterministically without re-deriving from shifts state.
     const consumedIncentives = [];
     if(incMutated){
       for(const [k, day] of Object.entries(openIncentives || {})){
@@ -2472,26 +2477,29 @@ export default function ShiftApp() {
         }
       }
     }
-    if(Object.keys(deltas).length || Object.keys(incCredits).length || Object.keys(availPenalties).length){
-      const nu = users.map(u => {
-        const bidDelta = deltas[u.id] || 0;
-        const incBonus = incCredits[u.id] || 0;
-        const penalty = availPenalties[u.id] || 0;
-        if(bidDelta === 0 && incBonus === 0 && penalty === 0) return u;
-        return {...u, points: Math.max(0, (u.points||0) + bidDelta + incBonus - penalty)};
-      });
-      setUsers(nu); await persist("users",nu);
+    // Build the complete awards array in the reducer-expected shape. Walks finalShifts and emits
+    // an entry for every cell that didn't have a uid before. `auto` flag carries through from
+    // the entry (true for auto-assign cells from computeAutoAssign, false for reconcile awards).
+    const allAwards = [];
+    for(const [dk, day] of Object.entries(finalShifts)){
+      for(const [sidStr, entry] of Object.entries(day)){
+        const sid = parseInt(sidStr);
+        const newUid = entry && (typeof entry === "object" ? entry.uid : entry);
+        if(newUid == null) continue;
+        if(getUid(shifts[dk]?.[sid])) continue;  // already had a uid pre-reconcile
+        allAwards.push({
+          dateKey: dk,
+          slotId: sid,
+          uid: newUid,
+          source: entry.source || "pool",
+          auto: !!entry.auto,
+          ...(entry.bid != null ? { bid: entry.bid } : {}),
+        });
+      }
     }
-    if(incMutated){ setOpenIncentives(nextOpenIncentives); await persist("openIncentives", nextOpenIncentives); }
-    // Stash the deltas on the current block so "Reset block" can reverse them. availPenalties is
-    // tracked separately so reset can restore it (and so the block report can attribute the cost).
-    // Phase advances to RECON — providers can no longer change availability/topOptions but can confirm/flag.
-    await updateCurrentBlock({phase: PHASE.RECON, lastReconcileDeltas:deltas, pointsAtClose, availPenalties});
-    // D.4.B: enriched payload. availPenalties / pointsAtClose / openIncentivesPatch are all
-    // cascaded effects of the reconcile — captured here so applyEvent doesn't have to re-derive.
-    trackEvent("block.reconcile", {
+    await applyAndTrack("block.reconcile", {
       blockId: currentBlock?.id != null ? String(currentBlock.id) : null,
-      awards: awarded,
+      awards: allAwards,
       autoCount,
       deltas,
       availPenalties,
@@ -2500,7 +2508,6 @@ export default function ShiftApp() {
     });
     flash(`✅ ${awarded.length} Top Option ${awarded.length===1?"award":"awards"} · ${autoCount} auto-filled · block now in Reconciliation`);
     setReconcilePreview(null);
-    // Optional convenience: surface the block report immediately so admin can audit.
     setShowBlockReport(true);
   };
 
