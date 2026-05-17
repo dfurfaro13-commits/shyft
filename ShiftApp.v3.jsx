@@ -2504,40 +2504,22 @@ export default function ShiftApp() {
     setShowBlockReport(true);
   };
 
+  // D.4.D2 Phase 3: routed through applyAndTrack. The reducer owns shifts deletion, points
+  // restoration, AND config block-phase patch — replacing the three imperative setX calls
+  // plus updateCurrentBlock. clearedDateKeys / restoredDeltas / restoredPenalties travel in
+  // payload so other devices can replay deterministically without re-reading our blockMeta.
   const resetBlock = async () => {
-    // Clear all shifts within the current block, send phase back to availability, and
-    // reverse the last reconcile's bid charges + availability penalty deductions.
-    const nextShifts = {...shifts};
-    let cleared = 0;
     const clearedDateKeys = [];
+    let cleared = 0;
     for(const k of blockDays){
-      if(nextShifts[k]){
-        cleared += Object.keys(nextShifts[k]).length;
+      if(shifts[k]){
+        cleared += Object.keys(shifts[k]).length;
         clearedDateKeys.push(k);
-        delete nextShifts[k];
       }
     }
-    setShifts(nextShifts); await persist("shifts",nextShifts);
     const restored = currentBlock?.lastReconcileDeltas || {};
     const restoredPenalties = currentBlock?.availPenalties || {};
-    const touchedUids = new Set([...Object.keys(restored), ...Object.keys(restoredPenalties)]);
-    if(touchedUids.size){
-      const nu = users.map(u => {
-        if(!touchedUids.has(String(u.id))) return u;
-        // bid deltas are stored as negative (charges), so subtracting reverses them.
-        // availPenalties are stored as positive amounts that were subtracted at close — add them back.
-        const bidDelta = restored[u.id] || 0;
-        const penalty = restoredPenalties[u.id] || 0;
-        return {...u, points: Math.max(0, (u.points||0) - bidDelta + penalty)};
-      });
-      setUsers(nu); await persist("users",nu);
-    }
-    // Reverting to availability invalidates the entering-pts snapshot — a fresh snapshot is taken
-    // when assignment runs again. Also clears the phase back to AVAIL so providers can edit.
-    await updateCurrentBlock({phase: PHASE.AVAIL, lastReconcileDeltas:{}, pointsAtClose:null, availPenalties:{}});
-    // D.4.B: capture the restored point deltas + penalties + cleared dates so applyEvent can
-    // replay deterministically without re-reading blockMeta.
-    trackEvent("block.reset", {
+    await applyAndTrack("block.reset", {
       blockId: currentBlock?.id != null ? String(currentBlock.id) : null,
       restoredDeltas: restored,
       restoredPenalties,
@@ -2551,13 +2533,20 @@ export default function ShiftApp() {
 
   // Per-shift confirmation by the awarded provider. "ok" = looks good, "flagged" = problem.
   // We store on the entry itself so it travels with the slot through any takes/swaps.
+  // D.4.D2 Phase 3: the "ok" path routes through applyAndTrack. The null (un-confirm) path
+  // stays imperative — there's no dedicated event type for it and the shift.confirm reducer
+  // hardcodes "ok". TODO: add a shift.unconfirm event in D.4.E for cross-device parity (rare
+  // path, low value today).
   const setShiftConfirm = async (dateKey, slotId, value /* "ok" | null */) => {
     const entry = shifts[dateKey]?.[slotId];
     if(!entry || getUid(entry) !== me.id) return;
-    const next = {...shifts};
-    next[dateKey] = {...next[dateKey], [slotId]: {...entry, confirm: value, flagReason: value==="ok"?null:entry.flagReason}};
-    setShifts(next); await persist("shifts", next);
-    if(value === "ok") trackEvent("shift.confirm", { dateKey, slotId });
+    if(value === "ok") {
+      await applyAndTrack("shift.confirm", { dateKey, slotId });
+    } else {
+      const next = {...shifts};
+      next[dateKey] = {...next[dateKey], [slotId]: {...entry, confirm: value, flagReason: entry.flagReason}};
+      setShifts(next); await persist("shifts", next);
+    }
   };
 
   // Returns ALL eligible swap candidates for a flagged shift, ranked by:
@@ -2649,31 +2638,16 @@ export default function ShiftApp() {
 
   // Admin reassigns a flagged shift to a candidate. Lifts the flag, stamps source "admin-swap",
   // tracks who it came from. New assignee gets a fresh confirm prompt.
+  // D.4.D2 Phase 3: routed through applyAndTrack. Reducer's shift.swap-admin handler owns
+  // the shift mutation AND the auto-listing-close cascade via closeAutoListingFor.
   const acceptSwapCandidate = async (dateKey, slotId, candidateUid) => {
     if(!me || me.role !== "admin") { flash("⚠️ Admin only"); return; }
     const entry = shifts[dateKey]?.[slotId];
     if(!entry || !getUid(entry)) return;
     const originalUid = getUid(entry);
     if(originalUid === candidateUid) { flash("⚠️ Same provider"); return; }
-    const ns = {...shifts};
-    ns[dateKey] = {...ns[dateKey], [slotId]: {
-      ...entry,
-      uid: candidateUid,
-      source: "auto-swap",
-      swappedFrom: originalUid,
-      confirm: null,
-      flagReason: null,
-    }};
-    setShifts(ns); await persist("shifts", ns);
-    // Close any auto-posted marketplace listing for this slot — the swap settled the issue.
-    const nm = marketplace.map(l =>
-      (l.dateKey === dateKey && l.slotId === slotId && l.status === "open" && l.autoPosted)
-        ? {...l, status:"cancelled", tradeOffers:(l.tradeOffers||[]).map(o => o.status==="pending" ? {...o, status:"stale"} : o)}
-        : l
-    );
-    if(nm.some((l,i) => l !== marketplace[i])){ setMarketplace(nm); await persist("marketplace", nm); }
     const newUser = users.find(u => u.id === candidateUid);
-    trackEvent("shift.swap-admin", {
+    await applyAndTrack("shift.swap-admin", {
       fromUid: String(originalUid),
       toUid: String(candidateUid),
       dateKey,
@@ -2685,6 +2659,8 @@ export default function ShiftApp() {
 
   // Admin executes a two-sided trade between the flagged shift's holder and a partner. Flips
   // both shifts atomically, stamps source "auto-trade" on each side, clears the flag.
+  // D.4.D2 Phase 3: routed through applyAndTrack. Reducer owns the dual-shift swap AND the
+  // auto-listing-close cascade on the flagged side.
   const acceptTradeCandidate = async (flaggedDateKey, flaggedSlotId, partnerDateKey, partnerSlotId) => {
     if(!me || me.role !== "admin") { flash("⚠️ Admin only"); return; }
     const aEntry = shifts[flaggedDateKey]?.[flaggedSlotId];
@@ -2693,24 +2669,9 @@ export default function ShiftApp() {
     const flaggerUid = getUid(aEntry);
     const partnerUid = getUid(bEntry);
     if(flaggerUid == null || partnerUid == null || flaggerUid === partnerUid) return;
-    const ns = {...shifts};
-    ns[flaggedDateKey] = {...ns[flaggedDateKey], [flaggedSlotId]: {
-      ...aEntry, uid: partnerUid, source: "auto-trade", swappedFrom: flaggerUid, confirm: null, flagReason: null,
-    }};
-    ns[partnerDateKey] = {...ns[partnerDateKey], [partnerSlotId]: {
-      ...bEntry, uid: flaggerUid, source: "auto-trade", swappedFrom: partnerUid, confirm: null, flagReason: null,
-    }};
-    setShifts(ns); await persist("shifts", ns);
-    // Close any auto-posted listing on the flagged shift — the trade settled it.
-    const nm = marketplace.map(l =>
-      (l.dateKey === flaggedDateKey && l.slotId === flaggedSlotId && l.status === "open" && l.autoPosted)
-        ? {...l, status:"cancelled", tradeOffers:(l.tradeOffers||[]).map(o => o.status==="pending" ? {...o, status:"stale"} : o)}
-        : l
-    );
-    if(nm.some((l,i) => l !== marketplace[i])){ setMarketplace(nm); await persist("marketplace", nm); }
     const flagger = users.find(u => u.id === flaggerUid);
     const partner = users.find(u => u.id === partnerUid);
-    trackEvent("shift.trade-admin", {
+    await applyAndTrack("shift.trade-admin", {
       aUid: String(flaggerUid),
       bUid: String(partnerUid),
       aDate: flaggedDateKey,
@@ -2958,25 +2919,18 @@ export default function ShiftApp() {
 
   // Admin sets a bonus-points incentive on an open slot. The pts are minted by the system on award
   // (no debit anywhere). Stored in openIncentives until the slot fills, then credited to the awardee.
+  // D.4.D2 Phase 3: routed through applyAndTrack. Reducer's incentive.open-set handler owns
+  // the upsert-or-delete based on points value (0 → delete entry, >0 → write).
   const setOpenIncentive = async (dateKey, slotId, ptsRaw) => {
     if(!me || me.role !== "admin") { flash("⚠️ Admin only"); return; }
     const entry = shifts[dateKey]?.[slotId];
     if(entry && getUid(entry)) { flash("⚠️ Slot already assigned — set incentive on the marketplace listing instead"); return; }
     const pts = Math.max(0, parseInt(ptsRaw)||0);
-    const next = {...openIncentives};
-    if(pts > 0){
-      if(!next[dateKey]) next[dateKey] = {};
-      else next[dateKey] = {...next[dateKey]};
-      next[dateKey][slotId] = pts;
-    } else if(next[dateKey]?.[slotId] != null){
-      next[dateKey] = {...next[dateKey]};
-      delete next[dateKey][slotId];
-      if(!Object.keys(next[dateKey]).length) delete next[dateKey];
-    } else {
-      return;  // no change
-    }
-    setOpenIncentives(next); await persist("openIncentives", next);
-    trackEvent("incentive.open-set", { dateKey, slotId, points: pts });
+    // Cheap pre-check: if the value isn't actually changing, skip the event (reducer would
+    // no-op too, but this saves the round-trip + outbox bookkeeping).
+    const cur = openIncentives[dateKey]?.[slotId] ?? 0;
+    if(pts === cur) return;
+    await applyAndTrack("incentive.open-set", { dateKey, slotId, points: pts });
     flash(pts > 0 ? `Incentive set: +${pts} pt${pts===1?"":"s"}` : "Incentive removed");
   };
 
