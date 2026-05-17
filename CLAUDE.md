@@ -15,9 +15,9 @@ The interface must be **clean, professional, simple, and intuitive.** This is th
 ## Project scope & constraints
 
 - **Hobby project.** David is building this on his own time. Recurring costs ≈ $0 — Cloudflare's free tier covers Workers, D1, and R2 at our current scale. No paid SaaS, no per-seat licenses. Flag anything that would change that.
-- **localStorage is still authoritative; cloud mirrors.** Phases A–C added cloud auth + event log + snapshot sync; Phase D is the in-flight migration to make cloud the source of truth. Until D.4.D2 ships, every state mutation writes to localStorage first; the event log + snapshot uploads run in parallel.
+- **Cloud is authoritative; localStorage is a cache.** As of D.4.D2 (shipped), `loadGroup` pulls from cloud (snapshot + event-tail replay), every mutation routes through `applyAndTrack → applyEvent → setX + persist + POST /api/events`, a 15s periodic poll syncs cross-device, and the snapshot uploader is a 30s-debounced compaction job gated on "dirty since last upload". localStorage still holds the per-group cache so the UI works offline-read-only, but the reducer is the single source of truth for state transitions.
 - **Hosted as a website.** Deployed to Cloudflare Pages + Worker at `app.shift-scheduling.com`.
-- **Design for cloud-mirroring from day one.** New mutations should fire `trackEvent` and the data shape should pass cleanly through `applyEvent` so the eventual D.4.D2 cutover stays cheap.
+- **Design for the reducer.** New mutations should go through `applyAndTrack(type, payload, opts)` — not `trackEvent` directly. Add a handler to `EVENT_HANDLERS` in the head template (mirror the reference stub in the JSX preamble), capture any non-deterministic inputs (`Date.now()`, `Math.random()`) into the payload, and route the producer through `applyAndTrack`. The dispatcher handles the slice-diff dispatch + POST + outbox.
 
 ---
 
@@ -118,9 +118,9 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 
 ---
 
-## Backend (Phase A → D.4.D1, all shipped)
+## Backend (Phase A → D.4.D2, all shipped)
 
-The Cloudflare Worker fronts a D1 database + R2 bucket. localStorage is still the source of truth in the app; the cloud mirror runs in parallel until D.4.D2 inverts the relationship.
+The Cloudflare Worker fronts a D1 database + R2 bucket. As of D.4.D2, cloud is the source of truth: `loadGroup` rehydrates from snapshot + event-tail replay, mutations go through `applyAndTrack` → reducer → POST event, a 15s poll syncs cross-device. localStorage still holds the per-group cache (so the UI reads it directly) but it's downstream of the reducer, not the source.
 
 - **Deploy:** `npx wrangler deploy` (after `wrangler login`, `d1 create shift-db`, paste id into `wrangler.jsonc`, run each `migrations/000*.sql` file via `d1 execute shift-db --remote --file=…`, `r2 bucket create shift-events`, and `wrangler secret put RESEND_API_KEY`, `SESSION_PEPPER`, `OWNER_BOOTSTRAP_CODE`).
 - **Local dev:** `npx wrangler dev`. Create `.dev.vars` (gitignored) with `RESEND_API_KEY=...` and `DEV_EMAIL=console` to log magic links instead of sending.
@@ -135,16 +135,15 @@ Every meaningful state mutation fires `POST /api/events` to D1. The component-lo
 
 ### Phase C — snapshot sync
 
-After every per-group `persist()`, a debounced uploader (~2s) fires `POST /api/snapshots` with the entire per-group state plus the local-only group metadata (`groupCode`, `adminCode`, `name`, `createdAt`). D1 stores the latest (one row per group, last-write-wins); R2 stores history at `snapshots/<groupId>/<server_ts>-<client_ts>.json`. Two consumer flows:
+After every per-group `persist()`, a debounced uploader fires `POST /api/snapshots` with the entire per-group state plus the local-only group metadata (`groupCode`, `adminCode`, `name`, `createdAt`). D1 stores the latest (one row per group, last-write-wins); R2 stores history at `snapshots/<groupId>/<server_ts>-<client_ts>.json`. D.4.D2 Phase 4 demoted the uploader: **2s → 30s debounce + dirty gate** (only uploads when `persist` has run since the last successful upload).
 
-- **Sync banner.** When a cloud-signed-in user opens a cloud-mirrored group and `checkCloudSyncOffer` sees cloud is meaningfully newer than this device's `shyft3_g<gid>_lastModified`, an amber banner offers "Sync now" — `applySnapshot` overwrites the 8 per-group keys and reloads the group.
-- **First-device-claim.** On the auth screen, any cloud membership not matched to a local `groups[]` entry renders a "Restore" card; clicking it pulls the latest snapshot and creates the local group from `payload.meta`.
+**The manual Sync banner (`checkCloudSyncOffer` / `acceptCloudSync` / amber JSX) was removed in D.4.D2 Phase 5** — the 15s periodic poll handles cross-device sync continuously now. `applySnapshot` survives because the first-device-claim Restore card on the auth screen and the owner-auto-restore useEffect both still need it: any cloud membership not matched to a local `groups[]` entry renders a "Restore" card; clicking pulls the latest snapshot and creates the local group from `payload.meta`.
 
 `buildSnapshotPayload` reads from a `snapshotStateRef` updated render-time (not via useEffect). This fixes a stale-closure bug where the 2s debounced upload was uploading pre-mutation state — caught by D.4.C's validator.
 
 **Concurrency control.** `POST /api/snapshots` accepts `If-Match: <serverTs>` and returns 409 with the current serverTs when stale. The frontend doesn't yet send `If-Match` — backwards-compatible last-write-wins is preserved. Making it mandatory remains deferred.
 
-### Phase D — backend-as-truth (D.1 + D.2 + D.2.5 + D.3 + D.4.A + D.4.B + D.4.C + D.4.D1 shipped)
+### Phase D — backend-as-truth (D.1 + D.2 + D.2.5 + D.3 + D.4.A + D.4.B + D.4.C + D.4.D1 + D.4.D2 shipped)
 
 **D.1 (password auth + cloud user creation).** PBKDF2 password hashes on `users` (310k iters, SHA-256, 16-byte salt; format `pbkdf2$310000$<salt>$<hash>`) and a `kind ∈ ('real','test')` designator. `POST /api/auth/password` issues a session for email+password, rate-limited 10/hr per (email, ip) via `password_attempts`. `POST /api/users` is the admin create-cloud-user surface: `kind='test'` mints a synthetic `<localId>@<cloudGroupId>.test.invalid` email + temp password; `kind='real'` pre-issues a magic link via Resend. The "+ Add user" modal in PeoplePage wires both flows; `NewUserInfoModal` surfaces local + cloud credentials in separate panels.
 
@@ -192,9 +191,35 @@ All 26 mutation paths in `ShiftApp.v3.jsx` now fire `trackEvent`, so the D1 even
 **D.4.D1 (dual-write shadow diff + event outbox).** Two additive pieces — localStorage still authoritative.
 
 - **Shadow diff.** `trackEvent` is now a dispatcher: snapshots live state synchronously (via `validatorLiveRef`, updated render-time so the deferred compare sees post-mutation state), schedules a `setTimeout(0)` to replay the event through `applyEvent` against that snapshot, and diffs against the now-updated live state. Mismatches log a grouped `[shadow-diff] ❌` console error. Runs unconditionally for cloud-signed-in users on cloud-mirrored groups. Cost ≈ sub-ms per event. Every divergence = a real reducer bug.
-- **Event outbox.** `window.api.postEvent(body)` wraps the `/api/events` POST; on transport failure or 5xx/408/429 the body is parked in `localStorage.shyft3_evt_outbox` (cap 500). Flushed in order on `visibilitychange→visible`, `online`, and once on load via `queueMicrotask`. 4xx errors are dropped. Idempotency caveat: server still mints event ids, so a retry that already committed creates a duplicate row — fine here because the outbox only fires on genuine transport failures (request never reached the server). D.4.D2 will tighten this with client-issued ids + INSERT-IGNORE.
+- **Event outbox.** `window.api.postEvent(body)` wraps the `/api/events` POST; on transport failure or 5xx/408/429 the body is parked in `localStorage.shyft3_evt_outbox` (cap 500). Flushed in order on `visibilitychange→visible`, `online`, and once on load via `queueMicrotask`. 4xx errors are dropped. Idempotency caveat: server still mints event ids, so a retry that already committed creates a duplicate row — fine here because the outbox only fires on genuine transport failures (request never reached the server). Client UUIDs + `INSERT OR IGNORE` are deferred to D.4.E.
 
-**Soak gate before D.4.D2:** 3+ days of normal use with zero `[shadow-diff]` errors in console.
+**D.4.D2 (cloud-authoritative cutover).** Six sub-phases, all shipped. localStorage is now downstream of the reducer.
+
+- **Phase 1 — `loadGroup` cloud-first.** `loadGroupFromCloud(gid, cloudGid)` pulls `/api/snapshots/:gid/latest`, replays events since `snap.serverTs` through `applyEvent`, stamps a per-group `shyft3_g<gid>_lastSeenServerTs` cursor, and writes through to localStorage via `writeGroupStateToStorage` (8 per-group keys). Conservative reverse-sync guard: if local has data AND the cloud snapshot has no payload, push local up first to protect the D.4.B → D.4.D2 danger window. `loadGroup` falls back to local-only on any cloud failure.
+
+- **Phase 2 — periodic poll.** New `useEffect` gated on `(groupId, cloudUser, currentGroup.cloudGroupId, me.id)`. While the document is visible, polls `GET /api/events?gid=&since=<lastSeenServerTs>` every 15s. Each batch is filtered (skip events stamped with this tab's `SHYFT_CLIENT_ID`), replayed through `applyEvent` via `validatorLiveRef`, and changed slices are dispatched via `setX + persist`. Visibility-aware (start on visible, clear on hidden, immediate poll on each transition); inflight guard prevents overlap.
+
+- **Phase 2.1 — per-tab `SHYFT_CLIENT_ID`.** Random UUID held in `sessionStorage` (survives reload, unique per tab); module-scope constant in head template, mirrored reference-only in JSX preamble. Stamped into every event payload by `trackEvent` / `applyAndTrack`. Cross-device poll filters on `evt.payload.clientId === SHYFT_CLIENT_ID` (skip own-tab events). Fixes the two-windows-of-the-same-user sync gap that the old `localUid == me.id` filter created. Pre-2.1 events without `clientId` fall back to the legacy `localUid` filter.
+
+- **Phase 3 — mutation flow refactor.** All 26 imperative `trackEvent` callsites are gone. Each mutation now flows through `applyAndTrack(type, payload, opts)`:
+  1. `buildEventBody(type, payload, opts)` builds the wire body (extracted from `trackEvent` so `applyAndTrack` and `trackEvent` share one canonical body + one `clientTs` — the reducer reads `e.clientTs` for `postedAt`/`takenAt` fields and any drift between the two would surface as shadow-diff).
+  2. Stamps a local `id` (`local_${Date.now()}_${rand}`) onto the event so `applyEvent`'s `if (!evt.id) return state` guard doesn't bail. The local id is NOT in the body POSTed to the server (server still mints).
+  3. Runs `applyEvent(cleanBefore, evt)` against `validatorLiveRef.current`.
+  4. Object-identity diffs each slice — only `setX + persist`s the slices that actually changed (reducer returns the same reference for untouched slices).
+  5. POSTs the same body the reducer consumed. Shadow-diff is intentionally bypassed because predicted == actual by construction now.
+  Producer side stays responsible for eligibility checks + capturing non-deterministic inputs into payload (e.g. `chainRepair`, listing ids, `pointsTransferred`). Two helper deletions fell out: `_postListing` (callers inline the "find existing or mint id" branch) and `updateCurrentBlock` (every block transition fires its own event whose reducer patches `config.blocks` via `patchBlockInConfig`).
+
+- **Phase 4 — snapshot uploader demotion.** Debounce `2s → 30s`; `snapshotDirty` ref gates `uploadSnapshot` (set true by `persist()` on any write, cleared on successful POST). Snapshot is now a compaction optimization + rehydration baseline, not the primary persistence path. Event log + poll are authoritative for realtime sync.
+
+- **Phase 5 — manual Sync banner removed.** Polling supersedes it. Deleted `cloudSyncOffer` state, `checkCloudSyncOffer`, the dependent `useEffect`, `acceptCloudSync`, and the amber banner JSX.
+
+**Two latent bugs surfaced + fixed during Phase 3 soak:**
+- Wire-format string vs local numeric uid mismatch in the marketplace flow (`offer.offererId` stored as string by `trade.offer-post` reducer, compared with strict-equality against numeric `me.id` in `acceptTradeOffer`). Fix: `uidVal(fromUid)` in the reducer + `String(a) === String(b)` defensive comparisons across the affected handlers (commits `73919da` for the swap-admin equivalent, `a09bf4f` for offer/accept).
+- `applyEvent`'s `if (!evt.id) return state` guard caused `applyAndTrack` to no-op silently when first written (server mints id on POST; applyAndTrack had no local id). Symptom: A's tab didn't update on its own actions even though B saw them via poll. Fix: stamp `local_${ts}_${rand}` on the evt (commit `c645e29`).
+
+**`block.reconcile` payload contract had three latent shape bugs** that the pre-Phase-3 imperative `applyReconcile` masked (post-mutation awaits made `validatorLiveRef` stale at shadow-diff time, turning the diff vacuous for shifts/openIncentives and only-real for the users cascade). Surfaced + fixed in commit `8e2cd63`: payload `awards` shape was `{winner, slot: target, ...}` but reducer reads `{uid, slotId, ...}` (silently skipped all entries); payload only carried reconcile awards, not auto-assign cells (replaying devices missed auto-assigns); `applyAwardsToShifts` hardcoded `auto: false`. All three fixed: rebuild a flat awards array from diffing `finalShifts` vs pre-reconcile `shifts`, in reducer-expected shape, with `auto` carried through.
+
+**Accounts delete cascade** (commit `af62dbf`): owner-level `DELETE /api/owner/users/:uid` now triggers a per-group local sweep on the deleter's client. For the currently-loaded group: `applyAndTrack("user.delete", { uid, cascadeShifts })` (reducer handles the four-slice cascade + cross-device event propagation). For non-loaded affected groups: hand-edit localStorage. Server-side snapshot patching for non-loaded groups stays a follow-up.
 
 ---
 
@@ -344,6 +369,8 @@ Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`, `offerT
 - **Compact code, dense comments.** The codebase favors slightly-dense JSX with explanatory comments above complex blocks rather than spreading things out. Match this style.
 - **Source-tag awarded entries.** When awarding a shift, set `source` to one of: `pool` | `pool-solo` | `cascade` | `preferred-auto` | `available-auto` | `auto-swap` | `marketplace` | `admin`. The block report attributes by source.
 - **Determinism for `applyEvent`.** Anything inside an `EVENT_HANDLERS` branch must be pure — no `Date.now()`, no `Math.random()`, no clock reads. If a handler needs entropy or a timestamp, the producer in `ShiftApp.v3.jsx` must capture it into the event payload (see D.4.B's `chainRepair`, `listing`, `awarded` enrichments).
+- **New mutations go through `applyAndTrack`, not `trackEvent`.** Post-D.4.D2 every state mutation flows `applyAndTrack(type, payload, opts)` → reducer → `setX + persist + POST`. Add a handler to `EVENT_HANDLERS` in the head template (mirror a reference stub `(s, e) => s` in the JSX preamble's `EVENT_HANDLERS` block for IDE awareness — the runtime copy is canonical), capture non-deterministic inputs into payload, and the producer just does eligibility checks + `await applyAndTrack(...)`. No direct `setX + persist` in handlers, no `trackEvent` callsites (there are none left). For cascades that touch multiple slices, design the reducer to do all of them; `applyAndTrack`'s object-identity diff dispatches only the slices that actually changed.
+- **Uid form: numeric local, stringified on the wire.** Local `users[i].id` is numeric; `me.id` and `entry.uid` in `shifts` are numeric. The wire format stringifies uids (`fromUid: String(me.id)`, etc.) for forward-compat with cloud-uuid uids someday. The reducer normalizes via `uidVal(...)` when writing into numeric-keyed fields (shifts[].uid, marketplace .offererId, .takenBy). Always use `String(a) === String(b)` for cross-source uid comparisons — strict-equality between numeric local and wire-string forms has bitten us twice already (`73919da`, `a09bf4f`).
 - **No emojis in code unless they're already part of the UX vocabulary** (🎯 ⭐ ✕ ⚙ 📣). User explicitly favors emoji UI for state markers.
 
 ---
@@ -366,19 +393,23 @@ Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`, `offerT
 - ✅ **v3.1: Top Option model replacing per-slot pools**
 - ✅ Phase A backend: magic-link auth, owner-issued invites (Cloudflare Worker + D1 + R2)
 - ✅ Phase B event log (`POST /api/events` + 26 wired types)
-- ✅ Phase C snapshot sync (debounced upload + Sync banner + Restore card)
+- ✅ Phase C snapshot sync (debounced upload + Restore card; sync banner deleted in D.4.D2 Phase 5)
 - ✅ Phase D.1/D.2/D.2.5: password auth, one-shot migration, cloud-owner bridge + impersonation
 - ✅ Phase D.3: cloud-backed signup + sign in, owner Accounts page
 - ✅ Phase D.4.A: backend foundation (allow-list, `GET /api/events` tail, payload-size bump)
 - ✅ Phase D.4.B: full `trackEvent` coverage + payload enrichments
 - ✅ Phase D.4.C: `applyEvent` reducer + offline validator
-- 🟡 Phase D.4.D1: dual-write shadow diff + event outbox (shipped, **in soak**)
+- ✅ Phase D.4.D1: dual-write shadow diff + event outbox
+- ✅ Phase D.4.D2: cloud-authoritative cutover (6 sub-phases — `loadGroup` cloud-first, 15s poll, per-tab client id, mutation refactor through `applyAndTrack`, snapshot uploader demotion, sync banner removal)
 
 ### Pending (deferred by user)
 - ⏳ **Lock-time point crediting** ("Step 2"). Today points credit at reconcile via `users.points` directly. Spec wants `users.points` (locked balance) split from `pendingPoints[blockId]` (this block's accruals), with pending → locked at the Lock transition.
 - ⏳ Schedule snapshot at Lock (frozen "My final schedule" view per user, persisted with the block).
-- ⏳ Phase D.4.D2: cloud-authoritative cutover. Plan in `~/.claude/plans/crispy-twirling-nest.md`.
-- ⏳ Phase D.4.E: polish (UUID event ids, retired `Date.now()` ids, etc.).
+- ⏳ Phase D.4.E polish:
+  - Client UUIDs (replace `Date.now()`-based ids in `adminAddUser`, listings, offers) + `INSERT OR IGNORE` on event POST so outbox retries don't dupe.
+  - Event types for the three remaining local-only handlers: `clearFlag` (admin clears a flag without swapping), `setShiftConfirm` null-path (un-confirm), `adminAssign` (admin direct slot assignment with optional incentive credit).
+  - Server-side snapshot patching when owner deletes from Accounts (so non-loaded groups don't need a client-side sweep — currently a hand-edit-localStorage fallback per `af62dbf`).
+  - Conflict toasts on `POST /api/events` failure; outbox depth indicator on admin dashboard.
 - ⏳ R2 monthly event-log archival (deferred until corpus grows).
 - ⏳ Mandatory `If-Match` on snapshot uploads (concurrency control beyond last-write-wins).
 
@@ -410,9 +441,13 @@ Smoke test (against either of the above):
 7. Admin → Lock block
 
 D.4 verification (cloud-signed-in owner only):
-- DevTools console should stay quiet — any `[shadow-diff] ❌` line is a real reducer bug. Screenshot + diagnose before shipping the next change.
-- After a batch of events, run `await window.__shiftValidator.run()` in DevTools; expect `✅ 0 divergences`.
-- Outbox check: DevTools → Network → Offline → fire one event → Online → confirm `localStorage.getItem("shyft3_evt_outbox") === "[]"` after the flush.
+- **Validator is the canonical source-of-truth check.** Run `await window.__shiftValidator.run()` in DevTools; expect `✅ 0 divergences`. Post-D.4.D2 the shadow-diff inside `trackEvent` is effectively dead code (zero callsites left) — divergence detection lives in the validator's snapshot+event-replay diff.
+- **Console should stay quiet.** Any `[applyAndTrack] reducer threw`, `[shadow-diff] ❌`, `[uploadSnapshot] refusing…`, or `[writeGroupStateToStorage] refusing…` line is a real bug. Screenshot + diagnose before shipping.
+- **Cross-device:** open two windows as different users; mutate in one → other reflects within ~15s via poll. No amber Sync banner — it was removed in Phase 5.
+- **Multi-window same-user:** two tabs of the same login should sync via the per-tab `SHYFT_CLIENT_ID` filter (`window.__shyftClientId` should differ per tab).
+- **Snapshot uploader cadence:** mutate → `POST /api/events` fires immediately → `POST /api/snapshots` debounces for 30s then fires once. No further snapshot POSTs if no mutations.
+- **Outbox check:** DevTools → Network → Offline → fire one event → Online → confirm `localStorage.getItem("shyft3_evt_outbox") === "[]"` after the flush.
+- **Cold-load:** clear localStorage → reload → sign in → group rehydrates from snapshot + event-tail replay via `loadGroupFromCloud`.
 
 ---
 
