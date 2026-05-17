@@ -3853,10 +3853,10 @@ function ShiftApp() {
   };
   // opts.reason annotates the user.update event so replay/audit can distinguish admin point
   // adjustments from ordinary profile edits without re-deriving from the patch shape.
+  // D.4.D2 Phase 3: routed through applyAndTrack. adjustPoints inherits the refactor since
+  // it just delegates here.
   const updateUser = async (uid, patch, opts = {}) => {
-    const next = users.map(u => u.id===uid ? {...u, ...patch} : u);
-    setUsers(next); await persist("users", next);
-    trackEvent("user.update", {
+    await applyAndTrack("user.update", {
       uid: String(uid), patch,
       ...(opts.reason ? { reason: opts.reason } : {}),
     });
@@ -3865,29 +3865,21 @@ function ShiftApp() {
     const u = users.find(x => x.id===uid);
     await updateUser(uid, { points: Math.max(0, (u?.points||0) + delta) }, { reason: "adjust" });
   };
+  // D.4.D2 Phase 3: routed through applyAndTrack. Reducer's user.delete owns the four-slice
+  // cascade (users + shifts + unavailability + preferences). cascadeShifts is captured in
+  // payload (admin's local state is canonical for which slots to drop); the unavailability
+  // and preferences cascade is derived inside the reducer from the uid, so no payload entry.
   const deleteUser = async uid => {
     if(!confirm("Delete this account?")) return;
-    // Capture cascades before the mutation so the event payload carries the full
-    // effect — applyEvent doesn't have to know how to derive them in D.4.C.
     const cascadeShifts = [];
     Object.entries(shifts).forEach(([k, day]) => {
       Object.entries(day).forEach(([sid, e]) => {
         if(getUid(e) === uid) cascadeShifts.push({ dateKey: k, slotId: parseInt(sid) });
       });
     });
-    const cascadeUnavail = unavailability[uid] || null;
-    const cascadePrefs = preferences[uid] || null;
-    const nu = users.filter(u => u.id !== uid);
-    const ns = {}; Object.entries(shifts).forEach(([k,day])=>{const c={};Object.entries(day).forEach(([sid,e])=>{if(getUid(e)!==uid)c[sid]=e;});if(Object.keys(c).length)ns[k]=c;});
-    const nun = {...unavailability}; delete nun[uid];
-    const npr = {...preferences}; delete npr[uid];
-    setUsers(nu); setShifts(ns); setUnavailability(nun); setPreferences(npr);
-    await persist("users",nu); await persist("shifts",ns); await persist("unavail",nun); await persist("prefs",npr);
-    trackEvent("user.delete", {
+    await applyAndTrack("user.delete", {
       uid: String(uid),
       cascadeShifts,
-      cascadeUnavail,
-      cascadePrefs,
     });
     flash("Removed");
   };
@@ -3914,8 +3906,10 @@ function ShiftApp() {
       email: (form.email||"").trim() || null,
       createdAt: Date.now(),
     };
-    const next = [...users, nu]; setUsers(next); await persist("users", next);
-    trackEvent("user.create", { user: nu });
+    // D.4.D2 Phase 3: route through applyAndTrack. Reducer appends nu to users; the temp
+    // password and pwHash are intentionally kept on the user object (same as pre-refactor
+    // behavior — that's how the next sign-in finds the hash).
+    await applyAndTrack("user.create", { user: nu });
     return { user: nu, tempPassword };
   };
 
