@@ -2137,15 +2137,9 @@ export default function ShiftApp() {
     if(!me||me.role!=="provider") return;
     const cur=unavailability[me.id]||{};
     const blocked=k in cur;
-    const nextCur={...cur};
-    if(blocked) delete nextCur[k]; else nextCur[k]=null;
-    const next={...unavailability,[me.id]:nextCur};
-    setUnavailability(next); await persist("unavail",next);
-    if(!blocked){
-      const pcur=preferences[me.id]||[];
-      if(pcur.includes(k)){ const pnext={...preferences,[me.id]:pcur.filter(d=>d!==k)}; setPreferences(pnext); await persist("prefs",pnext); }
-    }
-    trackEvent("unavail.toggle", { dateKey: k, blocked: !blocked });
+    // D.4.D2 Phase 3: route through applyAndTrack. Reducer's unavail.toggle handler owns
+    // both the unavailability flip AND the preference-clear cascade when blocking.
+    await applyAndTrack("unavail.toggle", { dateKey: k, blocked: !blocked });
   };
 
   const toggleUnavail = async k => {
@@ -2168,28 +2162,44 @@ export default function ShiftApp() {
     await _applyToggleUnavail(k);
   };
 
+  // D.4.D2 Phase 3: route through applyAndTrack. Reducer rejects if the day isn't already
+  // in the user's unavail map, matching the imperative `if(!(k in cur)) return` guard.
   const setUnavailReason = async (k, reason) => {
     if(!me||me.role!=="provider") return;
     const cur=unavailability[me.id]||{};
     if(!(k in cur)) return;
-    const next={...unavailability,[me.id]:{...cur,[k]:reason||null}};
-    setUnavailability(next); await persist("unavail",next);
-    trackEvent("unavail.reason", { dateKey: k, reason: reason || null });
+    await applyAndTrack("unavail.reason", { dateKey: k, reason: reason || null });
   };
 
+  // D.4.D2 Phase 3: route through applyAndTrack with optional chainRepair payload. The
+  // reducer's preference.toggle handles BOTH the preference flip AND the topOption-clear +
+  // chain-repair cascade atomically — avoids the nested applyAndTrack race that calling
+  // clearTopOption separately would create (validatorLiveRef can lag a microtask between
+  // sequential dispatches, causing the second call to overwrite the first's chain repair).
   const togglePreference = async k => {
     if(!me||me.role!=="provider") return;
     if(isUnavail(me.id,k)){ flash("⚠️ You've blocked this day"); return; }
     if(!inBlock(k,config)){ flash("⚠️ Outside block"); return; }
     const cur=preferences[me.id]||[];
     const wanted=cur.includes(k);
-    // Removing preferred while a Top Option is active is contradictory — clear the Top Option too.
+    let chainRepair = null;
     if(wanted && inTopOption(k, me.id)){
-      await clearTopOption(k);
+      const lid = getLinkId(k, me.id);
+      const chain = lid ? getLinkChain(k, me.id) : [];
+      if(chain.length){
+        const idx = chain.indexOf(k);
+        const left = chain.slice(0, idx);
+        const right = chain.slice(idx + 1);
+        const leftLid = left.length >= 2 ? lid : null;
+        const rightLid = right.length >= 2 ? newLinkId() : null;
+        chainRepair = { left, right, leftLid, rightLid };
+      }
     }
-    const next={...preferences,[me.id]:wanted?cur.filter(d=>d!==k):[...cur,k]};
-    setPreferences(next); await persist("prefs",next);
-    trackEvent("preference.toggle", { dateKey: k, wanted: !wanted });
+    await applyAndTrack("preference.toggle", {
+      dateKey: k,
+      wanted: !wanted,
+      ...(chainRepair ? { chainRepair } : {}),
+    });
   };
 
   const setTargets = async (uid, targets) => await updateUser(uid, { targets });
@@ -3016,19 +3026,13 @@ export default function ShiftApp() {
   };
 
   /* ── Admin helpers ── */
-  // opts.skipEvent suppresses the config.update event — used by updateCurrentBlock since
-  // every block-phase transition already fires its own specific event (block.reconcile,
-  // block.lock, block.unlock, block.reset). Without the opt-out we'd double-log every transition.
-  const updateConfig = async (patch, opts = {}) => {
-    const next = {...config, ...patch};
-    setConfig(next); await persist("config", next);
-    if(!opts.skipEvent) trackEvent("config.update", { patch });
-  };
-  // Patch the currently-active block in-place. No-op if no block is active.
-  const updateCurrentBlock = async patch => {
-    if(!config.currentBlockId || !Array.isArray(config.blocks)) return;
-    const blocks = config.blocks.map(b => b.id===config.currentBlockId ? {...b, ...patch} : b);
-    await updateConfig({blocks}, { skipEvent: true });
+  // D.4.D2 Phase 3: routed through applyAndTrack. The previous opts.skipEvent escape hatch
+  // (used by updateCurrentBlock to avoid double-logging on block transitions) is gone —
+  // updateCurrentBlock itself is deleted too, because every block-phase transition now
+  // fires its own event (block.lock / block.unlock / block.reset / block.reconcile) whose
+  // reducer patches config.blocks directly via patchBlockInConfig.
+  const updateConfig = async (patch) => {
+    await applyAndTrack("config.update", { patch });
   };
   // v3.1 admin-assign: entries are now award-only (no per-slot pool field). Setting uid:null
   // simply removes the entry. Setting a uid stamps an admin-source award.
@@ -3797,7 +3801,7 @@ export default function ShiftApp() {
           </ul>
           <div className="flex gap-2">
             <button onClick={()=>setConfirmLock(false)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
-            <button onClick={async()=>{ await updateCurrentBlock({phase:PHASE.LOCKED}); trackEvent("block.lock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null }); setConfirmLock(false); flash("🔒 Block locked"); }}
+            <button onClick={async()=>{ await applyAndTrack("block.lock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null }); setConfirmLock(false); flash("🔒 Block locked"); }}
               className="flex-1 py-2.5 text-sm bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-medium">Lock block</button>
           </div>
         </div>
@@ -4563,7 +4567,7 @@ export default function ShiftApp() {
               </button>
             );
             return (
-              <button onClick={()=>{ updateCurrentBlock({phase:PHASE.RECON}); trackEvent("block.unlock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null }); }}
+              <button onClick={()=>{ applyAndTrack("block.unlock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null }); }}
                 className="py-2.5 text-sm font-medium rounded-lg bg-amber-600 text-white hover:bg-amber-700">
                 🔓 Unlock (back to Reconciliation)
               </button>
@@ -5597,7 +5601,7 @@ export default function ShiftApp() {
       if(!canAct) return;
       if(phase===PHASE.AVAIL) setReconcilePreview(computeReconcile());
       else if(phase===PHASE.RECON) setConfirmLock(true);
-      else updateCurrentBlock({phase:PHASE.RECON});
+      else applyAndTrack("block.unlock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null });
     };
     const statusLabel = !currentBlock
       ? "No current block"

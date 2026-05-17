@@ -637,7 +637,7 @@
       },
 
       "preference.toggle": (s, e) => {
-        const { dateKey, wanted } = e.payload || {};
+        const { dateKey, wanted, chainRepair } = e.payload || {};
         const uid = e.localUid;
         if (!dateKey || uid == null) return s;
         const prefKey = (uid in s.preferences) ? uid : (String(uid) in s.preferences ? String(uid) : uid);
@@ -651,6 +651,14 @@
           // Removing preferred also clears the Top Option (mirrors togglePreference live cascade).
           if (next.topOptions[dateKey]?.[uid] || next.topOptions[dateKey]?.[String(uid)]) {
             next = { ...next, topOptions: removeTopOptionEntry(next.topOptions, dateKey, uid) };
+            // chainRepair travels in payload when the cleared topOption was a chain member —
+            // the producer captures the Math.random-derived rightLid so this stays deterministic
+            // across replay. Atomic with the preference + topOption mutations in one event,
+            // avoiding nested applyAndTrack races between clearTopOption and preference.toggle.
+            if (chainRepair) {
+              next = { ...next, topOptions: stampChainLinkIds(next.topOptions, chainRepair.left || [], uid, chainRepair.leftLid) };
+              next = { ...next, topOptions: stampChainLinkIds(next.topOptions, chainRepair.right || [], uid, chainRepair.rightLid) };
+            }
           }
           return next;
         }
