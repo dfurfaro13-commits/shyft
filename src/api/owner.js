@@ -142,14 +142,26 @@ export async function restoreSnapshot(req, env, { gid }) {
 //
 // Writes a fresh R2 history entry too so the patch shows up in the snapshot timeline and
 // we don't lose audit trail.
-async function patchSnapshotRemoveUser(env, callerId, groupId, localUid) {
+async function patchSnapshotRemoveUser(env, callerId, groupId, localUid, cloudUid) {
   const snap = await q1(env, "SELECT payload FROM snapshots WHERE group_id = ?", groupId);
   if (!snap) return;
   let payload;
   try { payload = JSON.parse(snap.payload); } catch { return; }
   if (!payload || typeof payload !== "object") return;
 
-  const uidStr = String(localUid);
+  // Resolve the local user's id within the snapshot. Two paths:
+  //   - membership.local_uid is set (D.2 migration + admin-add): use it directly.
+  //   - membership.local_uid is null (D.3 self-serve cloud signup): match by cloudUserId
+  //     on payload.users. enterGroupAsCloudMember stamps cloudUserId when creating the
+  //     local user record, so this link is reliable for any user that joined via D.3.
+  let resolvedUid = localUid;
+  if (resolvedUid == null && cloudUid != null && Array.isArray(payload.users)) {
+    const u = payload.users.find(u => u && String(u.cloudUserId || "") === String(cloudUid));
+    if (u) resolvedUid = u.id;
+  }
+  if (resolvedUid == null) return;  // user isn't in this snapshot at all — nothing to scrub
+
+  const uidStr = String(resolvedUid);
   const matchUid = v => String(v) === uidStr;
 
   if (Array.isArray(payload.users)) {
@@ -171,11 +183,11 @@ async function patchSnapshotRemoveUser(env, callerId, groupId, localUid) {
   }
 
   if (payload.unavail && typeof payload.unavail === "object") {
-    delete payload.unavail[localUid];
+    delete payload.unavail[resolvedUid];
     delete payload.unavail[uidStr];
   }
   if (payload.prefs && typeof payload.prefs === "object") {
-    delete payload.prefs[localUid];
+    delete payload.prefs[resolvedUid];
     delete payload.prefs[uidStr];
   }
   if (payload.topOptions && typeof payload.topOptions === "object") {
@@ -183,7 +195,7 @@ async function patchSnapshotRemoveUser(env, callerId, groupId, localUid) {
     for (const [dk, day] of Object.entries(payload.topOptions)) {
       if (!day || typeof day !== "object") continue;
       const cleanDay = { ...day };
-      delete cleanDay[localUid];
+      delete cleanDay[resolvedUid];
       delete cleanDay[uidStr];
       if (Object.keys(cleanDay).length) cleanTops[dk] = cleanDay;
     }
@@ -212,6 +224,7 @@ async function patchSnapshotRemoveUser(env, callerId, groupId, localUid) {
           serverTs: String(serverTs),
           patchedBy: "deleteOwnerUser",
           removedLocalUid: uidStr,
+          removedCloudUid: cloudUid != null ? String(cloudUid) : "",
         },
       });
     } catch (e) {
@@ -361,9 +374,12 @@ export async function deleteOwnerUser(req, env, { uid }) {
   //
   //      Done best-effort per group: a single broken snapshot shouldn't abort the whole delete.
   for (const row of affectedRows) {
-    if (row.local_uid == null) continue;
     try {
-      await patchSnapshotRemoveUser(env, caller.id, row.group_id, row.local_uid);
+      // Pass the deleted user's cloud uid (`uid`) as fallback — patchSnapshotRemoveUser
+      // uses it to find the local user in payload.users when membership.local_uid is null
+      // (the D.3 self-serve cloud signup path leaves local_uid null; the local user
+      // record in the snapshot carries cloudUserId for the same link).
+      await patchSnapshotRemoveUser(env, caller.id, row.group_id, row.local_uid, uid);
     } catch (e) {
       console.error("snapshot patch failed for group", row.group_id, e?.message || e);
     }

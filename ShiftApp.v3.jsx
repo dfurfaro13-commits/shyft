@@ -1075,10 +1075,22 @@ export default function ShiftApp() {
         method: "DELETE",
       });
       // Local cascade per affected group.
+      // mem.localUid resolution: server populates it for D.2 migration + admin-add. For D.3
+      // self-serve cloud signup it's null, but the local user object in storage carries
+      // `cloudUserId` matching the deleted cloud uid — fall back to that to find them.
+      const cloudUid = accountsDelete.uid;
       for (const mem of (accountsDelete.memberships || [])) {
         const localGroup = groups.find(g => g.cloudGroupId === mem.groupId);
-        if (!localGroup || mem.localUid == null) continue;
-        const localUid = mem.localUid;
+        if (!localGroup) continue;
+        let localUid = mem.localUid;
+        if (localUid == null) {
+          try {
+            const usersArr = JSON.parse(localStorage.getItem(`shyft3_g${localGroup.id}_users`) || "[]");
+            const u = usersArr.find(u => u && String(u.cloudUserId || "") === String(cloudUid));
+            if (u) localUid = u.id;
+          } catch {}
+        }
+        if (localUid == null) continue;
         if (groupId === localGroup.id) {
           // Currently loaded — drive cleanup through the reducer so the user.delete event
           // fires (cross-device propagation) and React state updates atomically.
