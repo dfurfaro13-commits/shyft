@@ -1169,6 +1169,27 @@
           delete p[String(uid)];
           next = { ...next, preferences: p };
         }
+        // D.4.E: also cascade topOptions. Without this, a deleted user's Top Option entries
+        // would linger in payload.topOptions[dateKey][uid], showing up as zombie bids the next
+        // time the group is loaded. Server's snapshot patch in deleteOwnerUser does the same
+        // cascade — keep them aligned.
+        if (next.topOptions && typeof next.topOptions === "object") {
+          let touched = false;
+          const cleanTops = {};
+          for (const [dk, day] of Object.entries(next.topOptions)) {
+            if (!day || typeof day !== "object") continue;
+            if (day[uid] === undefined && day[String(uid)] === undefined) {
+              cleanTops[dk] = day;
+              continue;
+            }
+            touched = true;
+            const cleanDay = { ...day };
+            delete cleanDay[uid];
+            delete cleanDay[String(uid)];
+            if (Object.keys(cleanDay).length) cleanTops[dk] = cleanDay;
+          }
+          if (touched) next = { ...next, topOptions: cleanTops };
+        }
         return next;
       },
 

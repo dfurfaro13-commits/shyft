@@ -219,7 +219,12 @@ All 26 mutation paths in `ShiftApp.v3.jsx` now fire `trackEvent`, so the D1 even
 
 **`block.reconcile` payload contract had three latent shape bugs** that the pre-Phase-3 imperative `applyReconcile` masked (post-mutation awaits made `validatorLiveRef` stale at shadow-diff time, turning the diff vacuous for shifts/openIncentives and only-real for the users cascade). Surfaced + fixed in commit `8e2cd63`: payload `awards` shape was `{winner, slot: target, ...}` but reducer reads `{uid, slotId, ...}` (silently skipped all entries); payload only carried reconcile awards, not auto-assign cells (replaying devices missed auto-assigns); `applyAwardsToShifts` hardcoded `auto: false`. All three fixed: rebuild a flat awards array from diffing `finalShifts` vs pre-reconcile `shifts`, in reducer-expected shape, with `auto` carried through.
 
-**Accounts delete cascade** (commit `af62dbf`): owner-level `DELETE /api/owner/users/:uid` now triggers a per-group local sweep on the deleter's client. For the currently-loaded group: `applyAndTrack("user.delete", { uid, cascadeShifts })` (reducer handles the four-slice cascade + cross-device event propagation). For non-loaded affected groups: hand-edit localStorage. Server-side snapshot patching for non-loaded groups stays a follow-up.
+**Accounts delete cascade** (commit `af62dbf` + D.4.E follow-up): owner-level `DELETE /api/owner/users/:uid` now triggers cleanup at three layers:
+- Client, currently-loaded group: `applyAndTrack("user.delete", { uid, cascadeShifts })` — reducer handles the four-slice cascade + cross-device event propagation via the event log.
+- Client, non-loaded affected groups: hand-edit localStorage (so the next time the deleter opens those groups they don't see the user).
+- Server (D.4.E): for each affected (group_id, local_uid) pair, `patchSnapshotRemoveUser` in `src/api/owner.js` rewrites the D1 snapshot — filter user out of `payload.users`, cascade-clean `shifts` / `unavail` / `prefs` / `topOptions` — and writes a fresh R2 history entry stamped `patchedBy: "deleteOwnerUser"`. Ensures any other device opening the group later via `loadGroupFromCloud` pulls correct state, not stale.
+
+Reducer's `user.delete` extended in the same D.4.E commit to also cascade `topOptions` (was missing — would have left zombie bid entries on cross-device replay).
 
 ---
 
@@ -408,7 +413,6 @@ Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`, `offerT
 - ⏳ Phase D.4.E polish:
   - Client UUIDs (replace `Date.now()`-based ids in `adminAddUser`, listings, offers) + `INSERT OR IGNORE` on event POST so outbox retries don't dupe.
   - Event types for the three remaining local-only handlers: `clearFlag` (admin clears a flag without swapping), `setShiftConfirm` null-path (un-confirm), `adminAssign` (admin direct slot assignment with optional incentive credit).
-  - Server-side snapshot patching when owner deletes from Accounts (so non-loaded groups don't need a client-side sweep — currently a hand-edit-localStorage fallback per `af62dbf`).
   - Conflict toasts on `POST /api/events` failure; outbox depth indicator on admin dashboard.
 - ⏳ R2 monthly event-log archival (deferred until corpus grows).
 - ⏳ Mandatory `If-Match` on snapshot uploads (concurrency control beyond last-write-wins).

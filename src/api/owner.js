@@ -131,6 +131,95 @@ export async function restoreSnapshot(req, env, { gid }) {
   });
 }
 
+// Internal: patch a group's latest D1 snapshot to remove a deleted user + cascade their
+// slice entries (shifts cells, unavail/prefs/topOptions maps). Called from deleteOwnerUser
+// for each (group_id, local_uid) pair that was scrubbed from memberships.
+//
+// Mirrors the reducer's user.delete cascade plus a topOptions sweep that the reducer doesn't
+// currently do (the reducer should follow suit — fixed alongside this change). Marketplace
+// listings + trade offers attributed to the deleted user are intentionally left alone, to
+// match the live-state behavior of the client-side deleteUser handler.
+//
+// Writes a fresh R2 history entry too so the patch shows up in the snapshot timeline and
+// we don't lose audit trail.
+async function patchSnapshotRemoveUser(env, callerId, groupId, localUid) {
+  const snap = await q1(env, "SELECT payload FROM snapshots WHERE group_id = ?", groupId);
+  if (!snap) return;
+  let payload;
+  try { payload = JSON.parse(snap.payload); } catch { return; }
+  if (!payload || typeof payload !== "object") return;
+
+  const uidStr = String(localUid);
+  const matchUid = v => String(v) === uidStr;
+
+  if (Array.isArray(payload.users)) {
+    payload.users = payload.users.filter(u => !matchUid(u.id));
+  }
+
+  if (payload.shifts && typeof payload.shifts === "object") {
+    const cleanShifts = {};
+    for (const [dk, day] of Object.entries(payload.shifts)) {
+      if (!day || typeof day !== "object") continue;
+      const cleanDay = {};
+      for (const [sid, entry] of Object.entries(day)) {
+        const eUid = entry && typeof entry === "object" ? entry.uid : entry;
+        if (!matchUid(eUid)) cleanDay[sid] = entry;
+      }
+      if (Object.keys(cleanDay).length) cleanShifts[dk] = cleanDay;
+    }
+    payload.shifts = cleanShifts;
+  }
+
+  if (payload.unavail && typeof payload.unavail === "object") {
+    delete payload.unavail[localUid];
+    delete payload.unavail[uidStr];
+  }
+  if (payload.prefs && typeof payload.prefs === "object") {
+    delete payload.prefs[localUid];
+    delete payload.prefs[uidStr];
+  }
+  if (payload.topOptions && typeof payload.topOptions === "object") {
+    const cleanTops = {};
+    for (const [dk, day] of Object.entries(payload.topOptions)) {
+      if (!day || typeof day !== "object") continue;
+      const cleanDay = { ...day };
+      delete cleanDay[localUid];
+      delete cleanDay[uidStr];
+      if (Object.keys(cleanDay).length) cleanTops[dk] = cleanDay;
+    }
+    payload.topOptions = cleanTops;
+  }
+
+  const payloadStr = JSON.stringify(payload);
+  const serverTs = nowSec();
+  const clientTs = Date.now();
+
+  await exec(
+    env,
+    `UPDATE snapshots SET payload = ?, user_id = ?, client_ts = ?, server_ts = ? WHERE group_id = ?`,
+    payloadStr, callerId, clientTs, serverTs, groupId,
+  );
+
+  if (env.R2) {
+    const key = `snapshots/${groupId}/${serverTs}-${clientTs}.json`;
+    try {
+      await env.R2.put(key, payloadStr, {
+        httpMetadata: { contentType: "application/json" },
+        customMetadata: {
+          groupId,
+          userId: callerId,
+          clientTs: String(clientTs),
+          serverTs: String(serverTs),
+          patchedBy: "deleteOwnerUser",
+          removedLocalUid: uidStr,
+        },
+      });
+    } catch (e) {
+      console.error("R2 put failed (snapshot patch):", key, e?.message || e);
+    }
+  }
+}
+
 // GET /api/owner/users
 //   Returns every user in the caller's owned groups, with their per-group memberships rolled
 //   into one entry. Excludes the caller themselves (owner manages everyone except self via this).
@@ -250,13 +339,35 @@ export async function deleteOwnerUser(req, env, { uid }) {
   const ownedIds = await callerOwnedGroupIds(env, caller.id);
   if (!ownedIds.length) return err(403, "forbidden");
 
-  // 1. Drop memberships in caller's groups.
+  // 0. Capture (group_id, local_uid) pairs BEFORE the membership delete so we know which
+  //    groups need their D1 snapshots patched and what local uid to scrub from each.
+  //    Without this, the snapshot patch in step 1.5 would have no way to find affected groups.
   const placeholders = ownedIds.map(() => "?").join(",");
+  const affectedRows = (await env.DB.prepare(
+    `SELECT group_id, local_uid FROM memberships WHERE user_id = ? AND group_id IN (${placeholders})`,
+  ).bind(uid, ...ownedIds).all()).results || [];
+
+  // 1. Drop memberships in caller's groups.
   await exec(
     env,
     `DELETE FROM memberships WHERE user_id = ? AND group_id IN (${placeholders})`,
     uid, ...ownedIds,
   );
+
+  // 1.5. Patch each affected group's D1 snapshot so non-loaded clients don't pull stale state
+  //      the next time they open the group via loadGroupFromCloud. The client-side cascade in
+  //      submitAccountsDelete (af62dbf) already handles the currently-loaded group through
+  //      applyAndTrack + the event log; this server-side patch covers everything else.
+  //
+  //      Done best-effort per group: a single broken snapshot shouldn't abort the whole delete.
+  for (const row of affectedRows) {
+    if (row.local_uid == null) continue;
+    try {
+      await patchSnapshotRemoveUser(env, caller.id, row.group_id, row.local_uid);
+    } catch (e) {
+      console.error("snapshot patch failed for group", row.group_id, e?.message || e);
+    }
+  }
 
   // 2. If no memberships remain anywhere, fully tombstone.
   const remaining = await q1(env, "SELECT 1 AS ok FROM memberships WHERE user_id = ? LIMIT 1", uid);
