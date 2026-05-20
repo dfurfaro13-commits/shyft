@@ -248,6 +248,7 @@ const EVENT_HANDLERS = {
   "trade.offer-decline":(s, e) => s, "incentive.open-set": (s, e) => s,
   "config.update":      (s, e) => s, "user.create":        (s, e) => s,
   "user.update":        (s, e) => s, "user.delete":        (s, e) => s,
+  "shift.clear-flag":   (s, e) => s, "shift.admin-assign": (s, e) => s,
   "snapshot.bootstrap": (s) => s,
 };
 
@@ -2591,22 +2592,14 @@ export default function ShiftApp() {
 
   /* ── Reconciliation: confirm / flag / auto-swap / marketplace ── */
 
-  // Per-shift confirmation by the awarded provider. "ok" = looks good, "flagged" = problem.
+  // Per-shift confirmation by the awarded provider. "ok" = looks good, null = un-confirm.
   // We store on the entry itself so it travels with the slot through any takes/swaps.
-  // D.4.D2 Phase 3: the "ok" path routes through applyAndTrack. The null (un-confirm) path
-  // stays imperative — there's no dedicated event type for it and the shift.confirm reducer
-  // hardcodes "ok". TODO: add a shift.unconfirm event in D.4.E for cross-device parity (rare
-  // path, low value today).
+  // D.4.E: both paths now route through applyAndTrack. The shift.confirm reducer reads
+  // `value` from payload (back-compat: missing value means "ok" for pre-D.4.E events).
   const setShiftConfirm = async (dateKey, slotId, value /* "ok" | null */) => {
     const entry = shifts[dateKey]?.[slotId];
     if(!entry || getUid(entry) !== me.id) return;
-    if(value === "ok") {
-      await applyAndTrack("shift.confirm", { dateKey, slotId });
-    } else {
-      const next = {...shifts};
-      next[dateKey] = {...next[dateKey], [slotId]: {...entry, confirm: value, flagReason: entry.flagReason}};
-      setShifts(next); await persist("shifts", next);
-    }
+    await applyAndTrack("shift.confirm", { dateKey, slotId, value });
   };
 
   // Returns ALL eligible swap candidates for a flagged shift, ranked by:
@@ -2743,13 +2736,12 @@ export default function ShiftApp() {
   };
 
   // Admin clears a flag without swapping (e.g. provider talked to them out of band).
+  // D.4.E: routed through applyAndTrack via shift.clear-flag event.
   const clearFlag = async (dateKey, slotId) => {
     if(!me || me.role !== "admin") return;
     const entry = shifts[dateKey]?.[slotId];
     if(!entry) return;
-    const ns = {...shifts};
-    ns[dateKey] = {...ns[dateKey], [slotId]: {...entry, confirm: null, flagReason: null}};
-    setShifts(ns); await persist("shifts", ns);
+    await applyAndTrack("shift.clear-flag", { dateKey, slotId });
     flash("Flag cleared");
   };
 
@@ -3029,31 +3021,25 @@ export default function ShiftApp() {
   };
   // v3.1 admin-assign: entries are now award-only (no per-slot pool field). Setting uid:null
   // simply removes the entry. Setting a uid stamps an admin-source award.
-  const adminAssign = async (dk,sid,uid) => {
-    const next={...shifts}; if(!next[dk]) next[dk]={};
-    const wasOpen = !getUid(next[dk][sid]);
-    if(uid===null){
-      delete next[dk][sid];
-    } else {
-      next[dk][sid] = { uid, auto:false, source:"admin" };
+  // D.4.E: routed through applyAndTrack via shift.admin-assign event. The "open slot had an
+  // incentive" cascade — transfer points to awardee + delete the openIncentive entry — is
+  // captured here on the producer side (we need pre-mutation shifts + openIncentives to
+  // detect "wasOpen" and read the incentive amount) and travels in payload.incentiveCredit
+  // so the reducer can replay deterministically.
+  const adminAssign = async (dk, sid, uid) => {
+    const wasOpen = !getUid(shifts[dk]?.[sid]);
+    let incentiveCredit = null;
+    if (uid !== null && wasOpen) {
+      const pts = openIncentives[dk]?.[sid] || 0;
+      if (pts > 0) incentiveCredit = { uid: String(uid), points: pts };
     }
-    if(!Object.keys(next[dk]).length) delete next[dk];
-    setShifts(next); await persist("shifts",next);
-    // If admin filled a previously-open slot that had an incentive, credit the awardee.
-    let incPts = 0;
-    if(uid !== null && wasOpen){
-      incPts = openIncentives[dk]?.[sid] || 0;
-      if(incPts > 0){
-        const nextOI = {...openIncentives};
-        nextOI[dk] = {...nextOI[dk]};
-        delete nextOI[dk][sid];
-        if(!Object.keys(nextOI[dk]).length) delete nextOI[dk];
-        setOpenIncentives(nextOI); await persist("openIncentives", nextOI);
-        const nu = users.map(u => u.id === uid ? {...u, points: (u.points||0) + incPts} : u);
-        setUsers(nu); await persist("users", nu);
-      }
-    }
-    flash(incPts > 0 ? `Updated · +${incPts} pt incentive credited` : "Updated");
+    await applyAndTrack("shift.admin-assign", {
+      dateKey: dk,
+      slotId: sid,
+      uid: uid == null ? null : String(uid),
+      ...(incentiveCredit ? { incentiveCredit } : {}),
+    });
+    flash(incentiveCredit ? `Updated · +${incentiveCredit.points} pt incentive credited` : "Updated");
   };
   // opts.reason annotates the user.update event so replay/audit can distinguish admin point
   // adjustments from ordinary profile edits without re-deriving from the patch shape.

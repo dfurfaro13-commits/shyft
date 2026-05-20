@@ -773,6 +773,28 @@
       },
 
       "shift.confirm": (s, e) => {
+        const { dateKey, slotId, value } = e.payload || {};
+        if (!dateKey || slotId == null) return s;
+        const day = s.shifts[dateKey];
+        const entry = day?.[slotId];
+        if (!entry) return s;
+        // D.4.E: `value` carries the new confirm state. `"ok"` clears the flag (the user is
+        // confirming an awarded shift); `null` un-confirms but preserves any existing
+        // flagReason (rare path — user un-marks an "ok"). Back-compat for pre-D.4.E events
+        // that didn't carry `value`: treat as "ok".
+        const v = value === undefined ? "ok" : value;
+        return {
+          ...s,
+          shifts: {
+            ...s.shifts,
+            [dateKey]: { ...day, [slotId]: { ...entry, confirm: v, flagReason: v === "ok" ? null : entry.flagReason } },
+          },
+        };
+      },
+
+      // D.4.E: admin clears a flag without swapping (e.g. provider talked to admin out of band).
+      // Resets confirm + flagReason; doesn't change the assignee.
+      "shift.clear-flag": (s, e) => {
         const { dateKey, slotId } = e.payload || {};
         if (!dateKey || slotId == null) return s;
         const day = s.shifts[dateKey];
@@ -782,9 +804,53 @@
           ...s,
           shifts: {
             ...s.shifts,
-            [dateKey]: { ...day, [slotId]: { ...entry, confirm: "ok", flagReason: null } },
+            [dateKey]: { ...day, [slotId]: { ...entry, confirm: null, flagReason: null } },
           },
         };
+      },
+
+      // D.4.E: admin directly assigns a uid to (or clears) a slot. Two cascades the producer
+      // can request via payload:
+      //   - uid === null: delete the entry (admin clearing).
+      //   - incentiveCredit: present iff the admin fills a previously-open slot that had a
+      //     pending openIncentive. The producer captures the (uid, points) on the imperative
+      //     side; the reducer transfers points + deletes the incentive entry atomically.
+      "shift.admin-assign": (s, e) => {
+        const { dateKey, slotId, uid, incentiveCredit } = e.payload || {};
+        if (!dateKey || slotId == null) return s;
+        let nextShifts = { ...s.shifts };
+        if (uid == null) {
+          if (!nextShifts[dateKey] || !nextShifts[dateKey][slotId]) return s;
+          nextShifts[dateKey] = { ...nextShifts[dateKey] };
+          delete nextShifts[dateKey][slotId];
+          if (!Object.keys(nextShifts[dateKey]).length) delete nextShifts[dateKey];
+        } else {
+          nextShifts[dateKey] = {
+            ...(nextShifts[dateKey] || {}),
+            [slotId]: { uid: uidVal(uid), auto: false, source: "admin" },
+          };
+        }
+        let next = { ...s, shifts: nextShifts };
+        if (incentiveCredit && incentiveCredit.uid != null && (incentiveCredit.points|0) > 0) {
+          const credUid = incentiveCredit.uid;
+          const pts = incentiveCredit.points | 0;
+          // Strip the consumed openIncentive entry.
+          if (next.openIncentives[dateKey]?.[slotId] != null || next.openIncentives[dateKey]?.[String(slotId)] != null) {
+            const dayOI = { ...next.openIncentives[dateKey] };
+            delete dayOI[slotId];
+            delete dayOI[String(slotId)];
+            const nextOI = { ...next.openIncentives };
+            if (Object.keys(dayOI).length) nextOI[dateKey] = dayOI;
+            else delete nextOI[dateKey];
+            next = { ...next, openIncentives: nextOI };
+          }
+          // Credit the awardee.
+          next = {
+            ...next,
+            users: next.users.map(u => String(u.id) === String(credUid) ? { ...u, points: (u.points || 0) + pts } : u),
+          };
+        }
+        return next;
       },
 
       "shift.flag": (s, e) => {

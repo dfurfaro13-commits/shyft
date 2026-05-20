@@ -36,6 +36,11 @@ const ALLOWED_TYPES = new Set([
   "config.update",
   "unavail.reason",
   "snapshot.bootstrap",
+  // D.4.E — event types for the three previously-local-only handlers. shift.confirm extended
+  // to carry value (null/"ok") for the un-confirm path; shift.clear-flag is admin clearing
+  // without swap; shift.admin-assign is direct slot fill with optional incentive credit.
+  "shift.clear-flag",
+  "shift.admin-assign",
 ]);
 
 // Bumped 16K → 64K in D.4.A to absorb cascade payloads (e.g. user.delete listing
