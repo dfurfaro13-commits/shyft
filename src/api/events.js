@@ -76,17 +76,30 @@ export async function logEvent(req, env) {
   const payloadStr = typeof payload === "string" ? payload : JSON.stringify(payload);
   if (payloadStr.length > MAX_PAYLOAD_BYTES) return err(413, "payload_too_large");
 
-  const id = newId("evt");
+  // D.4.E: accept a client-issued event id (used by the frontend's buildEventBody) so the
+  // outbox can retry a failed POST without creating a duplicate row. Validate the shape to
+  // bound the attack surface: 8–64 chars, URL-safe alphabet. Anything else falls back to a
+  // server-minted id (back-compat for any caller still relying on the old behavior).
+  const rawId = body.id ? String(body.id) : "";
+  const idLooksOk = rawId.length >= 8 && rawId.length <= 64 && /^[a-zA-Z0-9_-]+$/.test(rawId);
+  const id = idLooksOk ? rawId : newId("evt");
   const blockId = body.blockId ? String(body.blockId) : null;
   const localUid = body.localUid ? String(body.localUid) : null;
   const clientTs = Number.isFinite(+body.clientTs) ? Math.floor(+body.clientTs) : Date.now();
 
-  // RETURNING is supported on D1 (SQLite 3.35+); avoids the extra SELECT round-trip.
+  // INSERT OR IGNORE + RETURNING: on the happy path, RETURNING gives us the freshly-inserted
+  // server_ts. On id collision (outbox retry of an already-committed event), the INSERT is
+  // a no-op and RETURNING yields no rows — we fall back to fetching the existing row's
+  // server_ts so the client still gets a meaningful response. Both branches are idempotent
+  // from the client's point of view.
   const row = await env.DB.prepare(
-    "INSERT INTO events (id, group_id, user_id, local_uid, block_id, type, payload, client_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING server_ts",
+    "INSERT OR IGNORE INTO events (id, group_id, user_id, local_uid, block_id, type, payload, client_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING server_ts",
   ).bind(id, groupId, user.id, localUid, blockId, type, payloadStr, clientTs).first();
 
-  return json({ id, serverTs: row?.server_ts ?? null });
+  if (row) return json({ id, serverTs: row.server_ts });
+
+  const existing = await q1(env, "SELECT server_ts FROM events WHERE id = ?", id);
+  return json({ id, serverTs: existing?.server_ts ?? null, duplicate: true });
 }
 
 // GET /api/events?gid=&since=&limit=&type=

@@ -435,6 +435,16 @@
     // swappedFrom/takenFrom/sellerId fields all need to match that type or shadow-diff
     // catches a string-vs-number mismatch. Non-numeric values (future UUIDs) pass through
     // unchanged so the helper stays safe if we ever broaden the id space.
+    // D.4.E: opaque client UUID for entity ids (listings, offers, events). Used for
+    // outbox-retry idempotency: when the same event POST retries with the same client-issued
+    // id, the server's INSERT OR IGNORE makes it a no-op instead of creating a duplicate row.
+    // crypto.randomUUID is on every supported runtime (Chrome 92+, Safari 15.4+, FF 95+);
+    // the fallback exists only to keep the helper safe in old test contexts.
+    function newClientUuid() {
+      try { return crypto.randomUUID(); }
+      catch { return `${Date.now()}-${Math.random().toString(36).slice(2,8)}`; }
+    }
+
     function uidVal(v) {
       if (v == null) return null;
       if (typeof v === "number") return v;

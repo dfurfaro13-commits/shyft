@@ -435,6 +435,16 @@
     // swappedFrom/takenFrom/sellerId fields all need to match that type or shadow-diff
     // catches a string-vs-number mismatch. Non-numeric values (future UUIDs) pass through
     // unchanged so the helper stays safe if we ever broaden the id space.
+    // D.4.E: opaque client UUID for entity ids (listings, offers, events). Used for
+    // outbox-retry idempotency: when the same event POST retries with the same client-issued
+    // id, the server's INSERT OR IGNORE makes it a no-op instead of creating a duplicate row.
+    // crypto.randomUUID is on every supported runtime (Chrome 92+, Safari 15.4+, FF 95+);
+    // the fallback exists only to keep the helper safe in old test contexts.
+    function newClientUuid() {
+      try { return crypto.randomUUID(); }
+      catch { return `${Date.now()}-${Math.random().toString(36).slice(2,8)}`; }
+    }
+
     function uidVal(v) {
       if (v == null) return null;
       if (typeof v === "number") return v;
@@ -2436,6 +2446,10 @@ function ShiftApp() {
     // Untouched by the reducer — applyEvent only reads named slice fields.
     const stampedPayload = { ...(payload || {}), clientId: SHYFT_CLIENT_ID };
     return {
+      // D.4.E: client-issued UUID. The server uses INSERT OR IGNORE on this id, so an
+      // outbox-retried POST of the same body is now a no-op instead of creating a
+      // duplicate event row. Same id also satisfies applyEvent's `!evt.id` guard locally.
+      id: newClientUuid(),
       groupId: currentGroup.cloudGroupId,
       type,
       payload: stampedPayload,
@@ -2509,26 +2523,18 @@ function ShiftApp() {
   // calling. The reducer trusts the payload.
   const applyAndTrack = async (type, payload, opts = {}) => {
     const body = buildEventBody(type, payload, opts);
-    // applyEvent's first guard is `if (!evt || !evt.id) return state` — it bails on
-    // missing id. The server mints the real event id on POST, so we don't have one
-    // here yet. Stamp a local-only id used only for this call's applyEvent / dedup
-    // ring; the body POSTed to the server doesn't carry it, so the server still mints
-    // its own. Without this stamp applyEvent no-ops, no setX dispatches, and the local
-    // tab's UI never reflects the mutation (poll on OTHER tabs picks up the
-    // server-minted-id event normally and works fine — which is exactly the bug
-    // pattern: B sees A's decline but A doesn't).
-    const localEvtId = `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    // Synthesize a minimal evt for non-cloud-mirrored groups so applyEvent
-    // still runs. clientTs matches body.clientTs when body exists.
-    const evt = body
-      ? { ...body, id: localEvtId }
-      : {
-          id: localEvtId,
-          type,
-          payload: payload || {},
-          localUid: me?.id || null,
-          clientTs: Date.now(),
-        };
+    // body.id is set by buildEventBody (D.4.E) for cloud-mirrored groups — same id used
+    // for the local applyEvent (satisfies its `!evt.id` guard + appliedEventIds dedup ring)
+    // AND included in the POST so the server's INSERT OR IGNORE makes outbox retries
+    // idempotent. For non-cloud groups, synthesize a minimal evt with its own UUID so
+    // applyEvent still runs.
+    const evt = body || {
+      id: newClientUuid(),
+      type,
+      payload: payload || {},
+      localUid: me?.id || null,
+      clientTs: Date.now(),
+    };
     const before = validatorLiveRef.current;
     if (!before) return null;
     const cleanBefore = { ...before, appliedEventIds: [] };
@@ -3673,7 +3679,7 @@ function ShiftApp() {
     const sellerId = getUid(entry);
     const existing = marketplace.find(l => l.dateKey === dateKey && l.slotId === slotId && l.status === "open");
     const listing = existing || {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+      id: newClientUuid(),
       dateKey, slotId, sellerId,
       incentivePts: 0,
       postedAt: Date.now(),
@@ -3705,7 +3711,7 @@ function ShiftApp() {
     // Reuse an open listing's id if one already exists for this slot, so the reducer's
     // (listingId-keyed) dedup no-ops the append instead of creating a duplicate.
     const existing = marketplace.find(l => l.dateKey === dateKey && l.slotId === slotId && l.status === "open");
-    const listingId = existing?.id || `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+    const listingId = existing?.id || newClientUuid();
     await applyAndTrack("marketplace.post", { dateKey, slotId, incentivePts: inc, listingId });
     flash(`📣 Listed${inc>0?` · ${inc} pt incentive`:""}`);
     setListDraft(null);
@@ -3804,7 +3810,7 @@ function ShiftApp() {
     }
     const cap = Math.max(0, Math.floor(me.points || 0));
     const inc = Math.max(0, Math.min(cap, parseInt(incentivePts)||0));
-    const offerId = `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+    const offerId = newClientUuid();
     await applyAndTrack("trade.offer-post", {
       offerId,
       listingId,
