@@ -246,13 +246,30 @@
         return "retry"; // offline, DNS failure, etc.
       }
     }
+    // D.4.E: notify ShiftApp of outbox depth changes via a custom window event. The React
+    // component listens, updates state, and surfaces toasts on transitions
+    // (0 → >0 = "saved locally", >0 → 0 after flush = "synced"). Cheaper than polling and
+    // keeps the head template free of React knowledge.
+    function notifyOutboxChanged(reason) {
+      try {
+        window.dispatchEvent(new CustomEvent("shyft:outbox-changed", {
+          detail: { depth: readEventOutbox().length, reason },
+        }));
+      } catch {}
+    }
+    window.api.getOutboxDepth = () => readEventOutbox().length;
+
     window.api.postEvent = async function postEvent(body) {
       const r = await postEventOnce(body);
       if (r === "retry") {
         const q = readEventOutbox();
         q.push(body);
         writeEventOutbox(q);
+        notifyOutboxChanged("queued");
       }
+      // D.4.E: return the postEventOnce result so applyAndTrack can toast on "drop"
+      // (4xx server reject — these are rare and worth surfacing immediately).
+      return r;
     };
     let _flushingOutbox = false;
     async function flushEventOutbox() {
@@ -260,6 +277,7 @@
       _flushingOutbox = true;
       try {
         let q = readEventOutbox();
+        const startDepth = q.length;
         while (q.length) {
           const head = q[0];
           const r = await postEventOnce(head);
@@ -267,6 +285,7 @@
           q = q.slice(1);
           writeEventOutbox(q);
         }
+        if (startDepth > 0 && q.length !== startDepth) notifyOutboxChanged("flushed");
       } finally {
         _flushingOutbox = false;
       }
@@ -1340,6 +1359,12 @@ function ShiftApp() {
   // unclaimedCloudGroups = cloud groups in `cloudUser.memberships` that have no matching local
   // group (matched by cloudGroupId). Shown on the auth screen as "Restore" cards.
   const [unclaimedCloudGroups, setUnclaimedCloudGroups] = useState([]);
+  // D.4.E: outbox depth tracks unsent events parked in shyft3_evt_outbox (head template's
+  // window.api.postEvent queues here on transport failure). Updated reactively via the
+  // shyft:outbox-changed CustomEvent the head template dispatches on queue/flush transitions.
+  // Surfaces as a small floating badge bottom-right when > 0, plus toasts on the key
+  // transitions (queued first event / flushed everything).
+  const [outboxDepth, setOutboxDepth] = useState(0);
   const snapshotUploadTimer = useRef(null);
   const snapshotUploadInflight = useRef(false);
   // D.4.D2 Phase 4: snapshot becomes a compaction optimization, not the primary persistence
@@ -2251,6 +2276,32 @@ function ShiftApp() {
     })();
   }, [cloudUser, groups]);
 
+  // D.4.E: outbox depth listener. Head template dispatches `shyft:outbox-changed` after
+  // every queue/flush transition. We use it for two things:
+  //   1. Keep React state (`outboxDepth`) in sync so the floating badge can re-render.
+  //   2. Toast on key transitions — first-queued (0 → >0, reason="queued") tells the user
+  //      their action is parked for retry; full-flush (>0 → 0, reason="flushed") tells them
+  //      sync caught up. Per-event toasts on retry would be spammy when offline; this gives
+  //      just-enough feedback at the actually-meaningful moments.
+  useEffect(() => {
+    try { setOutboxDepth(window.api.getOutboxDepth?.() ?? 0); } catch {}
+    const handler = (e) => {
+      const depth = e?.detail?.depth ?? 0;
+      const reason = e?.detail?.reason;
+      setOutboxDepth(prevDepth => {
+        if (reason === "queued" && prevDepth === 0 && depth > 0) {
+          flash("📭 Saved locally — will sync when online");
+        } else if (reason === "flushed" && depth === 0 && prevDepth > 0) {
+          flash("✅ Synced queued changes");
+        }
+        return depth;
+      });
+    };
+    window.addEventListener("shyft:outbox-changed", handler);
+    return () => window.removeEventListener("shyft:outbox-changed", handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // D.4.D2 Phase 2: periodic poll for cross-device sync. Pulls events newer than
   // shyft3_g<gid>_lastSeenServerTs every 15s while the document is visible, replays
   // each through applyEvent against current live state, and writes the result back
@@ -2597,7 +2648,16 @@ function ShiftApp() {
     // will surface either through the periodic poll (which also runs applyEvent
     // and would diverge if state on cloud disagrees) or through the offline
     // validator. Outbox still kicks in on transport failure.
-    if (body) window.api.postEvent(body);
+    //
+    // D.4.E: await the postEvent result so we can toast on "drop" — that's a
+    // 4xx server reject (e.g. invalid payload shape, missing fields). Rare and
+    // important — silently dropping leaves the local state ahead of the cloud
+    // with no path to reconciliation. "retry" + "ok" stay silent here; the
+    // outbox-changed event handler surfaces them at the appropriate transitions.
+    if (body) {
+      const r = await window.api.postEvent(body);
+      if (r === "drop") flash("⚠ Server rejected this change — refresh and try again");
+    }
     return next;
   };
 
@@ -7426,6 +7486,19 @@ function ShiftApp() {
         </div>
         <button onClick={stopImpersonate} className="text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white px-3 py-1 rounded-lg flex-shrink-0">Stop</button>
       </div>
+    )}
+    {/* D.4.E: outbox depth badge. Surfaces queued (unsent) events when the network drops.
+        Floats top-right of the nav strip, only renders when depth > 0 so it stays out of
+        the way during normal operation. Clicking forces a flush attempt — useful when the
+        user knows connectivity is back but the next visibilitychange hasn't fired yet. */}
+    {outboxDepth > 0 && (
+      <button
+        onClick={() => { try { window.api.flushEventOutbox?.(); } catch {} }}
+        title="Click to retry sending now"
+        className="fixed top-3 right-3 z-50 bg-amber-500 hover:bg-amber-600 text-white text-[11px] font-semibold px-2.5 py-1 rounded-full shadow-md flex items-center gap-1.5">
+        <span>📭</span>
+        <span>{outboxDepth} queued · syncing…</span>
+      </button>
     )}
     <div className="min-h-screen bg-canvas text-ink-900 lg:flex pb-20 lg:pb-0">
       {/* Desktop sidebar */}

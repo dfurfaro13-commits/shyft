@@ -410,10 +410,7 @@ Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`, `offerT
 ### Pending (deferred by user)
 - ⏳ **Lock-time point crediting** ("Step 2"). Today points credit at reconcile via `users.points` directly. Spec wants `users.points` (locked balance) split from `pendingPoints[blockId]` (this block's accruals), with pending → locked at the Lock transition.
 - ⏳ Schedule snapshot at Lock (frozen "My final schedule" view per user, persisted with the block).
-- ⏳ Phase D.4.E polish:
-  - Client UUIDs (replace `Date.now()`-based ids in `adminAddUser`, listings, offers) + `INSERT OR IGNORE` on event POST so outbox retries don't dupe.
-  - Event types for the three remaining local-only handlers: `clearFlag` (admin clears a flag without swapping), `setShiftConfirm` null-path (un-confirm), `adminAssign` (admin direct slot assignment with optional incentive credit).
-  - Conflict toasts on `POST /api/events` failure; outbox depth indicator on admin dashboard.
+- ⏳ Lingering D.4.E follow-up: `adminAddUser` still mints `user.id` with `Date.now()` (other entity ids — listings, offers, event ids — moved to `crypto.randomUUID()` in `e355615`). Migrating user.id to UUID would break the "numeric local uid" convention; revisit when cloud-uuid uids are adopted more broadly.
 - ⏳ R2 monthly event-log archival (deferred until corpus grows).
 - ⏳ Mandatory `If-Match` on snapshot uploads (concurrency control beyond last-write-wins).
 
@@ -450,7 +447,7 @@ D.4 verification (cloud-signed-in owner only):
 - **Cross-device:** open two windows as different users; mutate in one → other reflects within ~15s via poll. No amber Sync banner — it was removed in Phase 5.
 - **Multi-window same-user:** two tabs of the same login should sync via the per-tab `SHYFT_CLIENT_ID` filter (`window.__shyftClientId` should differ per tab).
 - **Snapshot uploader cadence:** mutate → `POST /api/events` fires immediately → `POST /api/snapshots` debounces for 30s then fires once. No further snapshot POSTs if no mutations.
-- **Outbox check:** DevTools → Network → Offline → fire one event → Online → confirm `localStorage.getItem("shyft3_evt_outbox") === "[]"` after the flush.
+- **Outbox check:** DevTools → Network → Offline → fire one event → Online → confirm `localStorage.getItem("shyft3_evt_outbox") === "[]"` after the flush. D.4.E adds: an amber "📭 N queued · syncing…" badge appears top-right while the outbox is non-empty (click to force-flush); a toast fires on first-queued ("📭 Saved locally") and another on full-flush ("✅ Synced"); a 4xx server reject triggers a "⚠ Server rejected" toast directly from applyAndTrack.
 - **Cold-load:** clear localStorage → reload → sign in → group rehydrates from snapshot + event-tail replay via `loadGroupFromCloud`.
 
 ---

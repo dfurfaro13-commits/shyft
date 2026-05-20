@@ -246,13 +246,30 @@
         return "retry"; // offline, DNS failure, etc.
       }
     }
+    // D.4.E: notify ShiftApp of outbox depth changes via a custom window event. The React
+    // component listens, updates state, and surfaces toasts on transitions
+    // (0 → >0 = "saved locally", >0 → 0 after flush = "synced"). Cheaper than polling and
+    // keeps the head template free of React knowledge.
+    function notifyOutboxChanged(reason) {
+      try {
+        window.dispatchEvent(new CustomEvent("shyft:outbox-changed", {
+          detail: { depth: readEventOutbox().length, reason },
+        }));
+      } catch {}
+    }
+    window.api.getOutboxDepth = () => readEventOutbox().length;
+
     window.api.postEvent = async function postEvent(body) {
       const r = await postEventOnce(body);
       if (r === "retry") {
         const q = readEventOutbox();
         q.push(body);
         writeEventOutbox(q);
+        notifyOutboxChanged("queued");
       }
+      // D.4.E: return the postEventOnce result so applyAndTrack can toast on "drop"
+      // (4xx server reject — these are rare and worth surfacing immediately).
+      return r;
     };
     let _flushingOutbox = false;
     async function flushEventOutbox() {
@@ -260,6 +277,7 @@
       _flushingOutbox = true;
       try {
         let q = readEventOutbox();
+        const startDepth = q.length;
         while (q.length) {
           const head = q[0];
           const r = await postEventOnce(head);
@@ -267,6 +285,7 @@
           q = q.slice(1);
           writeEventOutbox(q);
         }
+        if (startDepth > 0 && q.length !== startDepth) notifyOutboxChanged("flushed");
       } finally {
         _flushingOutbox = false;
       }
