@@ -20,9 +20,8 @@ const ALLOWED_TYPES = new Set([
   "marketplace.post",
   "marketplace.take",
   "marketplace.cancel",
-  // D.4.A — types wired in D.4.B; allow-listed now so the backend accepts them
-  // as soon as the frontend starts emitting. snapshot.bootstrap is a placeholder
-  // for an eventual "fresh snapshot baseline" pseudo-event.
+  // snapshot.bootstrap is a placeholder for an eventual "fresh snapshot
+  // baseline" pseudo-event.
   "user.create",
   "user.update",
   "user.delete",
@@ -36,9 +35,9 @@ const ALLOWED_TYPES = new Set([
   "config.update",
   "unavail.reason",
   "snapshot.bootstrap",
-  // D.4.E — event types for the three previously-local-only handlers. shift.confirm extended
-  // to carry value (null/"ok") for the un-confirm path; shift.clear-flag is admin clearing
-  // without swap; shift.admin-assign is direct slot fill with optional incentive credit.
+  // shift.confirm carries value (null/"ok") for the un-confirm path; shift.clear-flag is
+  // admin clearing without swap; shift.admin-assign is direct slot fill with optional
+  // incentive credit.
   "shift.clear-flag",
   "shift.admin-assign",
 ]);
