@@ -17,7 +17,7 @@ The interface must be **clean, professional, simple, and intuitive.** This is th
 - **Hobby project.** David is building this on his own time. Recurring costs ≈ $0 — Cloudflare's free tier covers Workers, D1, and R2 at our current scale. No paid SaaS, no per-seat licenses. Flag anything that would change that.
 - **Cloud is authoritative; localStorage is a cache.** As of D.4.D2 (shipped), `loadGroup` pulls from cloud (snapshot + event-tail replay), every mutation routes through `applyAndTrack → applyEvent → setX + persist + POST /api/events`, a 15s periodic poll syncs cross-device, and the snapshot uploader is a 30s-debounced compaction job gated on "dirty since last upload". localStorage still holds the per-group cache so the UI works offline-read-only, but the reducer is the single source of truth for state transitions.
 - **Hosted as a website.** Deployed to Cloudflare Pages + Worker at `app.shift-scheduling.com`.
-- **Design for the reducer.** New mutations should go through `applyAndTrack(type, payload, opts)` — not `trackEvent` directly. Add a handler to `EVENT_HANDLERS` in the head template (mirror the reference stub in the JSX preamble), capture any non-deterministic inputs (`Date.now()`, `Math.random()`) into the payload, and route the producer through `applyAndTrack`. The dispatcher handles the slice-diff dispatch + POST + outbox.
+- **Design for the reducer.** New mutations go through `applyAndTrack(type, payload, opts)`. Add a handler to `EVENT_HANDLERS` in the head template (mirror the reference stub in the JSX preamble), capture any non-deterministic inputs (`Date.now()`, `Math.random()`) into the payload, and route the producer through `applyAndTrack`. The dispatcher handles the slice-diff dispatch + POST + outbox.
 
 ---
 
@@ -77,18 +77,15 @@ If they don't match, you have a syntax error.
 
 ### ⚠ Critical gotcha: head-template sync
 
-**Lines 1–96 of `ShiftApp.v3.jsx` (everything before `export default function ShiftApp`) are reference-only.** They exist for IDE readability but are **never** in the runtime build — the `tail -n +N` strips them.
+**Everything in `ShiftApp.v3.jsx` before `export default function ShiftApp` is reference-only.** It exists for IDE readability but is **never** in the runtime build — the `tail -n +N` strips it. The actual runtime constants and helpers live in `templates/shyft_head.v3.html`.
 
-The actual runtime constants live in `templates/shyft_head.v3.html`. **If you change a module-scope constant or helper in the JSX preamble, you MUST mirror the change in the head template, or it won't take effect.**
+There are two flavors of preamble code, and they have different sync rules:
 
-Common things that need both updates:
-- `DEFAULT_CONFIG`
-- `PHASE`, `PHASE_LABEL`, `PHASE_DESC`, `PHASE_TONE`
-- `phaseOf`, `isAvailabilityOpen`, `isReconciling`, `isLocked`
-- `getUid`, `isAuto`, `getSource`
-- `currentBlockOf`, `inBlock`
-- `applyEvent` + `EVENT_HANDLERS` + `diffState` (D.4.C reducer family)
-- Date helpers, color tables, etc.
+1. **General module-scope helpers** (top of the preamble — `DEFAULT_CONFIG`, `PHASE` constants, `phaseOf`, `getUid`, `dk`, `parseDk`, `currentBlockOf`, etc.) are **mirrored in full** in both files. If you change one in the JSX preamble, you MUST mirror the change in the head template, or it won't take effect.
+
+2. **The reducer family** (everything from the `D.4.C — applyEvent reducer (REFERENCE-ONLY STUBS)` banner down — the helpers `trackAppliedEventId`, `applyAwardsToShifts`, etc., plus `EVENT_HANDLERS`, `applyEvent`, `normalizeForDiff`, `diffState`) is **stubs-only in the JSX preamble** (signatures return their first arg or a no-op value). The canonical implementations live only in the head template. When you add or modify reducer logic, edit the head template; mirror only the signature into the JSX preamble for IDE awareness.
+
+This split exists because the reducer family is ~600 lines of business logic — full duplication would create silent drift. The general helpers are short, stable, and benefit from full mirroring so the IDE shows their behavior.
 
 Component-local helpers (anything inside `function ShiftApp(...)`) only need updating in the JSX — they're inside the slice that gets included.
 
@@ -131,7 +128,7 @@ The Cloudflare Worker fronts a D1 database + R2 bucket. As of D.4.D2, cloud is t
 
 ### Phase B — append-only event log
 
-Every meaningful state mutation fires `POST /api/events` to D1. The component-local helper `trackEvent(type, payload, opts?)` in `ShiftApp.v3.jsx` is the only call surface. The Worker rejects unknown types — to add a new event type, append it to `ALLOWED_TYPES` in `src/api/events.js` first. 26 wired types currently — see D.4.A/B subsections below for the full list. R2 archival of the event log is deferred — D1 is queryable directly and we'll dump monthly archives only when the corpus gets large enough to need it.
+Every meaningful state mutation fires `POST /api/events` to D1. The original call surface was a component-local `trackEvent(type, payload, opts?)` helper; D.4.D2 Phase 3 superseded that with `applyAndTrack`, and `trackEvent` itself was removed for being dead code. The Worker rejects unknown types — to add a new event type, append it to `ALLOWED_TYPES` in `src/api/events.js` first. 26 wired types currently — see D.4.A/B subsections below for the full list. R2 archival of the event log is deferred — D1 is queryable directly and we'll dump monthly archives only when the corpus gets large enough to need it.
 
 ### Phase C — snapshot sync
 
@@ -186,7 +183,7 @@ Frontend: `AccountsModal` lists users with kind/magic-link badges + (group, role
 
 All 26 mutation paths in `ShiftApp.v3.jsx` now fire `trackEvent`, so the D1 event log is a complete record of state changes.
 
-**D.4.C (applyEvent reducer + offline validator).** Pure-function reducer (`applyEvent(state, evt)` in `templates/shyft_head.v3.html`, mirrored reference-only in the JSX preamble) maps each of the 26 event types onto a state transition. Deterministic: no `Date.now()`, no `Math.random()`, no clock reads — all stamping data either lives in payload (D.4.B's enrichments) or is derived from existing state. Idempotency via a FIFO `appliedEventIds` ring (cap 200). Unknown event types are forward-compat no-ops. Validator: `window.__shiftValidator.run()` (cloud-owner only) pulls the latest snapshot, replays every newer event through `applyEvent`, and deep-diffs the result against live state. Soak passed `✅ 0 divergences` across all event types.
+**D.4.C (applyEvent reducer + offline validator).** Pure-function reducer (`applyEvent(state, evt)` in `templates/shyft_head.v3.html`; the JSX preamble holds signature-only stubs for IDE awareness) maps each of the 26 event types onto a state transition. Deterministic: no `Date.now()`, no `Math.random()`, no clock reads — all stamping data either lives in payload (D.4.B's enrichments) or is derived from existing state. Idempotency via a FIFO `appliedEventIds` ring (cap 200). Unknown event types are forward-compat no-ops. Validator: `window.__shiftValidator.run()` (cloud-owner only) pulls the latest snapshot, replays every newer event through `applyEvent`, and deep-diffs the result against live state. Soak passed `✅ 0 divergences` across all event types.
 
 **D.4.D1 (dual-write shadow diff + event outbox).** Two additive pieces — localStorage still authoritative.
 
@@ -199,7 +196,7 @@ All 26 mutation paths in `ShiftApp.v3.jsx` now fire `trackEvent`, so the D1 even
 
 - **Phase 2 — periodic poll.** New `useEffect` gated on `(groupId, cloudUser, currentGroup.cloudGroupId, me.id)`. While the document is visible, polls `GET /api/events?gid=&since=<lastSeenServerTs>` every 15s. Each batch is filtered (skip events stamped with this tab's `SHYFT_CLIENT_ID`), replayed through `applyEvent` via `validatorLiveRef`, and changed slices are dispatched via `setX + persist`. Visibility-aware (start on visible, clear on hidden, immediate poll on each transition); inflight guard prevents overlap.
 
-- **Phase 2.1 — per-tab `SHYFT_CLIENT_ID`.** Random UUID held in `sessionStorage` (survives reload, unique per tab); module-scope constant in head template, mirrored reference-only in JSX preamble. Stamped into every event payload by `trackEvent` / `applyAndTrack`. Cross-device poll filters on `evt.payload.clientId === SHYFT_CLIENT_ID` (skip own-tab events). Fixes the two-windows-of-the-same-user sync gap that the old `localUid == me.id` filter created. Pre-2.1 events without `clientId` fall back to the legacy `localUid` filter.
+- **Phase 2.1 — per-tab `SHYFT_CLIENT_ID`.** Random UUID held in `sessionStorage` (survives reload, unique per tab); module-scope constant in head template, mirrored in JSX preamble. Stamped into every event payload by `buildEventBody` (via `applyAndTrack`). Cross-device poll filters on `evt.payload.clientId === SHYFT_CLIENT_ID` (skip own-tab events). Fixes the two-windows-of-the-same-user sync gap that the old `localUid == me.id` filter created. Pre-2.1 events without `clientId` fall back to the legacy `localUid` filter.
 
 - **Phase 3 — mutation flow refactor.** All 26 imperative `trackEvent` callsites are gone. Each mutation now flows through `applyAndTrack(type, payload, opts)`:
   1. `buildEventBody(type, payload, opts)` builds the wire body (extracted from `trackEvent` so `applyAndTrack` and `trackEvent` share one canonical body + one `clientTs` — the reducer reads `e.clientTs` for `postedAt`/`takenAt` fields and any drift between the two would surface as shadow-diff).
@@ -361,7 +358,34 @@ marketplace[i] = {
 }
 ```
 
-Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`, `offerTrade`, `acceptTradeOffer`, `declineTradeOffer`. Listings appear in the **Trades** page (in nav for both providers and admin). Open count badged on nav.
+Producers: `postForTake`, `takeListing`, `cancelListing`, `offerTrade`, `acceptTradeOffer`, `declineTradeOffer` — all route through `applyAndTrack`; the corresponding reducers (`marketplace.post` / `.take` / `.cancel` / `trade.offer-*`) own the actual state transitions. Listings appear in the **Trades** page (in nav for both providers and admin). Open count badged on nav.
+
+### Lock-time point crediting
+
+Base earnings (day-pts × slot-credit + non-pref bonus) credit at the **Lock** transition, not at reconcile. Reconcile still applies bid debits, availability penalties, and open-shift incentive credits immediately; earnings stay deferred until the admin locks the block.
+
+Implementation (no new `pendingPoints` field — stamp + reverse pattern):
+- **Producer** at the lock callsite builds `earnings = {uid: pts}` via `buildBlockEarnings()` (iterates providers, calls the phase-blind `computePtsEarnedRaw(uid)`). The map is included in the `block.lock` event payload.
+- **`block.lock` reducer** applies the earnings to `users.points` AND stamps the exact map on the block config as `pointsCreditedAtLock`.
+- **`block.unlock` reducer** reads `payload.earnings` (the unlock producer passes `currentBlock.pointsCreditedAtLock` back in) and subtracts to reverse. Same map → exact reversal, no recompute drift.
+- **`block.reset` reducer** accepts a new `payload.restoredEarnings` so resetting from a locked block also reverses the credit, alongside the existing bid/penalty reversal.
+
+To avoid double-counting in projections after lock, `getPtsEarned(uid)` returns 0 when `isLocked(currentBlock)` — earnings already live in `users.points` at that point. A phase-blind sibling `computePtsEarnedRaw(uid)` exists for the lock callsite which needs the value despite the projection going to zero.
+
+### Per-block target snapshots (`targetsAtClose`)
+
+At reconcile, the producer captures `targetsAtClose = {uid: {min, ideal, max}}` from current providers (min derived from `seniorityLevels.find(l => l.id === u.seniorityId)?.minShifts`, ideal/max from `u.targets`) and the `block.reconcile` reducer stamps it on the block config. Same lifecycle as `pointsAtClose` — cleared by `block.reset`. Powers the Provider Report's cross-block target summation so retargeting a provider mid-history doesn't retroactively rewrite past blocks.
+
+### Admin reports
+
+Two admin-only modals reachable from the dashboard's Quick Actions:
+
+- **📊 Block report** (existing) — totals + per-provider breakdown for the active block. Per-provider table columns: Provider | Total | M/I/Mx | Top | Pref | Avail | Adm | Wknd | Spend | Proj. Source-bucket counts carry a `(P%)` suffix relative to the row's total (omitted for zeros). `Spend` is current `users.points`; `Proj` is `points + getPtsEarned − pendingPenalty` (`pendingPenalty` only non-zero in AVAIL). After lock, Proj == Spend by construction.
+- **📈 Provider report** (new) — same layout aggregated over N blocks via a top-of-modal "Last N / All blocks" dropdown. Sums source buckets across selected blocks; M/I/Mx sums per-block via each block's `targetsAtClose` snapshot (falls back to current values for pre-feature blocks with an amber footnote flag). Spend/Proj remain point-in-time. Selecting "Last 1 block" produces output equivalent to Block Report on the current block.
+
+### Remaining Issues alert
+
+A third alert type inside the admin dashboard's existing **Alerts** card, surfacing during **Reconciliation + Locked** phases when there are unfilled slots. `diagnoseOpenShifts()` walks every open `(dateKey, slotId)` and classifies each provider's state on that date into one of: `blocked` / `topOptOtherSlot` (Top-Optioned the day but won the other slot) / `preferredAtMax` / `availableAtMax` / `alreadyOnDay` / `eligible`. The per-slot row shows reasons (e.g. "3 preferred this day but are at max (Alice, Bob, Carol)") plus suggestions (manual assign one of N eligible / raise max / unblock outreach / set an incentive), with an "Open day →" button that opens the existing DaySheet for that date. Hidden in AVAIL (open slots are normal during signup).
 
 ---
 
@@ -374,8 +398,8 @@ Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`, `offerT
 - **Compact code, dense comments.** The codebase favors slightly-dense JSX with explanatory comments above complex blocks rather than spreading things out. Match this style.
 - **Source-tag awarded entries.** When awarding a shift, set `source` to one of: `pool` | `pool-solo` | `cascade` | `preferred-auto` | `available-auto` | `auto-swap` | `marketplace` | `admin`. The block report attributes by source.
 - **Determinism for `applyEvent`.** Anything inside an `EVENT_HANDLERS` branch must be pure — no `Date.now()`, no `Math.random()`, no clock reads. If a handler needs entropy or a timestamp, the producer in `ShiftApp.v3.jsx` must capture it into the event payload (see D.4.B's `chainRepair`, `listing`, `awarded` enrichments).
-- **New mutations go through `applyAndTrack`, not `trackEvent`.** Post-D.4.D2 every state mutation flows `applyAndTrack(type, payload, opts)` → reducer → `setX + persist + POST`. Add a handler to `EVENT_HANDLERS` in the head template (mirror a reference stub `(s, e) => s` in the JSX preamble's `EVENT_HANDLERS` block for IDE awareness — the runtime copy is canonical), capture non-deterministic inputs into payload, and the producer just does eligibility checks + `await applyAndTrack(...)`. No direct `setX + persist` in handlers, no `trackEvent` callsites (there are none left). For cascades that touch multiple slices, design the reducer to do all of them; `applyAndTrack`'s object-identity diff dispatches only the slices that actually changed.
-- **Uid form: numeric local, stringified on the wire.** Local `users[i].id` is numeric; `me.id` and `entry.uid` in `shifts` are numeric. The wire format stringifies uids (`fromUid: String(me.id)`, etc.) for forward-compat with cloud-uuid uids someday. The reducer normalizes via `uidVal(...)` when writing into numeric-keyed fields (shifts[].uid, marketplace .offererId, .takenBy). Always use `String(a) === String(b)` for cross-source uid comparisons — strict-equality between numeric local and wire-string forms has bitten us twice already (`73919da`, `a09bf4f`).
+- **New mutations go through `applyAndTrack`.** Every state mutation flows `applyAndTrack(type, payload, opts)` → reducer → `setX + persist + POST`. Add a handler to `EVENT_HANDLERS` in the head template (mirror a reference stub `(s, e) => s` in the JSX preamble's `EVENT_HANDLERS` block — the whole reducer family in the preamble is stubs-only, see [head-template sync](#-critical-gotcha-head-template-sync)). Capture non-deterministic inputs into payload; the producer just does eligibility checks + `await applyAndTrack(...)`. No direct `setX + persist` in handlers. For cascades that touch multiple slices, design the reducer to do all of them; `applyAndTrack`'s object-identity diff dispatches only the slices that actually changed.
+- **Uid form: numeric local, stringified on the wire.** Local `users[i].id` is numeric; `me.id` and `entry.uid` in `shifts` are numeric. The wire format stringifies uids (`fromUid: String(me.id)`, etc.) for forward-compat with cloud-uuid uids someday. The reducer normalizes via `uidVal(...)` when writing into numeric-keyed fields (shifts[].uid, marketplace .offererId, .takenBy). For cross-source comparisons, always use the `eqId(a, b)` helper (canonical copy in head template near `uidVal`, mirror in JSX preamble) — strict-equality between numeric local and wire-string forms has bitten us twice already (`73919da`, `a09bf4f`). `eqId` also returns false for null/null, so it doubles as a "set & equal" check.
 - **No emojis in code unless they're already part of the UX vocabulary** (🎯 ⭐ ✕ ⚙ 📣). User explicitly favors emoji UI for state markers.
 
 ---
@@ -406,13 +430,26 @@ Reducers: `_postListing`, `postForTake`, `takeListing`, `cancelListing`, `offerT
 - ✅ Phase D.4.C: `applyEvent` reducer + offline validator
 - ✅ Phase D.4.D1: dual-write shadow diff + event outbox
 - ✅ Phase D.4.D2: cloud-authoritative cutover (6 sub-phases — `loadGroup` cloud-first, 15s poll, per-tab client id, mutation refactor through `applyAndTrack`, snapshot uploader demotion, sync banner removal)
+- ✅ Lock-time point crediting: base earnings credit at lock via `block.lock` reducer; stamped `pointsCreditedAtLock` map enables exact reversal at unlock/reset; `getPtsEarned` phase-aware to avoid double-counting
+- ✅ Per-block target snapshots (`targetsAtClose`) — powers Provider Report's accurate cross-block target sums
+- ✅ Provider report: cross-block aggregate of Block Report (Last N / All blocks selector)
+- ✅ Block report enhancements: Wknd, Spend, Proj columns + per-source percentages
+- ✅ Remaining Issues alert: per-open-slot diagnosis + suggestions during RECON/LOCKED
 
 ### Pending (deferred by user)
-- ⏳ **Lock-time point crediting** ("Step 2"). Today points credit at reconcile via `users.points` directly. Spec wants `users.points` (locked balance) split from `pendingPoints[blockId]` (this block's accruals), with pending → locked at the Lock transition.
 - ⏳ Schedule snapshot at Lock (frozen "My final schedule" view per user, persisted with the block).
-- ⏳ Lingering D.4.E follow-up: `adminAddUser` still mints `user.id` with `Date.now()` (other entity ids — listings, offers, event ids — moved to `crypto.randomUUID()` in `e355615`). Migrating user.id to UUID would break the "numeric local uid" convention; revisit when cloud-uuid uids are adopted more broadly.
+- ⏳ Lingering D.4.E follow-up: several entity ids still mint with `Date.now()` instead of `crypto.randomUUID()` (which is what listings, offers, and event ids moved to in `e355615`). Same-millisecond collision is rare but real — most pressing for ids that cross device boundaries via the event log. Concrete spots (line numbers drift as the file evolves; grep `id:\s*Date\.now\(\)` if these don't resolve):
+  - **`user.id`** in `adminAddUser` ([ShiftApp.v3.jsx:2946](ShiftApp.v3.jsx:2946)). Migrating breaks the "numeric local uid" convention — revisit when cloud-uuid uids are adopted more broadly.
+  - **`groups.id`** at five local-group-creation callsites ([ShiftApp.v3.jsx:694](ShiftApp.v3.jsx:694), [724](ShiftApp.v3.jsx:724), [1181](ShiftApp.v3.jsx:1181), [1418](ShiftApp.v3.jsx:1418), [1627](ShiftApp.v3.jsx:1627)). Local-only ids, low collision risk. Note 1181 already adds `+ Math.floor(Math.random()*1000)` as a mitigation in the owner-restore path.
+  - **`config.blocks[].id`** at [ShiftApp.v3.jsx:516](ShiftApp.v3.jsx:516) (legacy single-block migration) and [5497](ShiftApp.v3.jsx:5497) ("+ New block" admin button). Block ids cross devices via `config.update` events — two admins creating a block in the same millisecond would collide.
+  - **`config.shiftSlots[].id`** at [ShiftApp.v3.jsx:5577](ShiftApp.v3.jsx:5577) and **`config.seniorityLevels[].id`** at [ShiftApp.v3.jsx:5594](ShiftApp.v3.jsx:5594) — same cross-device caveat as block ids.
 - ⏳ R2 monthly event-log archival (deferred until corpus grows).
 - ⏳ Mandatory `If-Match` on snapshot uploads (concurrency control beyond last-write-wins).
+- ⏳ **Low priority** — retire stale one-shot migrations baked into the load path. Each is currently correct (idempotent + marker-gated in localStorage) and has run on every existing user's device, but they accumulate as load-time overhead and noise in `loadGroup`/the head template. Worth declaring a "post-D.3 baseline" someday and dropping them all. Spots:
+  - `shyft3_migrate_from_v2` ([templates/shyft_head.v3.html:104](templates/shyft_head.v3.html:104)) — v2→v3 storage import.
+  - `shyft3_migrate_prune_supers` (head template) — pre-D.3 super-bootstrap key cleanup.
+  - `shyft3_g{gid}_migrate_top_options` (in `loadGroup`) — per-group pool→topOptions conversion.
+  - Inline `pointValuesLocked` defaulting + legacy `blockStart/blockEnd/signupOpen → blocks[]` migrations inside `loadGroup`'s config branch.
 
 ---
 
@@ -442,8 +479,8 @@ Smoke test (against either of the above):
 7. Admin → Lock block
 
 D.4 verification (cloud-signed-in owner only):
-- **Validator is the canonical source-of-truth check.** Run `await window.__shiftValidator.run()` in DevTools; expect `✅ 0 divergences`. Post-D.4.D2 the shadow-diff inside `trackEvent` is effectively dead code (zero callsites left) — divergence detection lives in the validator's snapshot+event-replay diff.
-- **Console should stay quiet.** Any `[applyAndTrack] reducer threw`, `[shadow-diff] ❌`, `[uploadSnapshot] refusing…`, or `[writeGroupStateToStorage] refusing…` line is a real bug. Screenshot + diagnose before shipping.
+- **Validator is the canonical source-of-truth check.** Run `await window.__shiftValidator.run()` in DevTools; expect `✅ 0 divergences`. (The historical shadow-diff inside `trackEvent` is gone — that whole helper was removed for being dead code; divergence detection lives only in the validator now.)
+- **Console should stay quiet.** Any `[applyAndTrack] reducer threw`, `[uploadSnapshot] refusing…`, `[uploadSnapshot] POST failed`, `[loadGroupFromCloud] reverse-sync push failed`, or `[writeGroupStateToStorage] refusing…` line is worth investigating. The first one is a real bug; the others are environmental (cloud down, payload empty, etc.) and the app falls through safely, but a sustained run of them means something's wrong.
 - **Cross-device:** open two windows as different users; mutate in one → other reflects within ~15s via poll. No amber Sync banner — it was removed in Phase 5.
 - **Multi-window same-user:** two tabs of the same login should sync via the per-tab `SHYFT_CLIENT_ID` filter (`window.__shyftClientId` should differ per tab).
 - **Snapshot uploader cadence:** mutate → `POST /api/events` fires immediately → `POST /api/snapshots` debounces for 30s then fires once. No further snapshot POSTs if no mutations.

@@ -184,16 +184,14 @@
 
     // ─── D.4.D2 Phase 2.1: per-tab client ID ────────────────────────────────
     // Random UUID stored in sessionStorage so it survives reload within a tab
-    // but stays distinct across tabs/windows. trackEvent stamps it into every
-    // outgoing event payload; the cross-device poll uses it to skip events
-    // this exact tab fired (since those were already applied imperatively and
-    // applyEvent isn't idempotent for toggles).
+    // but stays distinct across tabs/windows. buildEventBody stamps it into
+    // every outgoing event payload; the cross-device poll uses it to skip
+    // events this exact tab fired (since those were already applied locally
+    // and applyEvent isn't idempotent for toggles).
     //
     // Replaces the previous own-event filter (`localUid == me.id`), which had
     // a false-positive: two windows of the same user filtered each other out
-    // and never synced. Phase 3's mutation refactor will route local writes
-    // through applyEvent + appliedEventIds dedup, at which point this stamp
-    // becomes redundant; until then it's the band-aid that unlocks multi-window.
+    // and never synced.
     const SHYFT_CLIENT_ID = (() => {
       try {
         const k = "shyft3_client_id";
@@ -451,7 +449,7 @@
     // Normalize a uid coming off the wire (where producers stringify defensively, and the
     // Worker's events.js also stores localUid as TEXT) back to the numeric form used in
     // state. user.id throughout v3 is a Date.now()-style integer; entry.uid and the
-    // swappedFrom/takenFrom/sellerId fields all need to match that type or shadow-diff
+    // swappedFrom/takenFrom/sellerId fields all need to match that type or the validator
     // catches a string-vs-number mismatch. Non-numeric values (future UUIDs) pass through
     // unchanged so the helper stays safe if we ever broaden the id space.
     // D.4.E: opaque client UUID for entity ids (listings, offers, events). Used for
@@ -469,6 +467,18 @@
       if (typeof v === "number") return v;
       const n = +v;
       return Number.isFinite(n) ? n : v;
+    }
+
+    // Compare two ids regardless of whether one is numeric (local form) and the other
+    // is a string (wire format). Use this anywhere a uid or block/slot/listing id from
+    // one source is compared to another. Ad-hoc `String(a) === String(b)` is equivalent
+    // but the named helper makes intent explicit and prevents accidental `===` mismatches
+    // — that has bitten us twice (commits 73919da, a09bf4f). Returns false if either
+    // side is null/undefined (an "unset" id shouldn't match anything, including another
+    // unset id).
+    function eqId(a, b) {
+      if (a == null || b == null) return false;
+      return String(a) === String(b);
     }
 
     function trackAppliedEventId(prev, id) {
@@ -567,7 +577,7 @@
     // Patch one block's fields by id within config.blocks[].
     function patchBlockInConfig(config, blockId, patch) {
       if (!config || !Array.isArray(config.blocks)) return config;
-      const blocks = config.blocks.map(b => String(b.id) === String(blockId) ? { ...b, ...patch } : b);
+      const blocks = config.blocks.map(b => eqId(b.id, blockId) ? { ...b, ...patch } : b);
       return { ...config, blocks };
     }
 
@@ -749,6 +759,7 @@
               lastReconcileDeltas: p.deltas || {},
               pointsAtClose: p.pointsAtClose || null,
               availPenalties: p.availPenalties || {},
+              targetsAtClose: p.targetsAtClose || null,
             }),
           };
         }
@@ -758,13 +769,52 @@
       "block.lock": (s, e) => {
         const blockId = e.payload?.blockId || e.blockId;
         if (!blockId) return s;
-        return { ...s, config: patchBlockInConfig(s.config, blockId, { phase: "locked" }) };
+        // payload.earnings is a {uid: pts} map of base earnings (day-pts × slot-credit + non-pref
+        // bonus) computed at lock-time by the producer. Stamping the exact map on the block lets
+        // unlock / reset reverse the credit with no recomputation drift. Empty/zero entries are
+        // omitted so the touched-set stays narrow.
+        const earnings = e.payload?.earnings || {};
+        const anyEarnings = Object.values(earnings).some(v => (v || 0) !== 0);
+        let nextUsers = s.users;
+        if (anyEarnings) {
+          nextUsers = s.users.map(u => {
+            const add = earnings[u.id] ?? earnings[String(u.id)] ?? 0;
+            if (!add) return u;
+            return { ...u, points: Math.max(0, (u.points || 0) + add) };
+          });
+        }
+        return {
+          ...s,
+          users: nextUsers,
+          config: patchBlockInConfig(s.config, blockId, {
+            phase: "locked",
+            pointsCreditedAtLock: anyEarnings ? earnings : null,
+          }),
+        };
       },
 
       "block.unlock": (s, e) => {
         const blockId = e.payload?.blockId || e.blockId;
         if (!blockId) return s;
-        return { ...s, config: patchBlockInConfig(s.config, blockId, { phase: "reconciliation" }) };
+        // payload.earnings is the same {uid: pts} map stamped at lock-time. Subtract to reverse.
+        const earnings = e.payload?.earnings || {};
+        const anyEarnings = Object.values(earnings).some(v => (v || 0) !== 0);
+        let nextUsers = s.users;
+        if (anyEarnings) {
+          nextUsers = s.users.map(u => {
+            const sub = earnings[u.id] ?? earnings[String(u.id)] ?? 0;
+            if (!sub) return u;
+            return { ...u, points: Math.max(0, (u.points || 0) - sub) };
+          });
+        }
+        return {
+          ...s,
+          users: nextUsers,
+          config: patchBlockInConfig(s.config, blockId, {
+            phase: "reconciliation",
+            pointsCreditedAtLock: null,
+          }),
+        };
       },
 
       "block.reset": (s, e) => {
@@ -775,9 +825,12 @@
           for (const k of p.clearedDateKeys) delete nextShifts[k];
         }
         // Reverse bid charges + restore penalty deductions per resetBlock live logic.
+        // If reset is hit from a Locked phase, restoredEarnings carries the same map that was
+        // stamped at lock-time — subtract it to reverse the lock-time credit.
         const restored = p.restoredDeltas || {};
         const restoredPenalties = p.restoredPenalties || {};
-        const touched = new Set([...Object.keys(restored), ...Object.keys(restoredPenalties)]);
+        const restoredEarnings = p.restoredEarnings || {};
+        const touched = new Set([...Object.keys(restored), ...Object.keys(restoredPenalties), ...Object.keys(restoredEarnings)]);
         let nextUsers = s.users;
         if (touched.size) {
           nextUsers = s.users.map(u => {
@@ -785,8 +838,9 @@
             if (!touched.has(k) && !touched.has(u.id)) return u;
             const bidDelta = restored[k] ?? restored[u.id] ?? 0;
             const penalty = restoredPenalties[k] ?? restoredPenalties[u.id] ?? 0;
-            if (bidDelta === 0 && penalty === 0) return u;
-            return { ...u, points: Math.max(0, (u.points || 0) - bidDelta + penalty) };
+            const earnings = restoredEarnings[k] ?? restoredEarnings[u.id] ?? 0;
+            if (bidDelta === 0 && penalty === 0 && earnings === 0) return u;
+            return { ...u, points: Math.max(0, (u.points || 0) - bidDelta + penalty - earnings) };
           });
         }
         let nextConfig = s.config;
@@ -796,6 +850,8 @@
             lastReconcileDeltas: {},
             pointsAtClose: null,
             availPenalties: {},
+            pointsCreditedAtLock: null,
+            targetsAtClose: null,
           });
         }
         return { ...s, shifts: nextShifts, users: nextUsers, config: nextConfig };
@@ -876,7 +932,7 @@
           // Credit the awardee.
           next = {
             ...next,
-            users: next.users.map(u => String(u.id) === String(credUid) ? { ...u, points: (u.points || 0) + pts } : u),
+            users: next.users.map(u => eqId(u.id, credUid) ? { ...u, points: (u.points || 0) + pts } : u),
           };
         }
         return next;
@@ -895,8 +951,8 @@
             [dateKey]: { ...day, [slotId]: { ...entry, confirm: "flagged", flagReason: reason ?? null } },
           },
         };
-        // Idempotent listing append — _postListing returns the existing listing if one is
-        // already up for this slot, so the same id can be replayed safely.
+        // Idempotent listing append — if a listing with this id is already
+        // in marketplace, no-op so the same event can be replayed safely.
         if (listing && listing.id && !s.marketplace.some(l => l.id === listing.id)) {
           next = { ...next, marketplace: [...next.marketplace, listing] };
         }
@@ -985,10 +1041,10 @@
           next = {
             ...next,
             users: next.users.map(u => {
-              if (String(u.id) === String(listing.sellerId)) {
+              if (eqId(u.id, listing.sellerId)) {
                 return { ...u, points: Math.max(0, (u.points || 0) - listing.incentivePts) };
               }
-              if (String(u.id) === String(taker)) {
+              if (eqId(u.id, taker)) {
                 return { ...u, points: (u.points || 0) + listing.incentivePts };
               }
               return u;
@@ -1154,14 +1210,14 @@
         if (uid == null || !patch || typeof patch !== "object") return s;
         return {
           ...s,
-          users: s.users.map(u => String(u.id) === String(uid) ? { ...u, ...patch } : u),
+          users: s.users.map(u => eqId(u.id, uid) ? { ...u, ...patch } : u),
         };
       },
 
       "user.delete": (s, e) => {
         const { uid, cascadeShifts } = e.payload || {};
         if (uid == null) return s;
-        const match = u => String(u.id) === String(uid);
+        const match = u => eqId(u.id, uid);
         let next = { ...s, users: s.users.filter(u => !match(u)) };
         if (Array.isArray(cascadeShifts) && cascadeShifts.length) {
           const drop = new Set(cascadeShifts.map(c => `${c.dateKey}::${c.slotId}`));

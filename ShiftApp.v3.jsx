@@ -101,10 +101,19 @@ function newClientUuid() {
   catch { return `${Date.now()}-${Math.random().toString(36).slice(2,8)}`; }
 }
 
+// Compare two ids regardless of whether one is numeric (local form) and the other
+// is a string (wire format). Use this anywhere a uid or block/slot/listing id from
+// one source is compared to another. Returns false if either side is null/undefined.
+// See head template for the canonical copy and background.
+function eqId(a, b) {
+  if (a == null || b == null) return false;
+  return String(a) === String(b);
+}
+
 // D.4.D2 Phase 2.1 — per-tab client ID (reference-only mirror; runtime copy in head template).
-// Stamped into every event payload by trackEvent. Cross-device poll uses it to skip events this
-// exact tab fired (filter that replaces the previous `localUid == me.id` false-positive that
-// kept two-windows-of-the-same-user from syncing).
+// Stamped into every event payload by buildEventBody (via applyAndTrack). Cross-device poll
+// uses it to skip events this exact tab fired (replaces the previous `localUid == me.id`
+// false-positive that kept two-windows-of-the-same-user from syncing).
 const SHYFT_CLIENT_ID = (() => {
   try {
     const k = "shyft3_client_id";
@@ -120,127 +129,27 @@ const SHYFT_CLIENT_ID = (() => {
 })();
 
 // ════════════════════════════════════════════════════════════════════════════
-// D.4.C — applyEvent reducer (REFERENCE-ONLY MIRROR)
+// D.4.C — applyEvent reducer (REFERENCE-ONLY STUBS)
 //
-// The canonical runtime copy lives in templates/shyft_head.v3.html (which is
-// what gets concatenated into the runtime build). This preamble copy exists
-// for IDE readability ONLY — the `tail -n +N` step of the build strips
-// everything above `export default function ShiftApp`, so changes here have
-// no effect on the running app. Keep this in sync with the head template per
-// the CLAUDE.md head-template sync rule.
-//
-// See the head template for full inline documentation.
+// The canonical runtime copies live in templates/shyft_head.v3.html — that's
+// the file that gets concatenated into the build. This preamble holds STUBS
+// (signatures only, no behavior) for IDE awareness; the `tail -n +N` step
+// strips everything above `export default function ShiftApp`, so changes
+// here have no effect at runtime. When you add or modify reducer helpers /
+// handlers, edit the head template — mirror only the signature here.
 // ════════════════════════════════════════════════════════════════════════════
 
 const APPLIED_EVENTS_CAP = 200;
 
-function trackAppliedEventId(prev, id) {
-  const arr = Array.isArray(prev) ? prev : [];
-  if (arr.includes(id)) return arr;
-  const next = arr.length >= APPLIED_EVENTS_CAP
-    ? [...arr.slice(arr.length - APPLIED_EVENTS_CAP + 1), id]
-    : [...arr, id];
-  return next;
-}
+function trackAppliedEventId(prev, id) { return prev; }
+function removeTopOptionEntry(topOptions, dateKey, uid) { return topOptions; }
+function stampChainLinkIds(topOptions, dates, uid, lid) { return topOptions; }
+function applyAwardsToShifts(shifts, awards) { return shifts; }
+function applyPointsCascade(users, deltas, penalties, incCredits) { return users; }
+function applyOpenIncentivesPatch(openIncentives, patch) { return openIncentives; }
+function patchBlockInConfig(config, blockId, patch) { return config; }
+function closeAutoListingFor(marketplace, dateKey, slotId) { return marketplace; }
 
-function removeTopOptionEntry(topOptions, dateKey, uid) {
-  const dayMap = { ...(topOptions[dateKey] || {}) };
-  delete dayMap[uid];
-  delete dayMap[String(uid)];
-  const next = { ...topOptions };
-  if (Object.keys(dayMap).length) next[dateKey] = dayMap;
-  else delete next[dateKey];
-  return next;
-}
-
-function stampChainLinkIds(topOptions, dates, uid, lid) {
-  if (!Array.isArray(dates) || !dates.length) return topOptions;
-  const next = { ...topOptions };
-  for (const dk of dates) {
-    const en = next[dk]?.[uid] || next[dk]?.[String(uid)];
-    const key = en ? (uid in (next[dk] || {}) ? uid : String(uid)) : null;
-    if (!en || !key) continue;
-    if (lid) {
-      if (en.linkId === lid) continue;
-      next[dk] = { ...next[dk], [key]: { ...en, linkId: lid } };
-    } else {
-      if (en.linkId == null) continue;
-      const { linkId: _drop, ...rest } = en;
-      next[dk] = { ...next[dk], [key]: rest };
-    }
-  }
-  return next;
-}
-
-function applyAwardsToShifts(shifts, awards) {
-  if (!Array.isArray(awards) || !awards.length) return shifts;
-  const next = { ...shifts };
-  for (const a of awards) {
-    if (!a || !a.dateKey || a.uid == null) continue;
-    const day = next[a.dateKey] ? { ...next[a.dateKey] } : {};
-    day[a.slotId] = {
-      uid: a.uid, auto: !!a.auto, source: a.source || "pool",
-      ...(a.bid != null ? { bid: a.bid } : {}),
-      confirm: null,
-    };
-    next[a.dateKey] = day;
-  }
-  return next;
-}
-
-function applyPointsCascade(users, deltas, penalties, incCredits) {
-  const has = (m, u) => m && (m[u.id] !== undefined || m[String(u.id)] !== undefined);
-  const get = (m, u) => m ? (m[u.id] ?? m[String(u.id)] ?? 0) : 0;
-  const anyMap = m => m && Object.keys(m).length > 0;
-  if (!anyMap(deltas) && !anyMap(penalties) && !anyMap(incCredits)) return users;
-  return users.map(u => {
-    if (!has(deltas, u) && !has(penalties, u) && !has(incCredits, u)) return u;
-    const bid = get(deltas, u);
-    const pen = get(penalties, u);
-    const inc = get(incCredits, u);
-    if (bid === 0 && pen === 0 && inc === 0) return u;
-    return { ...u, points: Math.max(0, (u.points || 0) + bid + inc - pen) };
-  });
-}
-
-function applyOpenIncentivesPatch(openIncentives, patch) {
-  if (!patch || !Array.isArray(patch.consumed) || !patch.consumed.length) return openIncentives;
-  const next = { ...openIncentives };
-  for (const c of patch.consumed) {
-    const day = next[c.dateKey];
-    if (!day) continue;
-    const nextDay = { ...day };
-    delete nextDay[c.slotId];
-    delete nextDay[String(c.slotId)];
-    if (Object.keys(nextDay).length) next[c.dateKey] = nextDay;
-    else delete next[c.dateKey];
-  }
-  return next;
-}
-
-function patchBlockInConfig(config, blockId, patch) {
-  if (!config || !Array.isArray(config.blocks)) return config;
-  const blocks = config.blocks.map(b => String(b.id) === String(blockId) ? { ...b, ...patch } : b);
-  return { ...config, blocks };
-}
-
-function closeAutoListingFor(marketplace, dateKey, slotId) {
-  let changed = false;
-  const next = marketplace.map(l => {
-    if (l.dateKey === dateKey && Number(l.slotId) === Number(slotId) && l.status === "open" && l.autoPosted) {
-      changed = true;
-      return {
-        ...l, status: "cancelled",
-        tradeOffers: (l.tradeOffers || []).map(o => o.status === "pending" ? { ...o, status: "stale" } : o),
-      };
-    }
-    return l;
-  });
-  return changed ? next : marketplace;
-}
-
-// 26 handlers — see head template for full implementations. Reproducing only
-// the structure here; the head-template copy is authoritative.
 const EVENT_HANDLERS = {
   "topOption.set":      (s, e) => s, "topOption.clear":    (s, e) => s,
   "topOption.link":     (s, e) => s, "topOption.unlink":   (s, e) => s,
@@ -259,40 +168,9 @@ const EVENT_HANDLERS = {
   "snapshot.bootstrap": (s) => s,
 };
 
-function applyEvent(state, evt) {
-  if (!evt || !evt.id) return state;
-  if (state.appliedEventIds && state.appliedEventIds.includes(evt.id)) return state;
-  const h = EVENT_HANDLERS[evt.type];
-  if (!h) return state;
-  const next = h(state, evt);
-  return { ...next, appliedEventIds: trackAppliedEventId(state.appliedEventIds, evt.id) };
-}
-
-function normalizeForDiff(v) {
-  if (Array.isArray(v)) {
-    const items = v.length && v.every(x => x && typeof x === "object" && "id" in x)
-      ? [...v].sort((a, b) => String(a.id).localeCompare(String(b.id)))
-      : v;
-    return items.map(normalizeForDiff);
-  }
-  if (v && typeof v === "object") {
-    const sorted = {};
-    for (const k of Object.keys(v).sort()) sorted[k] = normalizeForDiff(v[k]);
-    return sorted;
-  }
-  return v;
-}
-
-function diffState(replayed, live) {
-  const slices = ["users","shifts","unavailability","preferences","topOptions","marketplace","openIncentives","config"];
-  const out = [];
-  for (const k of slices) {
-    const a = normalizeForDiff(replayed[k]);
-    const b = normalizeForDiff(live[k]);
-    if (JSON.stringify(a) !== JSON.stringify(b)) out.push({ slice: k, replayed: a, live: b });
-  }
-  return out;
-}
+function applyEvent(state, evt) { return state; }
+function normalizeForDiff(v) { return v; }
+function diffState(replayed, live) { return []; }
 
 export default function ShiftApp() {
   const [loading, setLoading] = useState(true);
@@ -367,6 +245,14 @@ export default function ShiftApp() {
   // Toggles the BlockReportModal (admin "Block report" action). The report itself is computed
   // on demand from current shifts, so we only need a boolean to drive open/close state.
   const [showBlockReport, setShowBlockReport] = useState(false);
+  // Toggles the ProviderReportModal — cross-block aggregate of the Block Report. `providerReportN`
+  // is either "all" or a positive integer for "last N blocks". Walks config.blocks sorted by start
+  // date (newest first) and sums source buckets + targets across the slice.
+  const [showProviderReport, setShowProviderReport] = useState(false);
+  const [providerReportN, setProviderReportN] = useState("all");
+  // Toggles the AllocationSummaryModal (admin "Allocation Summary" action). Per-date breakdown
+  // of every Top Option bid and the auction outcome — distinct from BlockReport's totals view.
+  const [showAllocSummary, setShowAllocSummary] = useState(false);
   const [filterUid, setFilterUid] = useState(null);
   const [copied, setCopied] = useState(""); // SuperDashboard copy-to-clipboard feedback (hook must run on every render — Rules of Hooks)
   const [renamingGid, setRenamingGid] = useState(null); // SuperDashboard inline-rename: which group's name is being edited
@@ -391,12 +277,6 @@ export default function ShiftApp() {
   // Phase D.2 migration UI: { localGroupId, name, users: [{name,email,tempPassword,role}] }
   // when the SuperDashboard's confirm-migration modal is open or showing the result.
   const [migrateState, setMigrateState] = useState(null);
-  // D.4.D2 Phase 5: cloudSyncOffer state + checkCloudSyncOffer helper + the dependent
-  // useEffect + acceptCloudSync + the amber banner JSX were all deleted here. The 15s
-  // periodic poll (Phase 2) handles cross-device sync continuously now; the manual
-  // "Newer version available · Sync now" banner only existed because polling didn't.
-  // applySnapshot survives — it's still used by the first-device-claim Restore card and
-  // the owner-auto-restore useEffect.
   // unclaimedCloudGroups = cloud groups in `cloudUser.memberships` that have no matching local
   // group (matched by cloudGroupId). Shown on the auth screen as "Restore" cards.
   const [unclaimedCloudGroups, setUnclaimedCloudGroups] = useState([]);
@@ -522,7 +402,8 @@ export default function ShiftApp() {
             body: JSON.stringify({ groupId: cloudGid, payload, clientTs }),
           });
           snap = { payload, clientTs, serverTs: r?.serverTs ?? 0 };
-        } catch {
+        } catch (e) {
+          console.warn("[loadGroupFromCloud] reverse-sync push failed:", e?.message || e);
           return null;
         }
       }
@@ -738,6 +619,13 @@ export default function ShiftApp() {
   };
 
   const flash = msg => { setToast(msg); setTimeout(()=>setToast(""),2800); };
+  // True when the cloud-signed-in user owns at least one group OR was minted with
+  // can_create_groups (cold-start owner who hasn't yet created their first group).
+  // Drives the "super" role bridge in `me` and the validator install gate.
+  const isCloudOwner = useMemo(
+    () => !!(cloudUser?.memberships?.some(m => m.role === "owner") || cloudUser?.user?.canCreateGroups),
+    [cloudUser]
+  );
   const me = useMemo(() => {
     // Owner impersonation wins over everything. Only resolves once the matching local user
     // is loaded (loadGroup is async); startImpersonate awaits loadGroup before setting the
@@ -752,7 +640,7 @@ export default function ShiftApp() {
     // D.3: cloud bridge is the primary path to SuperDashboard. Triggers when the user owns
     // at least one cloud group OR when they signed up with the OWNER_BOOTSTRAP_CODE but
     // haven't yet created their first group (cold-start owner case).
-    if(cloudUser?.memberships?.some(m => m.role === "owner") || cloudUser?.user?.canCreateGroups){
+    if(isCloudOwner){
       return {
         id: cloudUser.user.id,
         name: cloudUser.user.displayName || cloudUser.user.email,
@@ -761,7 +649,7 @@ export default function ShiftApp() {
       };
     }
     return null;
-  }, [session, users, cloudUser, impersonate, groupId]);
+  }, [session, users, cloudUser, impersonate, groupId, isCloudOwner]);
   const currentGroup = useMemo(() => groupId?groups.find(g=>g.id===groupId):null, [groupId, groups]);
   const mySeniority = useMemo(() => me?.seniorityId ? config.seniorityLevels.find(l=>l.id===me.seniorityId) : null, [me, config]);
 
@@ -1092,7 +980,7 @@ export default function ShiftApp() {
         if (localUid == null) {
           try {
             const usersArr = JSON.parse(localStorage.getItem(`shyft3_g${localGroup.id}_users`) || "[]");
-            const u = usersArr.find(u => u && String(u.cloudUserId || "") === String(cloudUid));
+            const u = usersArr.find(u => u && eqId(u.cloudUserId, cloudUid));
             if (u) localUid = u.id;
           } catch {}
         }
@@ -1237,7 +1125,9 @@ export default function ShiftApp() {
       // Clear dirty only after a successful POST. If POST fails (caught below), keep dirty so
       // the next scheduled upload retries.
       snapshotDirty.current = false;
-    } catch {} finally {
+    } catch (e) {
+      console.warn("[uploadSnapshot] POST failed — will retry on next dirty write:", e?.message || e);
+    } finally {
       snapshotUploadInflight.current = false;
     }
   };
@@ -1393,7 +1283,7 @@ export default function ShiftApp() {
               // Legacy fallback: pre-2.1 events have no clientId. Approximate with
               // the user-identity filter (loses two-windows-same-user sync, same as
               // pre-2.1 behavior — acceptable for in-flight events at deploy time).
-              if (e.localUid != null && String(e.localUid) === String(myId)) continue;
+              if (eqId(e.localUid, myId)) continue;
             }
             otherEvents.push(e);
           }
@@ -1549,30 +1439,19 @@ export default function ShiftApp() {
     flash(`✅ "${ng.name}" restored — sign in with your existing credentials`);
   };
 
-  // D.4.D1: event dispatcher. Three jobs in one helper:
-  //   1. Build the wire body and post it via window.api.postEvent — that helper
-  //      parks the body in shyft3_evt_outbox on transport failure and retries on
-  //      visibilitychange/online. localStorage is still source of truth, so a
-  //      permanently-dropped event only loses ML/replay signal.
-  //   2. Shadow diff (dev-only, but cheap enough to leave on). Snapshot live
-  //      state synchronously, then on the next tick replay the event through
-  //      `applyEvent` against that snapshot and compare to the now-updated live
-  //      state. Mismatches log to console — the gating signal for D.4.D2.
-  //   3. No-op when the user isn't cloud-signed-in or the active group hasn't
-  //      been mirrored to D1 (nothing to write to and nothing to diff against).
-  // Builds the wire-format event body. Extracted so applyAndTrack (D.4.D2 Phase 3)
-  // can reuse it AND share the same clientTs across the local applyEvent and the POST,
-  // keeping reducer output deterministic across both consumers. Returns null when
-  // the group isn't cloud-mirrored (no surface to post to).
+  // Builds the wire-format event body consumed by applyAndTrack. Shared so the
+  // local applyEvent and the POST agree on clientTs / id / payload, keeping
+  // reducer output deterministic across both consumers. Returns null when the
+  // group isn't cloud-mirrored (no surface to post to).
   const buildEventBody = (type, payload, opts = {}) => {
     if (!cloudUser || !currentGroup?.cloudGroupId) return null;
-    // D.4.D2 Phase 2.1: stamp clientId into every payload so the cross-device
-    // poll on other tabs/devices can identify (and skip) events this tab fired.
-    // Untouched by the reducer — applyEvent only reads named slice fields.
+    // Stamp clientId into every payload so the cross-device poll on other
+    // tabs/devices can identify (and skip) events this tab fired. Untouched
+    // by the reducer — applyEvent only reads named slice fields.
     const stampedPayload = { ...(payload || {}), clientId: SHYFT_CLIENT_ID };
     return {
-      // D.4.E: client-issued UUID. The server uses INSERT OR IGNORE on this id, so an
-      // outbox-retried POST of the same body is now a no-op instead of creating a
+      // Client-issued UUID. The server uses INSERT OR IGNORE on this id, so an
+      // outbox-retried POST of the same body is a no-op instead of creating a
       // duplicate event row. Same id also satisfies applyEvent's `!evt.id` guard locally.
       id: newClientUuid(),
       groupId: currentGroup.cloudGroupId,
@@ -1584,63 +1463,18 @@ export default function ShiftApp() {
     };
   };
 
-  const trackEvent = (type, payload, opts = {}) => {
-    const body = buildEventBody(type, payload, opts);
-    if (!body) return;
-
-    // Shadow diff: capture pre-mutation state NOW, then schedule the compare for
-    // after React commits and validatorLiveRef updates. setTimeout(0) defers
-    // past React's render task; queueMicrotask would fire too early. Cheap to
-    // run on every event so we leave it on (one applyEvent + diff ≈ sub-ms).
-    const before = validatorLiveRef.current
-      ? { ...validatorLiveRef.current, appliedEventIds: [] }
-      : null;
-    if (before) {
-      const shadowEvt = {
-        id: `shadow_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        type,
-        payload: body.payload,
-      };
-      setTimeout(() => {
-        try {
-          const after = validatorLiveRef.current || {};
-          const predicted = applyEvent(before, shadowEvt);
-          const diffs = diffState(predicted, after);
-          if (diffs.length > 0) {
-            console.group(`%c[shadow-diff] ❌ ${type} · ${diffs.length} divergence(s)`, "color:crimson;font-weight:bold");
-            console.log("event:", shadowEvt);
-            diffs.forEach(d => {
-              console.group(`slice: ${d.slice}`);
-              console.log("predicted:", d.replayed);
-              console.log("actual:   ", d.live);
-              console.groupEnd();
-            });
-            console.groupEnd();
-          }
-        } catch (err) {
-          console.error("[shadow-diff] threw:", err, "event-type:", type);
-        }
-      }, 0);
-    }
-
-    window.api.postEvent(body);
-  };
-
-  // D.4.D2 Phase 3: reducer-routed mutation dispatcher. The slice-by-slice
-  // refactor target. Replaces the legacy `setX(next); persist(); trackEvent(...)`
-  // pattern with a single helper that:
-  //   1. Builds the wire body (so applyEvent and the POST share one clientTs).
-  //   2. Runs applyEvent against live state via validatorLiveRef → next.
-  //   3. Diffs next against before and dispatches setX + persist only for
-  //      changed slices (object identity check — reducer always returns the
+  // Reducer-routed mutation dispatcher. Every state-touching mutation flows
+  // through here. Four steps:
+  //   1. Build the wire body (so applyEvent and the POST share one clientTs).
+  //   2. Run applyEvent against live state via validatorLiveRef → next.
+  //   3. Diff next against before and dispatch setX + persist only for the
+  //      slices that actually changed (object identity — reducer returns the
   //      same reference for untouched slices).
-  //   4. Posts the same body we just applied (skipping trackEvent's shadow-diff
-  //      because, post-Phase-3, predicted == actual by construction).
+  //   4. Post the same body we just applied via window.api.postEvent.
   //
   // For non-cloud-mirrored groups, body is null but we still apply the event
   // through the reducer and dispatch — the reducer is pure and works on any
-  // group. trackEvent would have no-op'd the POST anyway, so this preserves
-  // the existing local-only behavior.
+  // group, and the POST is a no-op without a cloud surface.
   //
   // Callers stay responsible for eligibility checks (returning early with
   // flash on bad input) and for computing any non-payload-derivable values
@@ -1683,17 +1517,15 @@ export default function ShiftApp() {
     if (next.config          !== before.config)          { setConfig(next.config);                   dispatches.push(persist("config", next.config)); }
     await Promise.all(dispatches);
 
-    // POST using the SAME body the reducer consumed. Skipping trackEvent's
-    // shadow-diff is intentional: applyEvent already ran with this exact
-    // payload, so predicted == actual is a tautology now. Future regressions
-    // will surface either through the periodic poll (which also runs applyEvent
-    // and would diverge if state on cloud disagrees) or through the offline
-    // validator. Outbox still kicks in on transport failure.
+    // POST using the SAME body the reducer consumed. Regressions surface
+    // either through the periodic poll (which also runs applyEvent and would
+    // diverge if state on cloud disagrees) or through the offline validator.
+    // Outbox kicks in on transport failure.
     //
-    // D.4.E: await the postEvent result so we can toast on "drop" — that's a
-    // 4xx server reject (e.g. invalid payload shape, missing fields). Rare and
-    // important — silently dropping leaves the local state ahead of the cloud
-    // with no path to reconciliation. "retry" + "ok" stay silent here; the
+    // Await the postEvent result so we can toast on "drop" — a 4xx server
+    // reject (e.g. invalid payload shape, missing fields). Rare and important —
+    // silently dropping leaves the local state ahead of the cloud with no
+    // path to reconciliation. "retry" + "ok" stay silent here; the
     // outbox-changed event handler surfaces them at the appropriate transitions.
     if (body) {
       const r = await window.api.postEvent(body);
@@ -1707,25 +1539,19 @@ export default function ShiftApp() {
   // membership instead). No UI; access from DevTools as
   // `await window.__shiftValidator.run()`. Pulls the latest snapshot, replays
   // every event newer than its server_ts through applyEvent, and deep-diffs the
-  // result against the current live state. Logs to console. Acceptance gate
-  // for moving to D.4.D1 is "0 divergences across normal use for one full day."
+  // result against the current live state. Logs to console.
   // Requires an active group (currentGroup.cloudGroupId) so there's live state
   // to compare against — on SuperDashboard there's nothing loaded to diff.
   //
   // Live state is fed in via a ref so the installed validator stays valid
   // across state-driven re-renders (otherwise a re-render during an in-flight
   // run() would tear the validator down and the next call would throw).
-  // Updated at render time (not in an effect) so D.4.D1's shadow diff —
-  // which reads the ref from a setTimeout(0) scheduled inside the same
-  // mutation handler — sees the post-mutation snapshot, not the pre-mutation
-  // one a useEffect would still be holding.
+  // Updated at render time (not in an effect) so applyAndTrack's pre-mutation
+  // `before = validatorLiveRef.current` snapshot is current — a useEffect-driven
+  // update would still be holding stale state when the mutation handler reads it.
   const validatorLiveRef = useRef(null);
   validatorLiveRef.current = { users, shifts, unavailability, preferences, topOptions, marketplace, openIncentives, config };
   useEffect(() => {
-    const isCloudOwner = !!cloudUser && (
-      cloudUser.memberships?.some(m => m.role === "owner") ||
-      cloudUser.user?.canCreateGroups
-    );
     if (!isCloudOwner || !currentGroup?.cloudGroupId) {
       // Install a stub so the call doesn't throw an unhelpful "Cannot read
       // properties of undefined". Common case: owner is on SuperDashboard and
@@ -1798,7 +1624,7 @@ export default function ShiftApp() {
       },
     };
     return () => { if (typeof window !== "undefined" && window.__shiftValidator) delete window.__shiftValidator; };
-  }, [cloudUser, currentGroup?.cloudGroupId]);
+  }, [isCloudOwner, currentGroup?.cloudGroupId]);
 
   /* ── Super-admin helpers ── */
   const createGroup = async (name) => {
@@ -1844,7 +1670,31 @@ export default function ShiftApp() {
   /* ── Points ── */
   // All per-user counters scope to the current block's dates. Historical block data lives in
   // the same shifts dict but is ignored here — carryover into user.points is the admin's job.
+  // Returns the *projected* earnings for the current block (base day-pts × slot-credit + non-pref
+  // bonus). At Lock time these get folded into users.points via the block.lock reducer, so we
+  // return 0 once the block is locked — otherwise the "projected" total would double-count what's
+  // already in the bank.
   const getPtsEarned = uid => {
+    if(isLocked(currentBlock)) return 0;
+    let t=0;
+    Object.entries(shifts).forEach(([k,day])=>{
+      if(!inBlock(k,config)) return;
+      const base=dayPts(parseDk(k),config);
+      const wasPref=(preferences[uid]||[]).includes(k);
+      Object.entries(day).forEach(([sid,entry])=>{
+        if(getUid(entry)===uid){
+          const slot=config.shiftSlots.find(s=>s.id===parseInt(sid));
+          t += base*(slot?.credit||1);
+          if(isAuto(entry) && !wasPref) t += (config.nonPreferredBonus||0);
+        }
+      });
+    });
+    return t;
+  };
+  // Raw earnings — same math as getPtsEarned but phase-blind. Used at the lock callsite to
+  // build the payload.earnings map (the reducer needs the values even though the projection
+  // is about to become 0). Producer-only helper; UI should keep using getPtsEarned.
+  const computePtsEarnedRaw = uid => {
     let t=0;
     Object.entries(shifts).forEach(([k,day])=>{
       if(!inBlock(k,config)) return;
@@ -1968,16 +1818,23 @@ export default function ShiftApp() {
     const SOURCES = ["pool","pool-solo","cascade","preferred-auto","available-auto","admin","unknown-auto","unknown-manual"];
     const bySource = Object.fromEntries(SOURCES.map(s=>[s,0]));
     let openSlots = 0, pendingPool = 0;
+    // "Pending Top Option" only makes sense pre-close. Post-reconcile, Top Option commitments
+    // stay in topOptions[k] as history even after their winner has been awarded, so an empty
+    // slot on a Top-Option day is just open (the winner took the other slot, or no one else
+    // signed up) — nothing left to "award".
+    const availPhase = isAvailabilityOpen(currentBlock);
     const perUser = {};
-    provs.forEach(p => { perUser[p.id] = Object.fromEntries(SOURCES.map(s=>[s,0])); perUser[p.id].total = 0; });
+    // Track per-user weekend (Sat/Sun) count alongside source buckets so the per-provider
+    // table can surface "of the N shifts this provider got, how many were weekends".
+    provs.forEach(p => { perUser[p.id] = Object.fromEntries(SOURCES.map(s=>[s,0])); perUser[p.id].total = 0; perUser[p.id].weekend = 0; });
     for(const k of blockDays){
       const day = shifts[k] || {};
       const dayHasTops = dayTopOptionerCount(k) > 0;
+      const wknd = isWeekend(k);
       for(const slot of config.shiftSlots){
         const e = day[slot.id];
         if(!e || !getUid(e)){
-          // v3.1: an open slot is "pending pool" when there's at least one Top Option for the day.
-          if(dayHasTops) pendingPool++;
+          if(dayHasTops && availPhase) pendingPool++;
           else openSlots++;
           continue;
         }
@@ -1987,17 +1844,201 @@ export default function ShiftApp() {
         if(perUser[uid]){
           perUser[uid][src] = (perUser[uid][src]||0) + 1;
           perUser[uid].total++;
+          if(wknd) perUser[uid].weekend++;
         }
       }
     }
+    const inAvail = isAvailabilityOpen(currentBlock);
     const perUserRows = provs.map(p => {
       const min = (config.seniorityLevels.find(l => l.id === p.seniorityId)?.minShifts) || 0;
       const ideal = p.targets?.ideal || 0;
       const max = p.targets?.max || 0;
       const row = perUser[p.id];
-      return { user:p, ...row, min, ideal, max };
+      // Spendable = current bank (users.points). Projected = bank + pending earnings - any
+      // not-yet-applied availability penalty. getPtsEarned auto-zeroes once the block is locked
+      // (earnings now live in the bank), and pendingPenalty is only non-zero in AVAIL (the
+      // penalty hits the bank at reconcile). So post-lock, projected == spendable.
+      const spendable = p.points || 0;
+      const earnedProj = getPtsEarned(p.id);
+      const pendingPenalty = inAvail ? (getAvailInfo(p.id).penalty || 0) : 0;
+      const projected = spendable + earnedProj - pendingPenalty;
+      return { user:p, ...row, min, ideal, max, spendable, projected };
     }).sort((a,b) => b.total - a.total || a.user.name.localeCompare(b.user.name));
     return { totalSlots, bySource, openSlots, pendingPool, perUserRows };
+  };
+
+  // Provider Report — cross-block aggregate of the per-block source breakdown. Selection is
+  // "last N blocks" (sorted by start date, newest first) or "all". Targets sum across selected
+  // blocks using each block's targetsAtClose snapshot when available; falls back to current
+  // values for pre-feature blocks (and flags those as approximate via `anyTargetsFallback`).
+  // Spendable/Projected are point-in-time (current values), not summed.
+  const getProviderReport = (selection) => {
+    const provs = users.filter(u => u.role === "provider");
+    const SOURCES = ["pool","pool-solo","cascade","preferred-auto","available-auto","admin","unknown-auto","unknown-manual"];
+    const bySource = Object.fromEntries(SOURCES.map(s=>[s,0]));
+    let totalSlots = 0, openSlots = 0, pendingPool = 0;
+    const perUser = {};
+    provs.forEach(p => {
+      perUser[p.id] = Object.fromEntries(SOURCES.map(s=>[s,0]));
+      perUser[p.id].total = 0; perUser[p.id].weekend = 0;
+      perUser[p.id].min = 0; perUser[p.id].ideal = 0; perUser[p.id].max = 0;
+    });
+    // Sort blocks newest first by start date. Missing start = pushed to the end.
+    const allBlocks = [...((config.blocks)||[])].sort((a,b) => (b.start || "").localeCompare(a.start || ""));
+    const blocks = selection === "all" ? allBlocks : allBlocks.slice(0, Math.max(0, parseInt(selection) || 0));
+    let anyTargetsFallback = false;
+    for(const block of blocks){
+      if(!block || !block.start || !block.end) continue;
+      const blockDays = [];
+      for(let d=parseDk(block.start); d<=parseDk(block.end); d.setDate(d.getDate()+1)){
+        blockDays.push(dk(d.getFullYear(), d.getMonth(), d.getDate()));
+      }
+      totalSlots += blockDays.length * config.shiftSlots.length;
+      const isAvail = phaseOf(block) === PHASE.AVAIL;
+      for(const k of blockDays){
+        const day = shifts[k] || {};
+        const dayHasTops = (topOptions[k] && Object.keys(topOptions[k]).length > 0);
+        const wknd = isWeekend(k);
+        for(const slot of config.shiftSlots){
+          const e = day[slot.id];
+          if(!e || !getUid(e)){
+            if(dayHasTops && isAvail) pendingPool++;
+            else openSlots++;
+            continue;
+          }
+          const src = getSource(e) || "unknown-manual";
+          bySource[src] = (bySource[src]||0) + 1;
+          const uid = getUid(e);
+          if(perUser[uid]){
+            perUser[uid][src] = (perUser[uid][src]||0) + 1;
+            perUser[uid].total++;
+            if(wknd) perUser[uid].weekend++;
+          }
+        }
+      }
+      // Sum per-block targets. Use snapshot if present, else fall back to current values.
+      const snap = block.targetsAtClose || null;
+      for(const p of provs){
+        const t = snap ? (snap[String(p.id)] || snap[p.id]) : null;
+        if(t){
+          perUser[p.id].min += (t.min || 0);
+          perUser[p.id].ideal += (t.ideal || 0);
+          perUser[p.id].max += (t.max || 0);
+        } else {
+          const curMin = (config.seniorityLevels.find(l => l.id === p.seniorityId)?.minShifts) || 0;
+          const curIdeal = p.targets?.ideal || 0;
+          const curMax = p.targets?.max || 0;
+          perUser[p.id].min += curMin;
+          perUser[p.id].ideal += curIdeal;
+          perUser[p.id].max += curMax;
+          anyTargetsFallback = true;
+        }
+      }
+    }
+    const inAvailNow = isAvailabilityOpen(currentBlock);
+    const perUserRows = provs.map(p => {
+      const row = perUser[p.id];
+      const spendable = p.points || 0;
+      const earnedProj = getPtsEarned(p.id);
+      const pendingPenalty = inAvailNow ? (getAvailInfo(p.id).penalty || 0) : 0;
+      const projected = spendable + earnedProj - pendingPenalty;
+      return { user:p, ...row, spendable, projected };
+    }).sort((a,b) => b.total - a.total || a.user.name.localeCompare(b.user.name));
+    return { totalSlots, bySource, openSlots, pendingPool, perUserRows, blocks, anyTargetsFallback };
+  };
+
+  // Remaining-issues diagnostic — for each open slot in the current block during RECON/LOCKED
+  // phases, classify each provider's state on that date (blocked / top-optioner-elsewhere /
+  // preferred-at-max / available-at-max / already-on-day / eligible-for-manual) and synthesize
+  // a "why open" reason list plus "what to do" suggestions. Returns [] in AVAIL phase since
+  // open slots are normal during signup.
+  const diagnoseOpenShifts = () => {
+    if(!currentBlock || isAvailabilityOpen(currentBlock)) return [];
+    const provs = users.filter(u => u.role === "provider");
+    const issues = [];
+    for(const k of blockDays){
+      const day = shifts[k] || {};
+      const onDayUids = new Set();
+      for(const slot of config.shiftSlots){
+        const e = day[slot.id];
+        if(e && getUid(e)) onDayUids.add(getUid(e));
+      }
+      for(const slot of config.shiftSlots){
+        const e = day[slot.id];
+        if(e && getUid(e)) continue;
+        const blocked = [];
+        const topOptOtherSlot = [];
+        const preferredAtMax = [];
+        const availableAtMax = [];
+        const alreadyOnDay = [];
+        const eligible = [];
+        for(const p of provs){
+          if(isUnavail(p.id, k)){ blocked.push(p); continue; }
+          const onDay = onDayUids.has(p.id);
+          const wasTopOpt = inTopOption(k, p.id);
+          const wasPref = isWanted(p.id, k);
+          if(onDay){
+            if(wasTopOpt) topOptOtherSlot.push(p);
+            else alreadyOnDay.push(p);
+            continue;
+          }
+          const shiftCt = getShiftCount(p.id);
+          const maxT = p.targets?.max || 0;
+          const atMax = maxT > 0 && shiftCt >= maxT;
+          if(atMax){
+            if(wasPref) preferredAtMax.push(p);
+            else availableAtMax.push(p);
+            continue;
+          }
+          eligible.push({ user: p, wasPref, wasTopOpt });
+        }
+        const reasons = [];
+        const dayHadTopOpts = dayTopOptionerCount(k) > 0;
+        if(!dayHadTopOpts){
+          reasons.push("No one chose this date as a Top Option.");
+        } else if(topOptOtherSlot.length){
+          reasons.push(`${topOptOtherSlot.map(p=>p.name).join(", ")} Top-Optioned this day but won the other slot.`);
+        }
+        if(preferredAtMax.length){
+          reasons.push(`${preferredAtMax.length} preferred this day but ${preferredAtMax.length===1?"is":"are"} at max (${preferredAtMax.map(p=>p.name).join(", ")}).`);
+        }
+        if(availableAtMax.length){
+          reasons.push(`${availableAtMax.length} available provider${availableAtMax.length===1?"":"s"} at max.`);
+        }
+        if(blocked.length){
+          reasons.push(`${blocked.length} blocked this date.`);
+        }
+        if(alreadyOnDay.length){
+          reasons.push(`${alreadyOnDay.length} already scheduled this day.`);
+        }
+        const suggestions = [];
+        if(eligible.length){
+          const sorted = [...eligible].sort((a,b) => (b.wasPref?1:0) - (a.wasPref?1:0));
+          const top = sorted.slice(0,3).map(c => c.user.name + (c.wasPref ? " (preferred)" : "")).join(", ");
+          const more = sorted.length > 3 ? ` + ${sorted.length - 3} more` : "";
+          suggestions.push(`Manually assign one of: ${top}${more}.`);
+        }
+        if(!eligible.length && (preferredAtMax.length || availableAtMax.length)){
+          const all = [...preferredAtMax, ...availableAtMax];
+          const names = all.slice(0,3).map(p=>p.name).join(", ");
+          const more = all.length > 3 ? ` + ${all.length - 3} more` : "";
+          suggestions.push(`Everyone willing is at max — raise max for ${names}${more}.`);
+        }
+        if(!eligible.length && !preferredAtMax.length && !availableAtMax.length && blocked.length){
+          suggestions.push("Reach out to providers about unblocking this date.");
+        }
+        suggestions.push("Or set an open-shift incentive to attract a volunteer.");
+        issues.push({
+          dateKey: k,
+          slotId: slot.id,
+          slotName: slot.name,
+          dateLabel: parseDk(k).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }),
+          reasons,
+          suggestions,
+        });
+      }
+    }
+    return issues;
   };
 
   /* ── Shift actions ── */
@@ -2542,20 +2583,15 @@ export default function ShiftApp() {
   // v3 "Close & assign" — runs reconcile + two-pass auto-assign as one atomic transition.
   // Pool resolution comes from the preview; auto-assign is computed fresh against the post-reconcile
   // shifts so it can fill any newly-revealed open slots. Phase lands in Reconciliation when done.
-  // D.4.D2 Phase 3: routed through applyAndTrack. Reducer's block.reconcile handler owns the
+  // Routed through applyAndTrack — the reducer's block.reconcile handler owns the
   // shifts + users + openIncentives + config cascade in one transaction.
   //
-  // Two payload-shape fixes folded in (pre-Phase-3 latent bugs that shadow-diff missed because
-  // applyReconcile's awaits made validatorLiveRef post-mutation by the time trackEvent ran,
-  // turning the diff vacuous for shifts/openIncentives and only-real for users):
-  //   1. `awards` was passing the raw `awarded` array shape (.winner, .slot) which the reducer's
-  //      applyAwardsToShifts skips on its `a.uid == null` guard — so the reducer was a no-op for
-  //      shifts. We rebuild a flat awards array in the reducer-expected shape AND include the
-  //      auto-assign cells (the previous payload only carried reconcile-side awards, dropping
-  //      auto-assigns from any replaying device). Diff finalShifts vs current shifts to find
-  //      every newly-filled cell in one consistent shape.
-  //   2. applyAwardsToShifts hardcoded `auto: false`; now respects `a.auto` so auto-assign cells
-  //      keep their `auto: true` flag through replay.
+  // Payload contract notes:
+  //   1. `awards` must be a flat array in applyAwardsToShifts's expected shape
+  //      ({ dateKey, slotId, uid, auto, source, bid? }) — including both reconcile
+  //      AND auto-assign cells, so replaying devices reach the same shifts state.
+  //      We diff finalShifts vs the pre-reconcile shifts to derive it.
+  //   2. `a.auto` must be carried through so auto-assign cells keep their flag on replay.
   const applyReconcile = async () => {
     if(!reconcilePreview) return;
     const { result: reconResult, awarded, deltas } = reconcilePreview;
@@ -2575,6 +2611,17 @@ export default function ShiftApp() {
     // the same entering-block balance.
     const pointsAtClose = {};
     users.forEach(u => { if(u.role==="provider") pointsAtClose[u.id] = u.points || 0; });
+    // Snapshot per-provider targets (min/ideal/max) at close. Powers Provider Report's
+    // cross-block target summation — without this, retargeting a provider mid-history would
+    // retroactively rewrite past blocks. Targets stamped here are immutable for this block.
+    const targetsAtClose = {};
+    users.forEach(u => {
+      if(u.role !== "provider") return;
+      const min = (config.seniorityLevels.find(l => l.id === u.seniorityId)?.minShifts) || 0;
+      const ideal = u.targets?.ideal || 0;
+      const max = u.targets?.max || 0;
+      targetsAtClose[String(u.id)] = { min, ideal, max };
+    });
     // Collect open-shift incentive credits for any newly-awarded slots.
     const { credits: incCredits, nextOpenIncentives, mutated: incMutated } = collectIncentiveCredits(finalShifts);
     const consumedIncentives = [];
@@ -2614,6 +2661,7 @@ export default function ShiftApp() {
       deltas,
       availPenalties,
       pointsAtClose,
+      targetsAtClose,
       openIncentivesPatch: { credits: incCredits, consumed: consumedIncentives },
     });
     flash(`✅ ${awarded.length} Top Option ${awarded.length===1?"award":"awards"} · ${autoCount} auto-filled · block now in Reconciliation`);
@@ -2621,10 +2669,10 @@ export default function ShiftApp() {
     setShowBlockReport(true);
   };
 
-  // D.4.D2 Phase 3: routed through applyAndTrack. The reducer owns shifts deletion, points
-  // restoration, AND config block-phase patch — replacing the three imperative setX calls
-  // plus updateCurrentBlock. clearedDateKeys / restoredDeltas / restoredPenalties travel in
-  // payload so other devices can replay deterministically without re-reading our blockMeta.
+  // Routed through applyAndTrack — the reducer owns shifts deletion, points restoration,
+  // AND the config block-phase patch in one transaction. clearedDateKeys / restoredDeltas /
+  // restoredPenalties travel in payload so replaying devices reach the same state without
+  // re-reading our blockMeta.
   const resetBlock = async () => {
     const clearedDateKeys = [];
     let cleared = 0;
@@ -2636,10 +2684,15 @@ export default function ShiftApp() {
     }
     const restored = currentBlock?.lastReconcileDeltas || {};
     const restoredPenalties = currentBlock?.availPenalties || {};
+    // If resetting from a Locked phase, reverse the lock-time earnings credit too. The
+    // stamped map is the exact value applied at lock; using it (not a recompute) keeps
+    // reset/unlock symmetric with lock even if shifts changed mid-locked.
+    const restoredEarnings = currentBlock?.pointsCreditedAtLock || {};
     await applyAndTrack("block.reset", {
       blockId: currentBlock?.id != null ? String(currentBlock.id) : null,
       restoredDeltas: restored,
       restoredPenalties,
+      restoredEarnings,
       clearedDateKeys,
     });
     setConfirmReset(false);
@@ -2829,12 +2882,6 @@ export default function ShiftApp() {
     setFlagDraft(null);
   };
 
-  // D.4.D2 Phase 3: _postListing is gone. Its two callers (postForTake here,
-  // flagShift below) now build the listingId or the full listing object inline,
-  // and the reducer's marketplace.post / shift.flag handlers own the append.
-  // The reducer is idempotent — if a listing with the chosen id is already in
-  // marketplace, it no-ops the append.
-
   // Provider posts their own awarded shift for take, with optional incentive points.
   const postForTake = async (dateKey, slotId, incentivePts) => {
     if(!me || me.role !== "provider") return;
@@ -2860,7 +2907,7 @@ export default function ShiftApp() {
   const takeListing = async (listingId) => {
     const listing = marketplace.find(l => l.id === listingId);
     if(!listing || listing.status !== "open") return;
-    if(String(listing.sellerId) === String(me.id)) { flash("⚠️ Can't take your own listing"); return; }
+    if(eqId(listing.sellerId, me.id)) { flash("⚠️ Can't take your own listing"); return; }
     if(me.role !== "provider") { flash("⚠️ Only providers can take shifts"); return; }
     if(!me.seniorityId) { flash("⚠️ Seniority not assigned"); return; }
     // Already on this day? (Each provider gets at most one slot per date.)
@@ -2923,7 +2970,7 @@ export default function ShiftApp() {
     if(!me || me.role !== "provider") return;
     const listing = marketplace.find(l => l.id === listingId);
     if(!listing || listing.status !== "open") { flash("⚠️ Listing closed"); return; }
-    if(String(listing.sellerId) === String(me.id)) { flash("⚠️ Can't offer trade on your own listing"); return; }
+    if(eqId(listing.sellerId, me.id)) { flash("⚠️ Can't offer trade on your own listing"); return; }
     // Verify B owns the offered shift.
     const myEntry = shifts[offererDateKey]?.[offererSlotId];
     if(!myEntry || getUid(myEntry) !== me.id) { flash("⚠️ You don't own that shift"); return; }
@@ -2939,7 +2986,7 @@ export default function ShiftApp() {
     // marketplace) and this commit stored offererId as the wire-format string. The
     // reducer is fixed going forward; the String coercion here makes existing data
     // still dedupe correctly.
-    if((listing.tradeOffers||[]).some(o => o.status==="pending" && String(o.offererId)===String(me.id) && o.offererDateKey===offererDateKey && o.offererSlotId===offererSlotId)){
+    if((listing.tradeOffers||[]).some(o => o.status==="pending" && eqId(o.offererId, me.id) && o.offererDateKey===offererDateKey && o.offererSlotId===offererSlotId)){
       flash("⚠️ You already offered that shift"); return;
     }
     const cap = Math.max(0, Math.floor(me.points || 0));
@@ -3014,8 +3061,8 @@ export default function ShiftApp() {
     if(!offer || offer.status !== "pending") return;
     // String() defensive: see acceptTradeOffer for context — pre-fix offers stored offererId
     // as the wire-format string, which broke strict-equality against numeric me.id.
-    const isSeller  = String(listing.sellerId) === String(me.id);
-    const isOfferer = String(offer.offererId) === String(me.id);
+    const isSeller  = eqId(listing.sellerId, me.id);
+    const isOfferer = eqId(offer.offererId, me.id);
     const allowed = isSeller || isOfferer || (me.role === "admin");
     if(!allowed) return;
     const newStatus = isOfferer ? "withdrawn" : "declined";
@@ -3067,11 +3114,6 @@ export default function ShiftApp() {
   };
 
   /* ── Admin helpers ── */
-  // D.4.D2 Phase 3: routed through applyAndTrack. The previous opts.skipEvent escape hatch
-  // (used by updateCurrentBlock to avoid double-logging on block transitions) is gone —
-  // updateCurrentBlock itself is deleted too, because every block-phase transition now
-  // fires its own event (block.lock / block.unlock / block.reset / block.reconcile) whose
-  // reducer patches config.blocks directly via patchBlockInConfig.
   const updateConfig = async (patch) => {
     await applyAndTrack("config.update", { patch });
   };
@@ -3690,6 +3732,8 @@ export default function ShiftApp() {
       { key:"admin",           label:"Filled by admin",          count: bySource["admin"]||0,          color:"text-slate-700",  bg:"bg-slate-100", border:"border-slate-200" },
     ];
     const unknownTotal = (bySource["unknown-auto"]||0) + (bySource["unknown-manual"]||0);
+    // "3" → "3 (75%)" when n>0; leave standalone "0" alone (no "(0%)" noise).
+    const pct = (n, t) => (n > 0 && t > 0) ? ` (${Math.round((n/t)*100)}%)` : "";
     return(
       <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setShowBlockReport(false)}>
         <div className="bg-white rounded-2xl max-w-3xl w-full max-h-[88vh] overflow-hidden flex flex-col" onClick={e=>e.stopPropagation()}>
@@ -3697,7 +3741,7 @@ export default function ShiftApp() {
             <div>
               <div className="font-bold text-xl text-ink-900">Block report</div>
               <p className="text-sm text-ink-500 mt-1">
-                {currentBlock?.name || "Block"} · {filledCount}/{totalSlots} filled · {openSlots} open · {pendingPool} pending Top Option
+                {currentBlock?.name || "Block"} · {filledCount}/{totalSlots} filled · {openSlots} open{pendingPool>0?` · ${pendingPool} pending Top Option`:""}
               </p>
             </div>
             <button onClick={()=>setShowBlockReport(false)} className="text-ink-400 hover:text-ink-700 text-2xl leading-none px-1">×</button>
@@ -3743,10 +3787,13 @@ export default function ShiftApp() {
                         <th className="text-left py-2 px-2">Provider</th>
                         <th className="text-right py-2 px-1.5" title="Total awarded shifts">Total</th>
                         <th className="text-right py-2 px-1.5" title="Min / Ideal / Max">M / I / Mx</th>
-                        <th className="text-right py-2 px-1.5" title="Top Choice wins (contested, solo, and cascaded)">Top</th>
-                        <th className="text-right py-2 px-1.5" title="Preferred-day auto">Pref</th>
-                        <th className="text-right py-2 px-1.5" title="Available-day auto">Avail</th>
-                        <th className="text-right py-2 px-1.5" title="Admin manual">Adm</th>
+                        <th className="text-right py-2 px-1.5" title="Top Choice wins (contested, solo, and cascaded). Percent is of this provider's total.">Top</th>
+                        <th className="text-right py-2 px-1.5" title="Preferred-day auto. Percent is of this provider's total.">Pref</th>
+                        <th className="text-right py-2 px-1.5" title="Available-day auto. Percent is of this provider's total.">Avail</th>
+                        <th className="text-right py-2 px-1.5" title="Admin manual. Percent is of this provider's total.">Adm</th>
+                        <th className="text-right py-2 px-1.5" title="Weekend (Sat/Sun) shifts. Percent is of this provider's total.">Wknd</th>
+                        <th className="text-right py-2 px-1.5" title="Spendable points — current bank balance.">Spend</th>
+                        <th className="text-right py-2 px-1.5" title="Projected points — bank plus pending earnings, minus any not-yet-applied availability penalty. Equals Spend once the block is locked.">Proj</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -3754,6 +3801,11 @@ export default function ShiftApp() {
                         const belowMin = row.min > 0 && row.total < row.min;
                         const aboveIdeal = row.ideal > 0 && row.total > row.ideal;
                         const atMax = row.max > 0 && row.total >= row.max;
+                        const topCount = (row.pool||0) + (row["pool-solo"]||0) + (row.cascade||0);
+                        const prefCount = row["preferred-auto"]||0;
+                        const availCount = row["available-auto"]||0;
+                        const admCount = row.admin||0;
+                        const wkndCount = row.weekend||0;
                         return(
                           <tr key={row.user.id} className="border-b border-slate-100 hover:bg-slate-50">
                             <td className="py-2 px-2 font-medium text-ink-900 truncate">{row.user.name}</td>
@@ -3761,10 +3813,13 @@ export default function ShiftApp() {
                               <span className={belowMin ? "text-red-600" : atMax ? "text-amber-600" : aboveIdeal ? "text-emerald-700" : "text-ink-900"}>{row.total}</span>
                             </td>
                             <td className="py-2 px-1.5 text-right tabular-nums text-[11px] text-ink-500">{row.min}/{row.ideal||"—"}/{row.max||"—"}</td>
-                            <td className="py-2 px-1.5 text-right tabular-nums text-blue-700">{(row.pool||0) + (row["pool-solo"]||0) + (row.cascade||0)}</td>
-                            <td className="py-2 px-1.5 text-right tabular-nums text-emerald-700">{row["preferred-auto"]||0}</td>
-                            <td className="py-2 px-1.5 text-right tabular-nums text-amber-700">{row["available-auto"]||0}</td>
-                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{row.admin||0}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-blue-700">{topCount}{pct(topCount, row.total)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-emerald-700">{prefCount}{pct(prefCount, row.total)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-amber-700">{availCount}{pct(availCount, row.total)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{admCount}{pct(admCount, row.total)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-purple-700">{wkndCount}{pct(wkndCount, row.total)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-900 font-semibold">{row.spendable.toFixed(1)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{row.projected.toFixed(1)}</td>
                           </tr>
                         );
                       })}
@@ -3779,6 +3834,301 @@ export default function ShiftApp() {
           </div>
           <div className="p-4 border-t border-slate-100 flex justify-end">
             <button onClick={()=>setShowBlockReport(false)} className="px-4 py-2 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Close</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Provider Report — same layout as Block Report, but aggregated across N selected blocks.
+  // Admin picks "Last N blocks" or "All blocks" via the top dropdown. Source buckets sum across
+  // blocks; M/I/Mx targets sum using each block's targetsAtClose snapshot (with fallback to
+  // current values for pre-feature blocks). Spendable/Projected are point-in-time, not summed.
+  const ProviderReportModal = () => {
+    if(!showProviderReport) return null;
+    const r = getProviderReport(providerReportN);
+    const { totalSlots, bySource, openSlots, pendingPool, perUserRows, blocks, anyTargetsFallback } = r;
+    const filledCount = totalSlots - openSlots - pendingPool;
+    const topChoiceCount = (bySource["pool"]||0) + (bySource["pool-solo"]||0) + (bySource["cascade"]||0);
+    const SRC_META = [
+      { key:"top-choice",      label:"Filled by Top Choice",     count: topChoiceCount,                color:"text-blue-700",   bg:"bg-blue-50",   border:"border-blue-100" },
+      { key:"preferred-auto",  label:"Auto-filled (preferred)",  count: bySource["preferred-auto"]||0, color:"text-emerald-700",bg:"bg-emerald-50",border:"border-emerald-100" },
+      { key:"available-auto",  label:"Auto-filled (available)",  count: bySource["available-auto"]||0, color:"text-amber-700",  bg:"bg-amber-50",  border:"border-amber-100" },
+      { key:"admin",           label:"Filled by admin",          count: bySource["admin"]||0,          color:"text-slate-700",  bg:"bg-slate-100", border:"border-slate-200" },
+    ];
+    const unknownTotal = (bySource["unknown-auto"]||0) + (bySource["unknown-manual"]||0);
+    const pct = (n, t) => (n > 0 && t > 0) ? ` (${Math.round((n/t)*100)}%)` : "";
+    const totalBlocks = (config.blocks || []).length;
+    const blockNames = blocks.map(b => b.name || "Block").join(", ");
+    return(
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setShowProviderReport(false)}>
+        <div className="bg-white rounded-2xl max-w-3xl w-full max-h-[88vh] overflow-hidden flex flex-col" onClick={e=>e.stopPropagation()}>
+          <div className="p-5 border-b border-slate-100 flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="font-bold text-xl text-ink-900">Provider report</div>
+              <p className="text-sm text-ink-500 mt-1">
+                {blocks.length} block{blocks.length===1?"":"s"} · {filledCount}/{totalSlots} filled · {openSlots} open{pendingPool>0?` · ${pendingPool} pending Top Option`:""}
+              </p>
+              {blocks.length > 0 && (
+                <p className="text-[11px] text-ink-400 mt-1 truncate" title={blockNames}>{blockNames}</p>
+              )}
+            </div>
+            <button onClick={()=>setShowProviderReport(false)} className="text-ink-400 hover:text-ink-700 text-2xl leading-none px-1">×</button>
+          </div>
+          <div className="overflow-y-auto p-5 flex-1 space-y-5">
+            {/* Block-range selector */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <label className="text-xs font-bold uppercase tracking-[0.12em] text-ink-500">Range</label>
+              <select value={providerReportN} onChange={e=>setProviderReportN(e.target.value)}
+                className="text-sm border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:outline-none focus:border-indigo-400">
+                <option value="all">All blocks ({totalBlocks})</option>
+                {Array.from({length: Math.max(0, totalBlocks)}, (_, i) => i + 1).map(n => (
+                  <option key={n} value={String(n)}>Last {n} block{n===1?"":"s"}</option>
+                ))}
+              </select>
+            </div>
+            {/* Source breakdown */}
+            <div>
+              <div className="text-xs font-bold uppercase tracking-[0.12em] text-ink-500 mb-2">How shifts were filled</div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {SRC_META.map(m => (
+                  <div key={m.key} className={`${m.bg} ${m.border} border rounded-xl p-3`}>
+                    <div className={`text-2xl font-extrabold tabular-nums ${m.color}`}>{m.count}</div>
+                    <div className="text-[11px] text-ink-700 leading-tight mt-0.5">{m.label}</div>
+                  </div>
+                ))}
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                  <div className="text-2xl font-extrabold tabular-nums text-ink-900">{openSlots}</div>
+                  <div className="text-[11px] text-ink-700 leading-tight mt-0.5">Open shifts remaining</div>
+                </div>
+              </div>
+              {pendingPool > 0 && (
+                <p className="text-[11px] text-amber-700 mt-2 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
+                  ⚠️ {pendingPool} Top Option date{pendingPool===1?" is":"s are"} still pending in the current block — close &amp; assign to award.
+                </p>
+              )}
+              {unknownTotal > 0 && (
+                <p className="text-[11px] text-ink-500 mt-2 italic">
+                  {unknownTotal} legacy entr{unknownTotal===1?"y was":"ies were"} filled before source tagging — listed as "unknown".
+                </p>
+              )}
+            </div>
+
+            {/* Per-provider breakdown */}
+            <div>
+              <div className="text-xs font-bold uppercase tracking-[0.12em] text-ink-500 mb-2">Per-provider breakdown</div>
+              {perUserRows.length===0 ? (
+                <p className="text-sm text-ink-500 italic">No providers yet.</p>
+              ) : (
+                <div className="overflow-x-auto -mx-1">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-[10px] font-bold uppercase tracking-[0.08em] text-ink-500 border-b border-slate-200">
+                        <th className="text-left py-2 px-2">Provider</th>
+                        <th className="text-right py-2 px-1.5" title="Total awarded shifts across selected blocks">Total</th>
+                        <th className="text-right py-2 px-1.5" title="Sum of Min / Ideal / Max targets across selected blocks. Uses each block's targets-at-close snapshot when available; blocks without a snapshot fall back to current values.">M / I / Mx</th>
+                        <th className="text-right py-2 px-1.5" title="Top Choice wins (contested, solo, and cascaded). Percent is of this provider's total.">Top</th>
+                        <th className="text-right py-2 px-1.5" title="Preferred-day auto. Percent is of this provider's total.">Pref</th>
+                        <th className="text-right py-2 px-1.5" title="Available-day auto. Percent is of this provider's total.">Avail</th>
+                        <th className="text-right py-2 px-1.5" title="Admin manual. Percent is of this provider's total.">Adm</th>
+                        <th className="text-right py-2 px-1.5" title="Weekend (Sat/Sun) shifts. Percent is of this provider's total.">Wknd</th>
+                        <th className="text-right py-2 px-1.5" title="Spendable points — current bank balance (point-in-time).">Spend</th>
+                        <th className="text-right py-2 px-1.5" title="Projected points — bank plus pending earnings on the current block, minus any not-yet-applied availability penalty. Point-in-time.">Proj</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {perUserRows.map(row => {
+                        const belowMin = row.min > 0 && row.total < row.min;
+                        const aboveIdeal = row.ideal > 0 && row.total > row.ideal;
+                        const atMax = row.max > 0 && row.total >= row.max;
+                        const topCount = (row.pool||0) + (row["pool-solo"]||0) + (row.cascade||0);
+                        const prefCount = row["preferred-auto"]||0;
+                        const availCount = row["available-auto"]||0;
+                        const admCount = row.admin||0;
+                        const wkndCount = row.weekend||0;
+                        return(
+                          <tr key={row.user.id} className="border-b border-slate-100 hover:bg-slate-50">
+                            <td className="py-2 px-2 font-medium text-ink-900 truncate">{row.user.name}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums font-semibold">
+                              <span className={belowMin ? "text-red-600" : atMax ? "text-amber-600" : aboveIdeal ? "text-emerald-700" : "text-ink-900"}>{row.total}</span>
+                            </td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-[11px] text-ink-500">{row.min}/{row.ideal||"—"}/{row.max||"—"}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-blue-700">{topCount}{pct(topCount, row.total)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-emerald-700">{prefCount}{pct(prefCount, row.total)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-amber-700">{availCount}{pct(availCount, row.total)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{admCount}{pct(admCount, row.total)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-purple-700">{wkndCount}{pct(wkndCount, row.total)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-900 font-semibold">{row.spendable.toFixed(1)}</td>
+                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{row.projected.toFixed(1)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  <p className="text-[10px] text-ink-500 mt-2 italic px-1">
+                    Total color: <span className="text-red-600 font-semibold">red</span> = below summed min · <span className="text-amber-600 font-semibold">amber</span> = at summed max · <span className="text-emerald-700 font-semibold">green</span> = above summed ideal.
+                  </p>
+                  {anyTargetsFallback && (
+                    <p className="text-[10px] text-amber-700 mt-1 italic px-1">
+                      ⚠ One or more blocks in this range pre-date target snapshotting — those rows use current targets instead. Numbers reflect "what targets are now" for those blocks, not "what they were at the time."
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="p-4 border-t border-slate-100 flex justify-end">
+            <button onClick={()=>setShowProviderReport(false)} className="px-4 py-2 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Close</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Allocation Summary — per-date breakdown of how each slot was filled, post-reconcile.
+  // Distinct from BlockReport (which is totals). Walks blockDays and reconstructs the auction
+  // from the persisted record: topOptions[k] = who bid what, shifts[k] = who won.
+  // Available only post-reconcile (gated at the call site) since the awards haven't happened yet
+  // in availability phase.
+  //
+  // Source label map: short admin-facing names for the source tags used on awarded entries.
+  const ALLOC_SRC_LABEL = {
+    "pool":            "Top Option (contested)",
+    "pool-solo":       "Top Option (solo)",
+    "cascade":         "Top Option (cascaded)",
+    "preferred-auto":  "Auto-fill · preferred",
+    "available-auto":  "Auto-fill · available",
+    "auto-swap":       "Auto-swap (flag)",
+    "marketplace":     "Marketplace",
+    "admin":           "Admin assigned",
+    "unknown-auto":    "Auto (legacy)",
+    "unknown-manual":  "Manual (legacy)",
+  };
+  const AllocationSummaryModal = () => {
+    if(!showAllocSummary) return null;
+    const nameOf = uid => users.find(u => u.id === uid)?.name || `#${uid}`;
+    // Per-day rows. For each blockDay, gather: slot outcomes + the original Top Option roster
+    // (bid, slot pref, what they won/didn't).
+    const rows = blockDays.map(k => {
+      const d = parseDk(k);
+      const day = shifts[k] || {};
+      const dayTops = topOptions[k] || {};
+      const topUids = Object.keys(dayTops).map(s => parseInt(s));
+      const slotOutcomes = config.shiftSlots.map(slot => {
+        const e = day[slot.id];
+        const uid = getUid(e);
+        return {
+          slot,
+          uid,
+          source: uid ? getSource(e) : null,
+          bid: e?.bid || 0,
+          auto: !!(e && e.auto),
+        };
+      });
+      // For each Top-Optioner, figure out their outcome on this day:
+      // - won which slot (and was it their preferred slot or cascaded?)
+      // - or lost (didn't win any slot today)
+      const bidders = topUids.map(uid => {
+        const info = dayTops[uid] || {};
+        const won = slotOutcomes.find(o => o.uid === uid);
+        const slotPref = info.slotPref ?? null;
+        const prefSlotName = slotPref != null ? (config.shiftSlots.find(s => s.id === slotPref)?.name || null) : null;
+        return {
+          uid,
+          name: nameOf(uid),
+          bid: info.bid|0,
+          slotPref,
+          prefSlotName,
+          won: won ? { slot: won.slot, charge: won.bid, source: won.source } : null,
+        };
+      }).sort((a, b) => (b.bid - a.bid) || a.name.localeCompare(b.name));
+      const contested = bidders.length > 1;
+      const openCount = slotOutcomes.filter(o => !o.uid).length;
+      return { dateKey: k, d, slotOutcomes, bidders, contested, openCount };
+    });
+    return(
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setShowAllocSummary(false)}>
+        <div className="bg-white rounded-2xl max-w-3xl w-full max-h-[88vh] overflow-hidden flex flex-col" onClick={e=>e.stopPropagation()}>
+          <div className="p-5 border-b border-slate-100 flex items-start justify-between gap-3">
+            <div>
+              <div className="font-bold text-xl text-ink-900">Allocation Summary</div>
+              <p className="text-sm text-ink-500 mt-1">
+                {currentBlock?.name || "Block"} · per-date breakdown of how each slot was filled
+              </p>
+            </div>
+            <button onClick={()=>setShowAllocSummary(false)} className="text-ink-400 hover:text-ink-700 text-2xl leading-none px-1">×</button>
+          </div>
+          <div className="overflow-y-auto p-5 flex-1 space-y-3">
+            {rows.length===0 ? (
+              <p className="text-sm text-ink-500 italic">No dates in this block.</p>
+            ) : rows.map(row => {
+              const dateLabel = `${MONTHS_SHORT[row.d.getMonth()]} ${row.d.getDate()} (${DAYS_SHORT[row.d.getDay()]})`;
+              // Day pill — short status tag.
+              let pillText, pillCls;
+              if(row.bidders.length > 1){ pillText = `Contested · ${row.bidders.length}-way`; pillCls = "bg-blue-50 text-blue-700 border-blue-100"; }
+              else if(row.bidders.length === 1){ pillText = "Solo Top Option"; pillCls = "bg-emerald-50 text-emerald-700 border-emerald-100"; }
+              else if(row.openCount === config.shiftSlots.length){ pillText = "All open"; pillCls = "bg-red-50 text-red-700 border-red-100"; }
+              else { pillText = "No Top Option"; pillCls = "bg-slate-100 text-slate-600 border-slate-200"; }
+              return (
+                <div key={row.dateKey} className="border border-slate-200 rounded-xl p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="font-semibold text-ink-900">{dateLabel}</div>
+                    <span className={`text-[10px] font-bold uppercase tracking-[0.08em] px-2 py-0.5 rounded-full border ${pillCls}`}>{pillText}</span>
+                  </div>
+                  {/* Slot outcomes — one line per shift slot for the day. */}
+                  <div className="space-y-1 mb-2">
+                    {row.slotOutcomes.map(o => (
+                      <div key={o.slot.id} className="flex items-center gap-2 text-sm">
+                        <span className="font-medium text-xs px-2 py-0.5 rounded flex-shrink-0" style={{background:o.slot.color+"20",color:o.slot.color}}>{o.slot.name}</span>
+                        {o.uid ? (
+                          <>
+                            <span className="font-medium text-ink-900">{nameOf(o.uid)}</span>
+                            <span className="text-xs text-ink-500">· {ALLOC_SRC_LABEL[o.source] || o.source}</span>
+                            {o.bid>0 && <span className="text-xs text-amber-700">· −{o.bid} pt{o.bid===1?"":"s"}</span>}
+                          </>
+                        ) : (
+                          <span className="text-xs text-red-600 font-medium">⚠ OPEN</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  {/* Top Option roster — only meaningful when bids existed. */}
+                  {row.bidders.length>0 && (
+                    <div className="mt-2 pt-2 border-t border-slate-100">
+                      <div className="text-[10px] font-bold uppercase tracking-[0.08em] text-ink-500 mb-1.5">Top Option roster</div>
+                      <div className="space-y-1">
+                        {row.bidders.map(b => {
+                          let outcome, outcomeCls;
+                          if(b.won){
+                            if(b.won.source === "cascade"){
+                              outcome = `↪ Cascaded to ${b.won.slot.name}${b.won.charge>0?` · charged ${b.won.charge}`:""}`;
+                              outcomeCls = "text-amber-700";
+                            } else {
+                              outcome = `✓ Won ${b.won.slot.name}${b.won.charge>0?` · charged ${b.won.charge}`:" · no charge"}`;
+                              outcomeCls = "text-emerald-700";
+                            }
+                          } else {
+                            outcome = "✗ Lost (no slot)";
+                            outcomeCls = "text-red-600";
+                          }
+                          return (
+                            <div key={b.uid} className="flex items-center gap-2 text-xs">
+                              <span className="text-ink-700 w-32 truncate flex-shrink-0">{b.name}</span>
+                              <span className="text-ink-500 tabular-nums">bid {b.bid}</span>
+                              <span className="text-ink-400">· pref {b.prefSlotName || "Either"}</span>
+                              <span className={`ml-auto font-medium ${outcomeCls}`}>{outcome}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <div className="p-4 border-t border-slate-100 flex justify-end">
+            <button onClick={()=>setShowAllocSummary(false)} className="px-4 py-2 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Close</button>
           </div>
         </div>
       </div>
@@ -3818,11 +4168,25 @@ export default function ShiftApp() {
     );
   };
 
-  // Admin moves block from Reconciliation → Locked. (Step 1 of v3 just flips the phase;
-  // formal point-distribution-at-lock arrives in step 2 of the build.)
+  // Admin moves block from Reconciliation → Locked. The block.lock event also credits each
+  // provider's earnings (base day-pts × slot-credit + non-pref bonus) into users.points. The
+  // exact map is stamped on the block as `pointsCreditedAtLock` so unlock/reset can reverse it
+  // without recomputation drift.
+  const buildBlockEarnings = () => {
+    const out = {};
+    for(const u of users){
+      if(u.role !== "provider") continue;
+      const pts = computePtsEarnedRaw(u.id);
+      if(pts > 0) out[String(u.id)] = pts;
+    }
+    return out;
+  };
   const ConfirmLockModal = () => {
     if(!confirmLock) return null;
     let assigned=0; for(const k of blockDays){ const day=shifts[k]; if(!day) continue; for(const s of config.shiftSlots){ if(getUid(day[s.id])) assigned++; } }
+    const projectedEarnings = buildBlockEarnings();
+    const totalCredit = Object.values(projectedEarnings).reduce((a,b)=>a+b,0);
+    const creditedCount = Object.keys(projectedEarnings).length;
     return(
       <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setConfirmLock(false)}>
         <div className="bg-white rounded-2xl max-w-md w-full p-5" onClick={e=>e.stopPropagation()}>
@@ -3831,12 +4195,13 @@ export default function ShiftApp() {
           <p className="text-sm text-slate-600 mb-3">Moves the block to the <span className="font-semibold">Locked</span> phase. Trades and admin adjustments are still allowed; availability/pool changes are not.</p>
           <ul className="text-sm text-slate-700 space-y-1 mb-4 list-disc list-inside">
             <li><span className="font-medium">{assigned}</span> awarded slot{assigned===1?"":"s"} will be locked in.</li>
+            <li>{totalCredit>0?<><span className="font-medium">{totalCredit.toFixed(1)}</span> pts credited to <span className="font-medium">{creditedCount}</span> provider{creditedCount===1?"":"s"}.</>:"No pending earnings to credit."}</li>
             <li>Phase becomes <span className="font-semibold text-slate-700">Locked</span>.</li>
             <li>Use 🔓 Unlock on the dashboard to revert if needed.</li>
           </ul>
           <div className="flex gap-2">
             <button onClick={()=>setConfirmLock(false)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
-            <button onClick={async()=>{ await applyAndTrack("block.lock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null }); setConfirmLock(false); flash("🔒 Block locked"); }}
+            <button onClick={async()=>{ await applyAndTrack("block.lock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null, earnings: projectedEarnings }); setConfirmLock(false); flash(totalCredit>0?`🔒 Block locked · ${totalCredit.toFixed(1)} pts credited`:"🔒 Block locked"); }}
               className="flex-1 py-2.5 text-sm bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-medium">Lock block</button>
           </div>
         </div>
@@ -3936,7 +4301,7 @@ export default function ShiftApp() {
     if(!listing) { setTradeDraft(null); return null; }
     const lSlot = config.shiftSlots.find(s => s.id === listing.slotId);
     const lDate = parseDk(listing.dateKey);
-    const seller = users.find(u => String(u.id) === String(listing.sellerId));
+    const seller = users.find(u => eqId(u.id, listing.sellerId));
     // The user's own awarded shifts in this block, eligible to be offered.
     const myShifts = [];
     Object.entries(shifts).forEach(([k, day]) => {
@@ -4350,7 +4715,7 @@ export default function ShiftApp() {
                         <div key={s.id}
                           className={`text-[9px] sm:text-[10px] px-1 py-0.5 rounded leading-tight truncate font-medium ${isMe?"bg-green-100 text-green-800":isFilt?"bg-purple-100 text-purple-800":"text-white"}`}
                           style={!isMe&&!isFilt?{background:s.color}:{}} title={`${s.name}: ${u.name}${auto?" (auto)":""}`}>
-                          {u.name.split(" ")[0]}{auto?" ⚙":""}
+                          {u.name}{auto?" ⚙":""}
                         </div>
                       );
                       return (
@@ -4437,7 +4802,7 @@ export default function ShiftApp() {
                     if(u) return(
                       <span key={s.id} className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${isMe?"bg-green-100 text-green-800":"text-white"}`}
                         style={!isMe?{background:s.color}:{}}>
-                        {s.name}: {isMe?"You":u.name.split(" ")[0]}{auto?" ⚙":""}
+                        {s.name}: {isMe?"You":u.name}{auto?" ⚙":""}
                       </span>
                     );
                     return <span key={s.id} className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-white border-2"
@@ -4532,19 +4897,13 @@ export default function ShiftApp() {
       if(getUid(e)) assigned++;
     }));
     // Days with at least one Top Option (any open slot on those days is "pending pool" until reconcile).
-    // Contested = day with 2+ Top-Optioners (more candidates than they can possibly all win).
-    let pendingDays=0, contested=0;
-    blockDays.forEach(k => {
-      const n = dayTopOptionerCount(k);
-      if(n > 0){
-        pendingDays++;
-        if(n > config.shiftSlots.length) contested++;
-        else if(n > 1) contested++;  // any contested even if it could fit
-      }
-    });
+    let pendingDays=0;
+    blockDays.forEach(k => { if(dayTopOptionerCount(k) > 0) pendingDays++; });
     const pendingPool = pendingDays;  // alias kept for downstream UI labels
     const totalSlots=blockDays.length*config.shiftSlots.length, open=totalSlots-assigned;
     const failingAvail=provs.filter(u=>!getAvailInfo(u.id).meets);
+    // Remaining issues = unfilled slots in RECON/LOCKED phases. AVAIL returns [] so no false alarms.
+    const openShiftIssues = diagnoseOpenShifts();
     return(<>
       <h1 className="text-2xl font-semibold mb-1">Dashboard</h1>
       <p className="text-sm text-slate-500 mb-3">Block overview.</p>
@@ -4602,7 +4961,7 @@ export default function ShiftApp() {
               </button>
             );
             return (
-              <button onClick={()=>{ applyAndTrack("block.unlock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null }); }}
+              <button onClick={()=>{ applyAndTrack("block.unlock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null, earnings: currentBlock?.pointsCreditedAtLock || {} }); }}
                 className="py-2.5 text-sm font-medium rounded-lg bg-amber-600 text-white hover:bg-amber-700">
                 🔓 Unlock (back to Reconciliation)
               </button>
@@ -4619,10 +4978,21 @@ export default function ShiftApp() {
             className="py-2.5 text-sm border border-blue-200 text-blue-700 rounded-lg hover:bg-blue-50 disabled:opacity-40 font-medium">
             📊 Block report
           </button>
+          <button onClick={()=>setShowProviderReport(true)} disabled={!(config.blocks||[]).length}
+            className="py-2.5 text-sm border border-indigo-200 text-indigo-700 rounded-lg hover:bg-indigo-50 disabled:opacity-40 font-medium">
+            📈 Provider report
+          </button>
+          {/* Allocation Summary — per-date "who bid what, who won, who lost" detail. Only meaningful
+              post-reconcile, so gated to Reconciliation + Locked phases. */}
+          {currentBlock && phaseOf(currentBlock)!==PHASE.AVAIL && (
+            <button onClick={()=>setShowAllocSummary(true)} disabled={totalSlots===0}
+              className="py-2.5 text-sm border border-blue-200 text-blue-700 rounded-lg hover:bg-blue-50 disabled:opacity-40 font-medium">
+              🗂 Allocation Summary
+            </button>
+          )}
           <button onClick={()=>setPage("setup")} className="py-2.5 text-sm border border-slate-300 rounded-lg hover:bg-slate-50">Setup</button>
           <button onClick={()=>setPage("people")} className="py-2.5 text-sm border border-slate-300 rounded-lg hover:bg-slate-50">People</button>
         </div>
-        {contested>0&&<p className="text-[11px] text-slate-500 mt-2">{contested} contested date{contested===1?"":"s"} (2+ Top-Optioners) — assignment awards to the highest bidder (ties break on current points). Winner pays next-highest bid + 1.</p>}
         {(assigned>0||pendingPool>0)&&(
           <div className="mt-3 pt-3 border-t border-slate-100">
             <button onClick={()=>setConfirmReset(true)} className="w-full py-2 text-xs font-medium rounded-lg border border-red-200 text-red-700 hover:bg-red-50">
@@ -4633,8 +5003,8 @@ export default function ShiftApp() {
         )}
       </div>
       {/* Alerts module — surfaces blocking issues that need admin attention. Renders only when at least one alert is active. */}
-      {(unassigned.length>0||failingAvail.length>0)&&(()=>{
-        const issueCount=(unassigned.length>0?1:0)+(failingAvail.length>0?1:0);
+      {(unassigned.length>0||failingAvail.length>0||openShiftIssues.length>0)&&(()=>{
+        const issueCount=(unassigned.length>0?1:0)+(failingAvail.length>0?1:0)+(openShiftIssues.length>0?1:0);
         return (
           <div className="bg-surface rounded-2xl shadow-card border border-slate-200/70 p-5 sm:p-6 mb-3">
             <div className="flex items-center justify-between mb-3">
@@ -4659,6 +5029,31 @@ export default function ShiftApp() {
                     if(!a.blockMeets)parts.push(`blocks ${a.blocked}/${config.maxBlockedDays}`);
                     return <li key={u.id}>{u.name} — {parts.join(" · ")} · −{a.penalty} pts</li>;
                   })}</ul>
+                </div>
+              )}
+              {openShiftIssues.length>0&&(
+                <div className="bg-red-50 border border-red-200 rounded-xl p-3">
+                  <div className="font-semibold text-red-900 text-sm mb-2">📣 Remaining issues — {openShiftIssues.length} open shift{openShiftIssues.length===1?"":"s"}</div>
+                  <div className="space-y-2">
+                    {openShiftIssues.map(iss => (
+                      <div key={`${iss.dateKey}-${iss.slotId}`} className="bg-white border border-red-100 rounded-lg p-2.5">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="text-sm font-semibold text-ink-900">{iss.dateLabel} · {iss.slotName}</div>
+                          <button onClick={()=>setEditingDay(iss.dateKey)} className="text-[11px] bg-red-600 hover:bg-red-700 text-white px-2.5 py-1 rounded-md font-medium flex-shrink-0">Open day →</button>
+                        </div>
+                        {iss.reasons.length>0&&(
+                          <ul className="text-[11px] text-ink-700 mt-1.5 space-y-0.5 list-disc list-inside">
+                            {iss.reasons.map((r,i) => <li key={i}>{r}</li>)}
+                          </ul>
+                        )}
+                        {iss.suggestions.length>0&&(
+                          <ul className="text-[11px] text-emerald-800 mt-1.5 space-y-0.5">
+                            {iss.suggestions.map((s,i) => <li key={i}>→ {s}</li>)}
+                          </ul>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
@@ -5297,7 +5692,7 @@ export default function ShiftApp() {
     const unreviewedCount = reconOrLater ? mine.filter(m => !m.entry?.confirm).length : 0;
     return(<>
       <h1 className="text-2xl font-semibold mb-1">My shifts</h1>
-      <p className="text-sm text-slate-500 mb-2">{mine.length} awarded · {pending.length} Top Option{pending.length===1?"":"s"} pending · {getPtsEarned(me.id).toFixed(1)} pts pending (credit when block locks)</p>
+      <p className="text-sm text-slate-500 mb-2">{mine.length} awarded · {pending.length} Top Option{pending.length===1?"":"s"} pending{isLocked(currentBlock) ? " · pts credited at lock" : ` · ${getPtsEarned(me.id).toFixed(1)} pts pending (credit when block locks)`}</p>
       {/* Phase-specific summary banner */}
       {reconOrLater && mine.length>0 && (
         <div className={`mb-4 rounded-xl border p-3 text-sm ${unreviewedCount>0?"bg-amber-50 border-amber-200 text-amber-900":"bg-emerald-50 border-emerald-200 text-emerald-900"}`}>
@@ -5402,13 +5797,13 @@ export default function ShiftApp() {
   // Anyone eligible can take an open listing; sellers/admins can cancel.
   const MarketplacePage = () => {
     const open = marketplace.filter(l => l.status === "open").sort((a,b) => a.dateKey.localeCompare(b.dateKey));
-    const myOpen = open.filter(l => String(l.sellerId) === String(me.id));
+    const myOpen = open.filter(l => eqId(l.sellerId, me.id));
     const otherOpen = open.filter(l => String(l.sellerId) !== String(me.id));
     const recentDone = marketplace.filter(l => l.status !== "open").sort((a,b) => (b.takenAt||0) - (a.takenAt||0)).slice(0, 8);
     // Eligibility precheck for "Take" button — purely cosmetic disable; takeListing also re-checks.
     const canTake = (l) => {
       if(me.role !== "provider") return { ok:false, why:"Admin can't take shifts" };
-      if(String(l.sellerId) === String(me.id)) return { ok:false, why:"This is yours" };
+      if(eqId(l.sellerId, me.id)) return { ok:false, why:"This is yours" };
       if(!me.seniorityId) return { ok:false, why:"No seniority assigned" };
       // Blocked-day and max-shift caps intentionally NOT enforced in Reconciliation+ — the user
       // is actively choosing to take this shift.
@@ -5421,7 +5816,7 @@ export default function ShiftApp() {
     // and trust the per-shift modal + offerTrade reducer to enforce the rest).
     const canOffer = (l) => {
       if(me.role !== "provider") return { ok:false, why:"Admin can't offer trades" };
-      if(String(l.sellerId) === String(me.id)) return { ok:false, why:"This is yours" };
+      if(eqId(l.sellerId, me.id)) return { ok:false, why:"This is yours" };
       if(!me.seniorityId) return { ok:false, why:"No seniority assigned" };
       // Blocked-day cap intentionally NOT enforced — see canTake.
       if(Object.values(shifts[l.dateKey]||{}).some(e => getUid(e) === me.id)) return { ok:false, why:"Already on this day" };
@@ -5437,13 +5832,13 @@ export default function ShiftApp() {
     const renderListing = (l) => {
       const slot = config.shiftSlots.find(s => s.id === l.slotId);
       const date = parseDk(l.dateKey);
-      const seller = users.find(u => String(u.id) === String(l.sellerId));
-      const mine = String(l.sellerId) === String(me.id);
+      const seller = users.find(u => eqId(u.id, l.sellerId));
+      const mine = eqId(l.sellerId, me.id);
       const elig = !mine ? canTake(l) : null;
       const offerElig = !mine ? canOffer(l) : null;
       const pendingOffers = (l.tradeOffers||[]).filter(o => o.status === "pending");
       // Has the viewer already offered on this listing?
-      const myPendingOffer = !mine ? pendingOffers.find(o => String(o.offererId) === String(me.id)) : null;
+      const myPendingOffer = !mine ? pendingOffers.find(o => eqId(o.offererId, me.id)) : null;
       return (
         <div key={l.id} className="bg-surface rounded-xl border border-slate-200 overflow-hidden">
           <div className="p-3 flex items-center gap-3">
@@ -5490,10 +5885,10 @@ export default function ShiftApp() {
             <div className="border-t border-slate-100 bg-slate-50/60 p-3 space-y-1.5">
               <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider">Pending offers</div>
               {pendingOffers.map(o => {
-                const offerer = users.find(u => String(u.id) === String(o.offererId));
+                const offerer = users.find(u => eqId(u.id, o.offererId));
                 const oSlot = config.shiftSlots.find(s => s.id === o.offererSlotId);
                 const oDate = parseDk(o.offererDateKey);
-                const isMyOffer = String(o.offererId) === String(me.id);
+                const isMyOffer = eqId(o.offererId, me.id);
                 if(!mine && !isMyOffer) return null; // hide other people's offers from non-owner
                 // offererId may be string-form (pre-fix); Number(...) || 0 keeps the avatar
                 // color stable instead of NaN'ing the modulo.
@@ -5553,8 +5948,8 @@ export default function ShiftApp() {
             const date = parseDk(l.dateKey);
             // String() defensive: trade.offer-accept pre-fix stored takenBy as the wire-format
             // string; sellerId is consistently numeric, but coerce both for safety.
-            const seller = users.find(u => String(u.id) === String(l.sellerId));
-            const taker = l.takenBy ? users.find(u => String(u.id) === String(l.takenBy)) : null;
+            const seller = users.find(u => eqId(u.id, l.sellerId));
+            const taker = l.takenBy ? users.find(u => eqId(u.id, l.takenBy)) : null;
             return (
               <div key={l.id} className="text-xs text-slate-600 flex items-center gap-2 px-3 py-1.5 bg-slate-50 rounded-lg">
                 <span className="text-slate-400 w-16 flex-shrink-0">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}</span>
@@ -5636,7 +6031,7 @@ export default function ShiftApp() {
       if(!canAct) return;
       if(phase===PHASE.AVAIL) setReconcilePreview(computeReconcile());
       else if(phase===PHASE.RECON) setConfirmLock(true);
-      else applyAndTrack("block.unlock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null });
+      else applyAndTrack("block.unlock", { blockId: currentBlock?.id != null ? String(currentBlock.id) : null, earnings: currentBlock?.pointsCreditedAtLock || {} });
     };
     const statusLabel = !currentBlock
       ? "No current block"
@@ -6614,7 +7009,7 @@ export default function ShiftApp() {
         ))}
       </nav>
 
-      {DaySheet()}{Onboarding()}{AutoAssignModal()}{ReconcileModal()}{ConfirmResetModal()}{ConfirmLockModal()}{ConfirmBlockOverModal()}{BlockReportModal()}{FlagDraftModal()}{ListDraftModal()}{TradeDraftModal()}{AddUserModal()}{NewUserInfoModal()}
+      {DaySheet()}{Onboarding()}{AutoAssignModal()}{ReconcileModal()}{ConfirmResetModal()}{ConfirmLockModal()}{ConfirmBlockOverModal()}{BlockReportModal()}{ProviderReportModal()}{AllocationSummaryModal()}{FlagDraftModal()}{ListDraftModal()}{TradeDraftModal()}{AddUserModal()}{NewUserInfoModal()}
       {toast&&<Toast msg={toast}/>}
     </div>
     </>
