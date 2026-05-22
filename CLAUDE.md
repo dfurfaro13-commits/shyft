@@ -4,7 +4,7 @@ The product is **SHIFT Scheduling** (call it **SHIFT** for short) — a scheduli
 
 This file is the catch-up brief for Claude Code instances joining the project mid-stream. **Read it first** before exploring code — the architecture has a few non-obvious gotchas that will burn time if you discover them by accident.
 
-> **Naming note for Claude:** the codebase predates the rebrand and still uses **`shyft`** in technical identifiers — file names (`ShiftApp.v3.jsx`, `shyft-v3.html`, `templates/shyft_head.v3.html`), the localStorage namespace (`shyft3_*`), and the migration markers (`shyft3_migrate_from_v2`, `shyft3_g{gid}_migrate_top_options`). **Leave these alone.** Renaming the storage namespace would invalidate every existing user's data. Only update brand mentions in user-facing UI strings, comments, and docs. (The old `SUPER_BOOTSTRAP = "Shyft-Kai-Dave"` constant moved to a Worker secret, `OWNER_BOOTSTRAP_CODE`, in D.3 — same value, different home.)
+> **Naming note for Claude:** the codebase predates the rebrand and still uses **`shyft`** in technical identifiers — JSX source name (`ShiftApp.v3.jsx`), templates (`templates/shyft_head.v3.html`, `templates/shyft_tail.v3.html`), the localStorage namespace (`shyft3_*`), and the migration markers (`shyft3_migrate_from_v2`, `shyft3_g{gid}_migrate_top_options`). **Leave these alone.** Renaming the storage namespace would invalidate every existing user's data. Only update brand mentions in user-facing UI strings, comments, and docs. (The old `SUPER_BOOTSTRAP = "Shyft-Kai-Dave"` constant moved to a Worker secret, `OWNER_BOOTSTRAP_CODE`, in D.3 — same value, different home. The built artifact moved from `shyft-v3.html` to `index.html` when the deploy URL switched to `www.shift-scheduling.com/`.)
 
 ---
 
@@ -16,7 +16,7 @@ The interface must be **clean, professional, simple, and intuitive.** This is th
 
 - **Hobby project.** David is building this on his own time. Recurring costs ≈ $0 — Cloudflare's free tier covers Workers, D1, and R2 at our current scale. No paid SaaS, no per-seat licenses. Flag anything that would change that.
 - **Cloud is authoritative; localStorage is a cache.** As of D.4.D2 (shipped), `loadGroup` pulls from cloud (snapshot + event-tail replay), every mutation routes through `applyAndTrack → applyEvent → setX + persist + POST /api/events`, a 15s periodic poll syncs cross-device, and the snapshot uploader is a 30s-debounced compaction job gated on "dirty since last upload". localStorage still holds the per-group cache so the UI works offline-read-only, but the reducer is the single source of truth for state transitions.
-- **Hosted as a website.** Deployed to Cloudflare Pages + Worker at `app.shift-scheduling.com`.
+- **Hosted as a website.** Deployed to Cloudflare Pages + Worker at `www.shift-scheduling.com` (root path serves the app).
 - **Design for the reducer.** New mutations go through `applyAndTrack(type, payload, opts)`. Add a handler to `EVENT_HANDLERS` in the head template (mirror the reference stub in the JSX preamble), capture any non-deterministic inputs (`Date.now()`, `Math.random()`) into the payload, and route the producer through `applyAndTrack`. The dispatcher handles the slice-diff dispatch + POST + outbox.
 
 ---
@@ -29,7 +29,7 @@ Only v3 is active. v1 and v2 are archived under `legacy/`.
 |---------|--------|----------------|--------|
 | v1 | `legacy/ShiftApp.jsx` | `legacy/shyft.html` | Frozen archive — do not read |
 | v2 | `legacy/ShiftApp.v2.jsx` | `legacy/shyft-v2.html` | Frozen archive — do not read |
-| **v3** | **`ShiftApp.v3.jsx`** | **`shyft-v3.html`** | **Active — all new work goes here** |
+| **v3** | **`ShiftApp.v3.jsx`** | **`index.html`** | **Active — all new work goes here** |
 
 **Never read or grep into `legacy/`.** Those files exist only for git history and as a paper trail; they are not relevant to any current task. If a question seems to require v1/v2 logic, ask first — usually the answer is "the spec doc" or "the v3 implementation," not the archived source.
 
@@ -54,7 +54,7 @@ The runtime artifact is **assembled from three pieces**, not edited directly:
        ↓
 [templates/shyft_tail.v3.html]   ← <ReactDOM.createRoot(...).render(<ShiftApp/>)>
        ↓
-shyft-v3.html
+index.html
 ```
 
 Build command — run from the project root (the folder that contains `ShiftApp.v3.jsx` and `templates/`):
@@ -64,13 +64,13 @@ N=$(grep -n "^export default function ShiftApp" ShiftApp.v3.jsx | cut -d: -f1)
 { cat templates/shyft_head.v3.html
   tail -n +"$N" ShiftApp.v3.jsx | sed 's/^export default function ShiftApp/function ShiftApp/'
   cat templates/shyft_tail.v3.html
-} > shyft-v3.html
+} > index.html
 ```
 
 After every build, sanity-check braces:
 
 ```bash
-o=$(grep -o '{' shyft-v3.html | wc -l) && c=$(grep -o '}' shyft-v3.html | wc -l) && echo "$o/$c"
+o=$(grep -o '{' index.html | wc -l) && c=$(grep -o '}' index.html | wc -l) && echo "$o/$c"
 ```
 
 If they don't match, you have a syntax error.
@@ -98,8 +98,7 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | `ShiftApp.v3.jsx` | Source of truth for all v3 code. Edit this. |
 | `templates/shyft_head.v3.html` | Runtime preamble (DOCTYPE, Tailwind config, migration, module-scope helpers, `applyEvent` reducer). Mirror module-scope code here. |
 | `templates/shyft_tail.v3.html` | Runtime postamble. Just `<ReactDOM>.render()`. Don't touch. |
-| `shyft-v3.html` | Built artifact. **Never edit by hand** — gets overwritten. Cloudflare Pages serves this. |
-| `index.html` | Tiny redirect to `shyft-v3.html` so the root URL of the deployed site loads the app. |
+| `index.html` | Built artifact. **Never edit by hand** — gets overwritten. Cloudflare serves this at `/`. |
 | `wrangler.jsonc` | Cloudflare Worker config. Binds the API Worker (`_worker.js`), D1 (`DB`), and R2 (`R2`). |
 | `_worker.js` | Worker entrypoint. Routes `/api/*` to the API; everything else falls through to static assets via `env.ASSETS.fetch`. |
 | `src/api/` | API handlers + `router.js`. Modules: `auth`, `signup`, `users`, `groups`, `owner`, `events`, `snapshots`. |
@@ -121,7 +120,7 @@ The Cloudflare Worker fronts a D1 database + R2 bucket. As of D.4.D2, cloud is t
 
 - **Deploy:** `npx wrangler deploy` (after `wrangler login`, `d1 create shift-db`, paste id into `wrangler.jsonc`, run each `migrations/000*.sql` file via `d1 execute shift-db --remote --file=…`, `r2 bucket create shift-events`, and `wrangler secret put RESEND_API_KEY`, `SESSION_PEPPER`, `OWNER_BOOTSTRAP_CODE`).
 - **Local dev:** `npx wrangler dev`. Create `.dev.vars` (gitignored) with `RESEND_API_KEY=...` and `DEV_EMAIL=console` to log magic links instead of sending.
-- **Email sender:** custom domain is live (`app.shift-scheduling.com` via Resend). `EMAIL_FROM` is configured; magic links deliver to any address.
+- **Email sender:** custom domain is live (`shift-scheduling.com` via Resend, sender `noreply@shift-scheduling.com`). `EMAIL_FROM` is configured; magic links deliver to any address.
 - **CSRF:** every state-changing API call must send `X-Requested-With: shift`. The `window.api.fetchJSON` shim in `templates/shyft_head.v3.html` adds it automatically.
 - **Sessions:** opaque `shift_sid` cookie. Server stores `SHA-256(SESSION_PEPPER + raw)`; raw value never persisted.
 - **Deploy hygiene.** The Worker's `assets.directory` is `./` (worktree root), so anything not excluded by `.assetsignore` ships as a public asset. Current `.assetsignore` excludes `*.sql`, `*.sqlite*`, `.git`, `.git/`, `.dev.vars`, `src/`, `migrations/`, etc. Before any deploy, sanity-check what `wrangler deploy` reports as new uploads.
@@ -231,7 +230,7 @@ This is a hobby project on a personal token budget. Follow these rules to keep i
 
 **Never read the wrong files**
 - **`legacy/` is off-limits.** Never Read, never grep. v1/v2 are frozen archives kept only for git history.
-- **Never Read `shyft-v3.html`** (the built artifact). It's regenerated by the build script and is just `head + JSX + tail` concatenated. To inspect content, Read `ShiftApp.v3.jsx` (or the head/tail templates). The *only* valid use of `shyft-v3.html` is the brace-count sanity pipe.
+- **Never Read `index.html`** (the built artifact). It's regenerated by the build script and is just `head + JSX + tail` concatenated. To inspect content, Read `ShiftApp.v3.jsx` (or the head/tail templates). The *only* valid use of `index.html` is the brace-count sanity pipe.
 - **Never Read `Phases for Shyft and Rules for shift assignment.docx`, `Test logins.xlsx`, `svg code for logos.docx`, or any image** unless explicitly asked.
 
 **Read large files in slices**
@@ -460,14 +459,14 @@ Build + brace check:
 ```bash
 # Run from the project root (the folder that contains ShiftApp.v3.jsx and templates/).
 N=$(grep -n "^export default function ShiftApp" ShiftApp.v3.jsx | cut -d: -f1)
-{ cat templates/shyft_head.v3.html; tail -n +"$N" ShiftApp.v3.jsx | sed 's/^export default function ShiftApp/function ShiftApp/'; cat templates/shyft_tail.v3.html; } > shyft-v3.html
-o=$(grep -o '{' shyft-v3.html | wc -l) && c=$(grep -o '}' shyft-v3.html | wc -l) && echo "braces $o/$c"
+{ cat templates/shyft_head.v3.html; tail -n +"$N" ShiftApp.v3.jsx | sed 's/^export default function ShiftApp/function ShiftApp/'; cat templates/shyft_tail.v3.html; } > index.html
+o=$(grep -o '{' index.html | wc -l) && c=$(grep -o '}' index.html | wc -l) && echo "braces $o/$c"
 ```
 
-**⚠ Opening `shyft-v3.html` from `file://` no longer works post-D.3.** All sign-in paths go through the Worker (`/api/auth/password`, `/api/auth/signup`, `/api/me`), so the auth screen loads but has no way to authenticate without the backend running. Use one of:
+**⚠ Opening `index.html` from `file://` no longer works post-D.3.** All sign-in paths go through the Worker (`/api/auth/password`, `/api/auth/signup`, `/api/me`), so the auth screen loads but has no way to authenticate without the backend running. Use one of:
 
 - **`npx wrangler dev --remote`** — runs the Worker at `http://localhost:8787` but proxies D1, R2, and secrets to the deployed instances. Real cloud auth, real event log, no production deploy needed. Lowest friction for local smoke testing.
-- **`npx wrangler deploy`** — full production push to `app.shift-scheduling.com`. Use when you're ready to soak against real traffic, or when testing something that only manifests in production (e.g. cookie-domain edge cases, custom-domain CSRF).
+- **`npx wrangler deploy`** — full production push to `www.shift-scheduling.com`. Use when you're ready to soak against real traffic, or when testing something that only manifests in production (e.g. cookie-domain edge cases, custom-domain CSRF).
 
 Smoke test (against either of the above):
 1. Sign in as admin → Setup → create a block in Availability phase

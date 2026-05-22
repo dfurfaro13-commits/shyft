@@ -1,6 +1,6 @@
 // Cloudflare Worker that fronts the static-assets binding for SHIFT.
 // Worker code (in _worker.js + ./src) handles /api/*. Everything else is served
-// straight from the directory below via the ASSETS binding (index.html → shyft-v3.html).
+// straight from the directory below via the ASSETS binding (index.html IS the app).
 //
 // Bindings:
 //   ASSETS — static files (this directory).
@@ -24,7 +24,7 @@
 		"binding": "ASSETS"
 	},
 	"vars": {
-		"APP_URL": "https://app.shift-scheduling.com",
+		"APP_URL": "https://www.shift-scheduling.com",
 		"EMAIL_FROM": "SHIFT <noreply@shift-scheduling.com>",
 		"DEV_EMAIL": ""
 	},
