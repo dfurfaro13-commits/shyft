@@ -1,8 +1,7 @@
-// Phase D.3 follow-up: owner-only "Accounts" tab in SuperDashboard. Lets the owner of one or
-// more groups see every user in those groups, change their email/password, or delete them.
-//
-// Multi-tenant scoping: every endpoint filters on memberships where the caller is owner. An
-// owner can never read or edit a user who isn't in one of their groups.
+// Owner-platform model: any user with users.can_create_groups = 1 ("Owner account") sees
+// and edits every group + every account. The per-group `memberships.role='owner'` is still
+// recorded on group creation for snapshot ownership trails, but it no longer gates access
+// here — canCreateGroups is the single permission switch.
 
 import { exec, q1, nowSec } from "../lib/db.js";
 import { hashPassword } from "../lib/passwords.js";
@@ -12,34 +11,24 @@ import { json, err, readJson, normalizeEmail, isEmail } from "../lib/http.js";
 
 const MIN_PASSWORD_LEN = 8;
 
-async function callerOwnedGroupIds(env, callerId) {
-  const rows = (await env.DB.prepare(
-    "SELECT group_id AS gid FROM memberships WHERE user_id = ? AND role = 'owner'",
-  ).bind(callerId).all()).results || [];
-  return rows.map(r => r.gid);
-}
-
-// True if caller owns at least one group the target is a member of.
-async function callerCanManage(env, callerId, targetId) {
-  const row = await q1(env, `
-    SELECT 1 AS ok
-      FROM memberships c
-      JOIN memberships t ON t.group_id = c.group_id
-     WHERE c.user_id = ? AND c.role = 'owner' AND t.user_id = ?
-     LIMIT 1
-  `, callerId, targetId);
+// True if the target user exists. Any Owner-account caller can manage any non-self user;
+// the self-edit / target-is-owner guards are enforced at each call site.
+async function targetExists(env, targetId) {
+  const row = await q1(env, "SELECT 1 AS ok FROM users WHERE id = ?", targetId);
   return !!row;
 }
 
 // GET /api/owner/snapshots/:gid/r2-list
-//   Lists R2 snapshot history for a group the caller owns. Used for manual recovery
-//   when the latest D1 snapshot has been corrupted (e.g. an empty-payload wipe). Returns
-//   up to `limit` (default 50, max 500) keys, sorted server_ts descending.
+//   Lists R2 snapshot history for any group. Owner-only (caller.canCreateGroups).
+//   Used for manual recovery when the latest D1 snapshot has been corrupted
+//   (e.g. an empty-payload wipe). Returns up to `limit` (default 50, max 500)
+//   keys, sorted server_ts descending.
 export async function listSnapshotHistory(req, env, { gid }) {
   const caller = await getSessionUser(env, req);
   if (!caller) return err(401, "unauthorized");
-  const ownedIds = await callerOwnedGroupIds(env, caller.id);
-  if (!ownedIds.includes(gid)) return err(403, "not_owner");
+  if (!caller.canCreateGroups) return err(403, "not_owner");
+  const group = await q1(env, "SELECT 1 AS ok FROM groups WHERE id = ?", gid);
+  if (!group) return err(404, "group_not_found");
   if (!env.R2) return err(503, "r2_unavailable");
 
   const url = new URL(req.url);
@@ -66,15 +55,17 @@ export async function listSnapshotHistory(req, env, { gid }) {
 
 // POST /api/owner/snapshots/:gid/restore  { r2Key }
 //   Reads the named R2 object and writes its payload back as both the latest D1 snapshot
-//   AND a fresh R2 history entry. Owner-only. Path-scoped: the r2Key must be under this
-//   group's prefix, so an owner of group A cannot read group B's history.
+//   AND a fresh R2 history entry. Owner-only (caller.canCreateGroups). Path-scoped:
+//   the r2Key must be under this group's prefix, so a stray r2Key from another group
+//   can't be used to cross-restore.
 export async function restoreSnapshot(req, env, { gid }) {
   const csrf = requireCsrfHeader(req);
   if (csrf) return csrf;
   const caller = await getSessionUser(env, req);
   if (!caller) return err(401, "unauthorized");
-  const ownedIds = await callerOwnedGroupIds(env, caller.id);
-  if (!ownedIds.includes(gid)) return err(403, "not_owner");
+  if (!caller.canCreateGroups) return err(403, "not_owner");
+  const group = await q1(env, "SELECT 1 AS ok FROM groups WHERE id = ?", gid);
+  if (!group) return err(404, "group_not_found");
   if (!env.R2) return err(503, "r2_unavailable");
 
   const body = await readJson(req);
@@ -234,25 +225,25 @@ async function patchSnapshotRemoveUser(env, callerId, groupId, localUid, cloudUi
 }
 
 // GET /api/owner/users
-//   Returns every user in the caller's owned groups, with their per-group memberships rolled
-//   into one entry. Excludes the caller themselves (owner manages everyone except self via this).
+//   Owner-only (caller.canCreateGroups). Returns every non-tombstoned user across every
+//   group, with their per-group memberships rolled up. Excludes the caller themselves.
+//   LEFT JOIN so cold-start Owners (canCreateGroups=1, no memberships yet) still appear.
 export async function listOwnerUsers(req, env) {
   const caller = await getSessionUser(env, req);
   if (!caller) return err(401, "unauthorized");
-  const ownedIds = await callerOwnedGroupIds(env, caller.id);
-  if (!ownedIds.length) return json({ users: [] });
+  if (!caller.canCreateGroups) return err(403, "not_owner");
 
-  const placeholders = ownedIds.map(() => "?").join(",");
   const rows = (await env.DB.prepare(
     `SELECT u.id, u.email, u.display_name AS displayName, u.username, u.kind,
             u.created_at AS createdAt, u.password_hash AS passwordHash,
+            u.can_create_groups AS canCreateGroups,
             m.group_id AS groupId, m.role, m.local_uid AS localUid,
             g.name AS groupName
        FROM users u
-       JOIN memberships m ON m.user_id = u.id
-       JOIN groups g ON g.id = m.group_id
-      WHERE m.group_id IN (${placeholders}) AND u.id != ?`,
-  ).bind(...ownedIds, caller.id).all()).results || [];
+       LEFT JOIN memberships m ON m.user_id = u.id
+       LEFT JOIN groups g ON g.id = m.group_id
+      WHERE u.id != ? AND u.email NOT LIKE '%@deleted.invalid'`,
+  ).bind(caller.id).all()).results || [];
 
   const byUser = new Map();
   for (const r of rows) {
@@ -265,15 +256,18 @@ export async function listOwnerUsers(req, env) {
         kind: r.kind,
         createdAt: r.createdAt,
         hasPassword: !!r.passwordHash,
+        canCreateGroups: !!r.canCreateGroups,
         memberships: [],
       });
     }
-    byUser.get(r.id).memberships.push({
-      groupId: r.groupId,
-      groupName: r.groupName,
-      role: r.role,
-      localUid: r.localUid,
-    });
+    if (r.groupId) {
+      byUser.get(r.id).memberships.push({
+        groupId: r.groupId,
+        groupName: r.groupName,
+        role: r.role,
+        localUid: r.localUid,
+      });
+    }
   }
   // Stable order: by display name, falling back to email.
   const users = Array.from(byUser.values()).sort((a, b) =>
@@ -283,15 +277,17 @@ export async function listOwnerUsers(req, env) {
 }
 
 // PATCH /api/owner/users/:uid  { email?, password? }
-//   Owner-only. Rejects self-edits (use the existing set-password button on the cloud strip).
-//   Email change validates uniqueness; password change hashes and stores.
+//   Owner-only (caller.canCreateGroups). Rejects self-edits (use the existing set-password
+//   button on the cloud strip). Email change validates uniqueness; password change hashes
+//   and stores.
 export async function updateOwnerUser(req, env, { uid }) {
   const csrf = requireCsrfHeader(req);
   if (csrf) return csrf;
   const caller = await getSessionUser(env, req);
   if (!caller) return err(401, "unauthorized");
+  if (!caller.canCreateGroups) return err(403, "not_owner");
   if (caller.id === uid) return err(400, "cannot_edit_self");
-  if (!(await callerCanManage(env, caller.id, uid))) return err(403, "forbidden");
+  if (!(await targetExists(env, uid))) return err(404, "not_found");
 
   const body = await readJson(req);
   const updates = [];
@@ -326,19 +322,30 @@ export async function updateOwnerUser(req, env, { uid }) {
 }
 
 // DELETE /api/owner/users/:uid
-//   Removes the user from every group the caller owns. If after that the user has no remaining
-//   memberships anywhere (the common case for David's test users), we anonymize the row and
+//   Owner-only (caller.canCreateGroups). Removes the user from every group. If no memberships
+//   remain anywhere afterwards (the common case for David's test users), anonymize the row and
 //   wipe sign-in artifacts so they can't recover the account. Events/snapshots are preserved
 //   for ML continuity (their FK still resolves to the now-tombstoned users row).
+//
+//   Refuses to delete another Owner account (canCreateGroups=1) — prevents Owners from
+//   tombstoning each other by accident. The target-is-owner guard also covers users who
+//   hold a role='owner' membership without canCreateGroups (shouldn't happen in the
+//   current model, but kept as a belt-and-suspenders check against orphaned ownership).
 export async function deleteOwnerUser(req, env, { uid }) {
   const csrf = requireCsrfHeader(req);
   if (csrf) return csrf;
   const caller = await getSessionUser(env, req);
   if (!caller) return err(401, "unauthorized");
+  if (!caller.canCreateGroups) return err(403, "not_owner");
   if (caller.id === uid) return err(400, "cannot_delete_self");
-  if (!(await callerCanManage(env, caller.id, uid))) return err(403, "forbidden");
 
-  // Refuse to delete a user who owns any group — would orphan ownership of someone else's data.
+  const target = await q1(
+    env,
+    "SELECT email, can_create_groups FROM users WHERE id = ?",
+    uid,
+  );
+  if (!target) return err(404, "not_found");
+  if (target.can_create_groups) return err(400, "target_is_owner");
   const targetOwnsAny = await q1(
     env,
     "SELECT 1 AS ok FROM memberships WHERE user_id = ? AND role = 'owner' LIMIT 1",
@@ -346,26 +353,14 @@ export async function deleteOwnerUser(req, env, { uid }) {
   );
   if (targetOwnsAny) return err(400, "target_is_owner");
 
-  const target = await q1(env, "SELECT email FROM users WHERE id = ?", uid);
-  if (!target) return err(404, "not_found");
-
-  const ownedIds = await callerOwnedGroupIds(env, caller.id);
-  if (!ownedIds.length) return err(403, "forbidden");
-
   // 0. Capture (group_id, local_uid) pairs BEFORE the membership delete so we know which
   //    groups need their D1 snapshots patched and what local uid to scrub from each.
-  //    Without this, the snapshot patch in step 1.5 would have no way to find affected groups.
-  const placeholders = ownedIds.map(() => "?").join(",");
   const affectedRows = (await env.DB.prepare(
-    `SELECT group_id, local_uid FROM memberships WHERE user_id = ? AND group_id IN (${placeholders})`,
-  ).bind(uid, ...ownedIds).all()).results || [];
+    `SELECT group_id, local_uid FROM memberships WHERE user_id = ?`,
+  ).bind(uid).all()).results || [];
 
-  // 1. Drop memberships in caller's groups.
-  await exec(
-    env,
-    `DELETE FROM memberships WHERE user_id = ? AND group_id IN (${placeholders})`,
-    uid, ...ownedIds,
-  );
+  // 1. Drop memberships from every group.
+  await exec(env, `DELETE FROM memberships WHERE user_id = ?`, uid);
 
   // 1.5. Patch each affected group's D1 snapshot so non-loaded clients don't pull stale state
   //      the next time they open the group via loadGroupFromCloud. The client-side cascade in
@@ -385,20 +380,16 @@ export async function deleteOwnerUser(req, env, { uid }) {
     }
   }
 
-  // 2. If no memberships remain anywhere, fully tombstone.
-  const remaining = await q1(env, "SELECT 1 AS ok FROM memberships WHERE user_id = ? LIMIT 1", uid);
-  let fullyDeleted = false;
-  if (!remaining) {
-    await exec(env, "DELETE FROM sessions WHERE user_id = ?", uid);
-    await exec(env, "DELETE FROM login_tokens WHERE email = ?", target.email);
-    await exec(env, "DELETE FROM password_attempts WHERE email = ?", target.email);
-    const tombstone = `deleted-${uid}-${nowSec()}@deleted.invalid`;
-    await exec(
-      env,
-      "UPDATE users SET email = ?, username = NULL, password_hash = NULL, display_name = 'Deleted user' WHERE id = ?",
-      tombstone, uid,
-    );
-    fullyDeleted = true;
-  }
-  return json({ ok: true, fullyDeleted });
+  // 2. Tombstone unconditionally — every membership was dropped above, so the user has
+  //    no remaining group attachment.
+  await exec(env, "DELETE FROM sessions WHERE user_id = ?", uid);
+  await exec(env, "DELETE FROM login_tokens WHERE email = ?", target.email);
+  await exec(env, "DELETE FROM password_attempts WHERE email = ?", target.email);
+  const tombstone = `deleted-${uid}-${nowSec()}@deleted.invalid`;
+  await exec(
+    env,
+    "UPDATE users SET email = ?, username = NULL, password_hash = NULL, display_name = 'Deleted user' WHERE id = ?",
+    tombstone, uid,
+  );
+  return json({ ok: true, fullyDeleted: true });
 }

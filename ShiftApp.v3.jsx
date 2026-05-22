@@ -949,7 +949,8 @@ export default function ShiftApp() {
         invalid_email: "Invalid email format.",
         password_too_short: "Password must be at least 8 characters.",
         cannot_edit_self: "Can't edit your own account from here.",
-        forbidden: "You don't manage this account.",
+        not_owner: "Owner permission required.",
+        not_found: "Account no longer exists.",
       })[e?.body?.error] || "Couldn't save changes.";
       setAccountsEdit(s => ({ ...s, busy: false, error: msg }));
     }
@@ -1029,8 +1030,9 @@ export default function ShiftApp() {
       await loadAccounts();
     } catch (e) {
       const msg = ({
-        target_is_owner: "Can't delete an owner of another group.",
+        target_is_owner: "Can't delete another Owner account.",
         cannot_delete_self: "Can't delete your own account from here.",
+        not_owner: "Owner permission required.",
         forbidden: "You don't manage this account.",
         not_found: "Account no longer exists.",
       })[e?.body?.error] || "Couldn't delete.";
@@ -6638,7 +6640,7 @@ export default function ShiftApp() {
             {accounts.loading ? "Loading…" : "Refresh"}
           </button>
         </div>
-        <p className="text-sm text-slate-500 mb-4">Every user across the groups you own. Edit credentials or remove someone here.</p>
+        <p className="text-sm text-slate-500 mb-4">Every user across every group. Edit credentials or remove someone here.</p>
         {accounts.error && (
           <div className="mb-3 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700 flex items-center justify-between">
             <span>{accounts.error}</span>
@@ -6648,7 +6650,7 @@ export default function ShiftApp() {
         {accounts.loading && !accounts.list ? (
           <div className="py-10 text-center text-sm text-slate-500">Loading…</div>
         ) : accounts.list && accounts.list.length === 0 ? (
-          <div className="py-10 text-center text-sm text-slate-500 italic">No other users in your groups yet.</div>
+          <div className="py-10 text-center text-sm text-slate-500 italic">No other users yet.</div>
         ) : accounts.list ? (
           <div className="space-y-2">
             {accounts.list.map(u => (
@@ -6656,6 +6658,7 @@ export default function ShiftApp() {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 flex-wrap">
                     <div className="font-medium text-sm text-slate-900">{u.displayName || "(no name)"}</div>
+                    {u.canCreateGroups && <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-100 text-purple-700 font-semibold uppercase tracking-wide">Owner</span>}
                     {u.kind === "test" && <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 font-semibold uppercase tracking-wide">Test</span>}
                     {!u.hasPassword && <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 font-semibold uppercase tracking-wide">Magic-link only</span>}
                   </div>

@@ -206,6 +206,13 @@ export async function authLogout(req, env) {
 }
 
 // GET /api/me
+//
+// Owner-platform model: any caller with canCreateGroups is treated as an owner of
+// every group. Real memberships are returned untouched (e.g. an Owner who also
+// joined a different group as a provider keeps the provider role there); for the
+// remaining groups we synthesize an owner-role entry. The SuperDashboard's
+// auto-restore loop reads `role === "owner"` directly, so this is enough to make
+// every group show up in the Owner's local groups[] list with no frontend change.
 export async function me(req, env) {
   const user = await getSessionUser(env, req);
   if (!user) return err(401, "unauthorized");
@@ -217,6 +224,28 @@ export async function me(req, env) {
       WHERE m.user_id = ?
       ORDER BY g.name`,
   ).bind(user.id).all()).results || [];
+
+  if (user.canCreateGroups) {
+    const known = new Set(memberships.map(m => m.groupId));
+    const others = (await env.DB.prepare(
+      `SELECT id AS groupId, name AS groupName, group_code AS groupCode, admin_code AS adminCode
+         FROM groups
+        ORDER BY name`,
+    ).all()).results || [];
+    for (const g of others) {
+      if (known.has(g.groupId)) continue;
+      memberships.push({
+        groupId: g.groupId,
+        groupName: g.groupName,
+        groupCode: g.groupCode,
+        adminCode: g.adminCode,
+        role: "owner",
+        localUid: null,
+      });
+    }
+    memberships.sort((a, b) => (a.groupName || "").localeCompare(b.groupName || ""));
+  }
+
   return json({ user, memberships });
 }
 
