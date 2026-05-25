@@ -1352,6 +1352,10 @@ function ShiftApp() {
   const [accounts, setAccounts] = useState({ list: null, loading: false, error: "" });
   const [accountsEdit, setAccountsEdit] = useState(null);   // { uid, name, email, password, busy, error } or null
   const [accountsDelete, setAccountsDelete] = useState(null); // { uid, name, busy, error } or null
+  // Self-service profile modal. null when closed. When open, holds three independent
+  // section sub-states (name / email / password) so saving one doesn't reset the others.
+  // Shape: { name:{value,busy,error,savedAt}, email:{value,busy,error,sentTo}, password:{current,next,confirm,busy,error,savedAt} }
+  const [profile, setProfile] = useState(null);
   const [authMode, setAuthMode] = useState("signin");
   // D.3: cloud-backed auth. `emailOrUsername` accepts either on Sign in; signup uses email,
   // username, displayName, plus optional groupCode/adminCode/ownerCode. Local-only fields
@@ -1409,6 +1413,11 @@ function ShiftApp() {
   const [cloudUser, setCloudUser] = useState(null);          // { id, email, displayName, memberships: [...] } | null
   const [pendingInvite, setPendingInvite] = useState(null);  // { token, groupId, groupName, role, expiresAt } | null
   const [magicLinkSent, setMagicLinkSent] = useState(false);
+  // Forgot-password flow on the sign-in screen. null = hidden (default link shown). When the
+  // user clicks "Forgot password?" we set phase:"form"; on submit we move to phase:"sent" with
+  // a deliberately-vague confirmation message (server returns 204 on miss too, so we never
+  // reveal whether the identifier matched a real account).
+  const [forgot, setForgot] = useState(null);  // {phase:"form"|"sent", value, busy, error}
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudError, setCloudError] = useState("");
   // Phase D.2 migration UI: { localGroupId, name, users: [{name,email,tempPassword,role}] }
@@ -2042,6 +2051,23 @@ function ShiftApp() {
           : "Couldn't send the link. Try again."));
     } finally { setCloudBusy(false); }
   };
+  // Forgot-password submit. Calls /api/auth/forgot-password (always 204) and moves to the
+  // "sent" phase regardless of whether the identifier matched. Phrasing of the success message
+  // intentionally hedges ("If <input> matches…") so the UI doesn't enumerate accounts.
+  const submitForgot = async () => {
+    const value = (forgot?.value || "").trim();
+    if (!value) { setForgot(s => ({ ...s, error: "Enter your email or username." })); return; }
+    setForgot(s => ({ ...s, busy: true, error: "" }));
+    try {
+      await window.api.fetchJSON("/api/auth/forgot-password", {
+        method: "POST",
+        body: JSON.stringify({ emailOrUsername: value.toLowerCase() }),
+      });
+      setForgot({ phase: "sent", value, busy: false, error: "" });
+    } catch (e) {
+      setForgot(s => ({ ...s, busy: false, error: "Couldn't send the reset link. Try again." }));
+    }
+  };
   // D.3 follow-up: load the Accounts list. Called on first switch to the Accounts tab and again
   // after every successful edit/delete. Errors stay inline so the user can retry without losing
   // context (no toast).
@@ -2059,12 +2085,25 @@ function ShiftApp() {
     setSuperDashTab(tab);
     if (tab === "accounts") loadAccounts();
   };
-  // Owner-only: PATCH email and/or password. Empty values are skipped.
+  // Owner-only: PATCH email and/or password. Empty values are skipped. Each filled field must
+  // be confirmed by re-entering the same value in its sibling confirm input — a typo on a
+  // password reset would otherwise lock the target user out with no recovery path other than
+  // another owner edit.
   const submitAccountsEdit = async () => {
     if (!accountsEdit) return;
     const body = {};
     const newEmail = (accountsEdit.email || "").trim().toLowerCase();
+    const newEmailConfirm = (accountsEdit.emailConfirm || "").trim().toLowerCase();
     const newPw = accountsEdit.password || "";
+    const newPwConfirm = accountsEdit.passwordConfirm || "";
+    if (newEmail && newEmail !== newEmailConfirm) {
+      setAccountsEdit(s => ({ ...s, error: "The two email entries don't match." }));
+      return;
+    }
+    if (newPw && newPw !== newPwConfirm) {
+      setAccountsEdit(s => ({ ...s, error: "The two password entries don't match." }));
+      return;
+    }
     if (newEmail) body.email = newEmail;
     if (newPw) body.password = newPw;
     if (!body.email && !body.password) {
@@ -2174,6 +2213,147 @@ function ShiftApp() {
         not_found: "Account no longer exists.",
       })[e?.body?.error] || "Couldn't delete.";
       setAccountsDelete(s => ({ ...s, busy: false, error: msg }));
+    }
+  };
+
+  // ── Self-service profile (any signed-in cloud user). Three sections (name, email, password)
+  // surface in ProfileModal; each saves independently. Name change propagates: PATCH cloud
+  // display_name THEN fire a user.update event into every group the user belongs to so the
+  // per-group `users[gid][i].name` (which is what's rendered everywhere in the schedule UI)
+  // stays in sync. Email change is two-step magic-link (server sends to NEW address; click
+  // confirms). Password change re-auths via currentPassword to block hijacked-session takeover.
+  const openProfile = () => {
+    if (!cloudUser?.user) { flash("⚠️ Sign in required to edit profile"); return; }
+    setProfile({
+      name: { value: cloudUser.user.displayName || "", busy: false, error: "", savedAt: 0 },
+      email: { value: "", busy: false, error: "", sentTo: "" },
+      password: { current: "", next: "", confirm: "", busy: false, error: "", savedAt: 0 },
+    });
+  };
+  const closeProfile = () => setProfile(null);
+
+  // For each cloud-membership, find the matching local group + local uid, then either route
+  // through applyAndTrack (loaded group → reducer dispatch + event POST) or post the event
+  // directly + patch localStorage (other groups → next loadGroup sees correct state without
+  // waiting for the snapshot to refresh). Mirrors the cascade pattern in submitAccountsDelete.
+  const propagateNameAcrossGroups = async (newName) => {
+    const memberships = cloudUser?.memberships || [];
+    const cloudUid = cloudUser?.user?.id;
+    for (const mem of memberships) {
+      const localGroup = groups.find(g => g.cloudGroupId === mem.groupId);
+      if (!localGroup) continue;
+      let localUid = mem.localUid;
+      if (localUid == null) {
+        try {
+          const usersArr = JSON.parse(localStorage.getItem(`shyft3_g${localGroup.id}_users`) || "[]");
+          const u = usersArr.find(u => u && eqId(u.cloudUserId, cloudUid));
+          if (u) localUid = u.id;
+        } catch {}
+      }
+      if (localUid == null) continue;
+
+      if (groupId === localGroup.id) {
+        await applyAndTrack("user.update", { uid: String(localUid), patch: { name: newName } });
+      } else {
+        // Hand-edit this group's local users[] so the next open/render reflects the new name
+        // without waiting for the cross-device poll. Also post a user.update event so any
+        // other device viewing this group picks it up on their next poll.
+        try {
+          const gkey = k => `shyft3_g${localGroup.id}_${k}`;
+          const usersArr = JSON.parse(localStorage.getItem(gkey("users")) || "[]")
+            .map(u => eqId(u.id, localUid) ? { ...u, name: newName } : u);
+          localStorage.setItem(gkey("users"), JSON.stringify(usersArr));
+        } catch (err) { console.error("[profile] local name patch failed for group", localGroup.id, err); }
+        try {
+          await window.api.postEvent({
+            id: newClientUuid(),
+            groupId: mem.groupId,
+            type: "user.update",
+            payload: { uid: String(localUid), patch: { name: newName }, clientId: SHYFT_CLIENT_ID },
+            localUid: String(localUid),
+            blockId: null,
+            clientTs: Date.now(),
+          });
+        } catch (err) { console.error("[profile] event post failed for group", localGroup.id, err); }
+      }
+    }
+  };
+
+  const submitProfileName = async () => {
+    if (!profile) return;
+    const newName = (profile.name.value || "").trim();
+    if (!newName) { setProfile(p => ({ ...p, name: { ...p.name, error: "Name can't be empty." } })); return; }
+    if (newName === (cloudUser?.user?.displayName || "")) {
+      setProfile(p => ({ ...p, name: { ...p.name, error: "That's already your display name." } }));
+      return;
+    }
+    setProfile(p => ({ ...p, name: { ...p.name, busy: true, error: "" } }));
+    try {
+      await window.api.fetchJSON("/api/me/profile", { method: "PATCH", body: JSON.stringify({ displayName: newName }) });
+      // Refresh cloudUser so `me` and the modal label both show the new name immediately.
+      try { const meRes = await window.api.fetchJSON("/api/me"); if (meRes) setCloudUser(meRes); } catch {}
+      await propagateNameAcrossGroups(newName);
+      setProfile(p => p && ({ ...p, name: { ...p.name, busy: false, error: "", savedAt: Date.now() } }));
+      flash("✅ Display name updated");
+    } catch (e) {
+      const msg = ({
+        name_too_short: "Name can't be empty.",
+        name_too_long: "Name is too long (80 char max).",
+        unauthorized: "Session expired — sign in again.",
+      })[e?.body?.error] || "Couldn't update name.";
+      setProfile(p => p && ({ ...p, name: { ...p.name, busy: false, error: msg } }));
+    }
+  };
+
+  const submitProfilePassword = async () => {
+    if (!profile) return;
+    const { current, next, confirm } = profile.password;
+    if (!current) { setProfile(p => ({ ...p, password: { ...p.password, error: "Enter your current password." } })); return; }
+    if ((next || "").length < 8) { setProfile(p => ({ ...p, password: { ...p.password, error: "New password must be at least 8 characters." } })); return; }
+    if (next !== confirm) { setProfile(p => ({ ...p, password: { ...p.password, error: "New passwords don't match." } })); return; }
+    setProfile(p => ({ ...p, password: { ...p.password, busy: true, error: "" } }));
+    try {
+      await window.api.fetchJSON("/api/me/password", {
+        method: "POST",
+        body: JSON.stringify({ currentPassword: current, newPassword: next }),
+      });
+      setProfile(p => p && ({ ...p, password: { current: "", next: "", confirm: "", busy: false, error: "", savedAt: Date.now() } }));
+      flash("✅ Password updated");
+    } catch (e) {
+      const msg = ({
+        current_password_incorrect: "Current password is incorrect.",
+        current_password_required: "Enter your current password.",
+        password_too_short: "New password must be at least 8 characters.",
+        no_password_set: "No password set — use a magic link to sign in first.",
+        unauthorized: "Session expired — sign in again.",
+      })[e?.body?.error] || "Couldn't update password.";
+      setProfile(p => p && ({ ...p, password: { ...p.password, busy: false, error: msg } }));
+    }
+  };
+
+  const submitProfileEmail = async () => {
+    if (!profile) return;
+    const newEmail = (profile.email.value || "").trim().toLowerCase();
+    if (!newEmail) { setProfile(p => ({ ...p, email: { ...p.email, error: "Enter the new email address." } })); return; }
+    if (newEmail === (cloudUser?.user?.email || "").toLowerCase()) {
+      setProfile(p => ({ ...p, email: { ...p.email, error: "That's already your email." } }));
+      return;
+    }
+    setProfile(p => ({ ...p, email: { ...p.email, busy: true, error: "", sentTo: "" } }));
+    try {
+      const r = await window.api.fetchJSON("/api/me/change-email-request", {
+        method: "POST",
+        body: JSON.stringify({ newEmail }),
+      });
+      setProfile(p => p && ({ ...p, email: { ...p.email, busy: false, error: "", sentTo: r?.sentTo || newEmail } }));
+    } catch (e) {
+      const msg = ({
+        invalid_email: "That doesn't look like a valid email.",
+        same_email: "That's already your email.",
+        email_taken: "Another account already uses that email.",
+        unauthorized: "Session expired — sign in again.",
+      })[e?.body?.error] || "Couldn't request the change.";
+      setProfile(p => p && ({ ...p, email: { ...p.email, busy: false, error: msg, sentTo: "" } }));
     }
   };
 
@@ -4403,7 +4583,7 @@ function ShiftApp() {
           <p className="text-sm text-slate-500 mb-5">{headerCopy}</p>
           <div className="flex bg-slate-100 rounded-lg p-1 mb-5">
             {[["signin","Sign in"],["signup","Sign up"]].map(([m,l])=>(
-              <button key={m} onClick={()=>{setAuthMode(m);setAuthError("");setCloudError("");setMagicLinkSent(false);}}
+              <button key={m} onClick={()=>{setAuthMode(m);setAuthError("");setCloudError("");setMagicLinkSent(false);setForgot(null);}}
                 className={`flex-1 py-2 text-xs font-medium rounded-md transition ${authMode===m?"bg-white shadow text-slate-900":"text-slate-500"}`}>
                 {l}
               </button>
@@ -4418,6 +4598,37 @@ function ShiftApp() {
               <button onClick={()=>{setMagicLinkSent(false);setCloudError("");}}
                 className="w-full text-xs font-medium text-slate-600 hover:text-slate-800 py-2">Send to a different email</button>
             </div>
+          ) : forgot ? (
+            forgot.phase === "sent" ? (
+              <div className="space-y-3 text-sm">
+                <div className="px-3 py-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800">
+                  If <span className="font-medium">{forgot.value}</span> matches an account, we sent a password-reset link to that account's email.
+                </div>
+                <p className="text-xs text-slate-500">The link expires in 15 minutes and can only be used once. Check your spam folder if you don't see it.</p>
+                <button onClick={()=>setForgot(null)}
+                  className="w-full text-xs font-medium text-slate-600 hover:text-slate-800 py-2">Back to sign in</button>
+              </div>
+            ) : (
+              <>
+                <div className="text-sm text-slate-600 mb-3">Enter your email or username. We'll email a link you can use to set a new password.</div>
+                <Field label="Email or username">
+                  <input type="text" value={forgot.value || ""} autoComplete="username" autoCapitalize="none"
+                    onChange={e=>setForgot(s=>({...s, value:e.target.value, error:""}))}
+                    onKeyDown={e=>e.key==="Enter"&&!forgot.busy&&submitForgot()}
+                    className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-base focus:outline-none focus:border-blue-500"
+                    placeholder="you@example.com or jsmith"/>
+                </Field>
+                {forgot.error && <div className="text-xs text-red-600 mb-3">{forgot.error}</div>}
+                <button onClick={submitForgot} disabled={forgot.busy}
+                  className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium text-base transition disabled:bg-slate-300">
+                  {forgot.busy ? "Sending…" : "Send reset link"}
+                </button>
+                <button onClick={()=>setForgot(null)}
+                  className="w-full text-xs font-medium text-slate-500 hover:text-slate-700 py-2 mt-1">
+                  Back to sign in
+                </button>
+              </>
+            )
           ) : authMode === "signin" ? (
             <>
               <Field label="Email or username">
@@ -4440,6 +4651,10 @@ function ShiftApp() {
               <button onClick={sendMagicLink} disabled={cloudBusy}
                 className="w-full text-xs font-medium text-slate-500 hover:text-slate-700 py-2 mt-1 disabled:opacity-50">
                 Or email me a sign-in link instead
+              </button>
+              <button onClick={()=>setForgot({ phase:"form", value:(authForm.emailOrUsername||"").trim(), busy:false, error:"" })}
+                className="w-full text-xs font-medium text-slate-500 hover:text-slate-700 py-1">
+                Forgot password?
               </button>
             </>
           ) : (
@@ -5706,7 +5921,7 @@ function ShiftApp() {
           <div className="space-y-3 text-sm text-slate-600 mb-5">
             <p><span className="font-semibold text-slate-900">1. Set your targets.</span> Tell us the minimum, ideal, and maximum shifts you want this block.</p>
             <p><span className="font-semibold text-slate-900">2. Mark preferred dates to work.</span> On the Availability page, star any days you'd prefer. Auto-assign uses this to fill leftover slots.</p>
-            <p><span className="font-semibold text-slate-900">3. Set Top Options for the days you really want.</span> On the Schedule page, pick <span className="font-semibold text-slate-900">🎯 Top Option</span> for any day you're committing to. You'll choose a slot preference (Primary / Backup / Either) and a bid — defaults to <span className="font-semibold text-slate-900">1 point</span>, but you can bid higher (up to your current points) to outweigh other Top-Optioners on the same day.</p>
+            <p><span className="font-semibold text-slate-900">3. Set Top Options for the days you really want.</span> On the Preferences page, pick <span className="font-semibold text-slate-900">🎯 Top Option</span> for any day you're committing to. You'll choose a slot preference (Primary / Backup / Either) and a bid — defaults to <span className="font-semibold text-slate-900">1 point</span>, but you can bid higher (up to your current points) to outweigh other Top-Optioners on the same day.</p>
             <p><span className="font-semibold text-slate-900">4. Block what you can't.</span> Optionally classify (Working, Vacation, Conference, Personal Conflict). You may block up to {config.maxBlockedDays} days ({config.maxBlockedWeekendDays} weekend) — going over costs a point per extra day. You also need to prefer at least {config.minPreferredDays} days ({config.minPreferredWeekendDays} weekend) or lose points.</p>
             <p><span className="font-semibold text-slate-900">5. Settled at close.</span> When the admin closes the window, contested days go to the <span className="font-semibold text-slate-900">highest bidder</span> (ties fall to highest current points). The winner pays the <span className="font-semibold text-slate-900">next-highest bid + 1</span> — never their full bid. So bidding 7 against a 2 costs you 3, not 7. Solo Top Options cost 0.</p>
           </div>
@@ -6023,8 +6238,12 @@ function ShiftApp() {
           </div>
         );
       })()}
-      <div>
-        <button onClick={()=>setPage("schedule")} className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-medium text-sm">Open schedule →</button>
+      <div className="space-y-2">
+        {isAvailabilityOpen(currentBlock) ? (
+          <button onClick={()=>setPage("preferences")} className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-medium text-sm">Set preferences →</button>
+        ) : (
+          <button onClick={()=>setPage("schedule")} className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-medium text-sm">View schedule →</button>
+        )}
       </div>
     </>);
   };
@@ -6345,8 +6564,11 @@ function ShiftApp() {
 
   // Provider-only combined Schedule page: targets + preferences + blocks + pool sign-up in one view.
   // Replaces the old separate Availability + Shifts pages (admins still have the Calendar page).
-  // v2 SchedulePage — redesigned with status-report hero, card grid (targets + spacing), daily list/calendar
-  const SchedulePage = () => {
+  // PreferencesPage — provider's per-day preferences (Top Option / Preferred / Available / Blocked)
+  // plus targets + spacing config. In Avail it's editable; in Recon+ the overlays stay visible
+  // (so the user can review what they bid) but every control is locked. The phase-aware copy at
+  // the top tells the user which mode they're in.
+  const PreferencesPage = () => {
     const avail=getAvailInfo(me.id);
     const t=me.targets||{min:0,ideal:0,max:0};
     const want=wantedCount(me.id);
@@ -6358,13 +6580,16 @@ function ShiftApp() {
     const statusOk = avail.meets;
     // Headline color reflects overall pass/fail
     const statusText = statusOk ? "text-emerald-600" : "text-amber-600";
+    const availPhase = isAvailabilityOpen(currentBlock);
+    const heroCopy = availPhase
+      ? "Mark the days you prefer, block the ones you can't work, and set 🎯 Top Option on the days you're committing to. Accurate preferences help auto-assign fill the block fairly."
+      : "These were your preferences for this block. Editing is locked since reconciliation began — head over to Schedule to see assignments.";
     return(<>
       {/* Hero */}
       <div className="mb-6 sm:mb-8">
-        <h1 className="text-3xl sm:text-4xl font-bold text-brand-700 leading-tight tracking-tight">Schedule</h1>
+        <h1 className="text-3xl sm:text-4xl font-bold text-brand-700 leading-tight tracking-tight">Preferences</h1>
         <p className="text-sm sm:text-base text-ink-500 mt-2 max-w-2xl leading-relaxed">
-          Mark the days you prefer, block the ones you can't work, and set 🎯 Top Option on the days you're committing to.
-          Accurate preferences help auto-assign fill the block fairly.
+          {heroCopy}
         </p>
       </div>
 
@@ -6568,26 +6793,27 @@ function ShiftApp() {
         </div>
         {!blockDays.length
           ? <p className="text-sm text-ink-500 text-center py-10">No block dates set yet — an admin will configure the block.</p>
-          : availView==="list" ? ScheduleList() : CalendarView()}
+          : availView==="list" ? PreferencesList() : CalendarView()}
       </div>
     </>);
   };
 
-  // v3 ScheduleList — date tile + slot chips + 3-state segmented control (Pref/Avail/Blocked).
-  // In Reconciliation+ the personal pref/blocked overlays drop and the buttons disappear, so the
-  // user reads the canonical assigned schedule instead of their own input layer.
-  // v3.1 ScheduleList — single 4-state segmented control per day (Top Option / Preferred / Available / Blocked).
-  // Top Option expands inline with slot pref + bid stepper. In Reconciliation+ the control hides
-  // and the user just reads the assigned schedule.
-  const ScheduleList = () => (
+  // PreferencesList — date tile + slot chips + 4-state segmented control (Top Option / Preferred /
+  // Available / Blocked). Top Option expands inline with slot pref + bid stepper.
+  //
+  // Phase behavior: overlays (your blocked/preferred/top-option styling) show in ALL phases so the
+  // user can review their prior preferences after reconciliation. The 4-state control and Top
+  // Option editors only mount in Availability — in Recon+ a static read-only summary takes their
+  // place so the user still sees the bid/slot pref they committed.
+  const PreferencesList = () => (
     <div className="space-y-3">{blockDays.map(k=>{
       const date=parseDk(k);
       const availPhase = isAvailabilityOpen(currentBlock);
       const blockedRaw=isUnavail(me.id,k), wantedRaw=isWanted(me.id,k);
       const reason=unavailReason(me.id,k);
-      const blocked = availPhase && blockedRaw;
-      const wanted = availPhase && wantedRaw;
-      const meTopOpt = availPhase && inTopOption(k, me.id);
+      const blocked = blockedRaw;
+      const wanted = wantedRaw;
+      const meTopOpt = inTopOption(k, me.id);
       const dayS=shifts[k]||{}, hasShift=Object.values(dayS).some(e=>getUid(e)===me.id);
       const isWk=isWeekend(k), pts=dayPts(date,config), hol=config.holidays[k];
       const filled=Object.values(dayS).filter(e=>getUid(e)).length, total=config.shiftSlots.length;
@@ -6788,7 +7014,138 @@ function ShiftApp() {
             )}
           </div>
           )}
+          {/* Recon+ read-only summary — surfaces the prior bid + slot pref + blocked reason so
+              the user can still see what they committed without the edit controls. */}
+          {!availPhase && (meTopOpt || (blocked && reason)) && (
+            <div className="px-4 pb-4">
+              {meTopOpt && (()=>{
+                const cur = topOptions[k][me.id];
+                const slot = cur.slotPref != null ? config.shiftSlots.find(s=>s.id===cur.slotPref) : null;
+                return (
+                  <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 text-xs text-blue-900 space-y-1">
+                    <div className="font-bold uppercase tracking-[0.12em] text-[10px] text-blue-700">🎯 Your Top Option (locked)</div>
+                    <div>Slot pref: <span className="font-semibold">{slot ? slot.name : "Either"}</span> · Bid: <span className="font-semibold tabular-nums">{cur.bid}</span></div>
+                  </div>
+                );
+              })()}
+              {blocked && reason && (
+                <div className={`${meTopOpt ? "mt-2 " : ""}text-[11px] text-red-800 bg-red-50 border border-red-200 rounded-xl px-3 py-2`}>
+                  <span className="font-bold uppercase tracking-[0.12em] text-[10px] text-red-700">Blocked reason</span>
+                  <span className="ml-2">{reason}</span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
+      );
+    })}</div>
+  );
+
+  // Provider Schedule page — assignments-focused view. In Availability it's mostly empty since
+  // awards haven't been computed; an empty-state banner steers the user to Preferences. In
+  // Reconciliation+ it shows the canonical assigned schedule, with a 🔄 marker on any slot that
+  // has an open marketplace listing (posted for take or trade).
+  const SchedulePage = () => {
+    const phase = phaseOf(currentBlock);
+    const availPhase = isAvailabilityOpen(currentBlock);
+    const reconOrLater = phase === PHASE.RECON || phase === PHASE.LOCKED;
+    const heroCopy = availPhase
+      ? "Assignments haven't been computed yet — they'll appear here after the admin closes & assigns. In the meantime, set your bids on the Preferences page."
+      : reconOrLater
+        ? "Block is in " + PHASE_LABEL[phase].toLowerCase() + ". Below is the canonical assigned schedule; days posted for take or trade are marked with 🔄."
+        : "View only.";
+    // Index open marketplace listings by `${dateKey}_${slotId}` so per-slot lookup is cheap.
+    const openListings = {};
+    marketplace.filter(l => l.status === "open").forEach(l => {
+      openListings[`${l.dateKey}_${l.slotId}`] = l;
+    });
+    return(<>
+      <div className="mb-6 sm:mb-8">
+        <h1 className="text-3xl sm:text-4xl font-bold text-brand-700 leading-tight tracking-tight">Schedule</h1>
+        <p className="text-sm sm:text-base text-ink-500 mt-2 max-w-2xl leading-relaxed">{heroCopy}</p>
+      </div>
+      <div className="bg-surface rounded-2xl shadow-card border border-slate-200/70 p-5 sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-lg bg-brand-50 text-brand-700 flex items-center justify-center font-bold">📅</div>
+            <h2 className="text-base sm:text-lg font-bold text-ink-900">Daily schedule</h2>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-[11px] text-ink-500 hidden sm:inline">
+              {blockDays.length} day{blockDays.length===1?"":"s"} · phase <span className={`font-semibold ${PHASE_TONE[phase].text}`}>{PHASE_LABEL[phase].toLowerCase()}</span>
+            </span>
+            <div className="flex bg-slate-100 rounded-lg p-0.5">
+              {[["list","List"],["calendar","Calendar"]].map(([v,l])=>(
+                <button key={v} onClick={()=>setShiftsView(v)}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition ${shiftsView===v?"bg-surface shadow-card text-ink-900":"text-ink-500 hover:text-ink-700"}`}>
+                  {l}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        {!blockDays.length ? (
+          <p className="text-sm text-ink-500 text-center py-10">No block dates set yet — an admin will configure the block.</p>
+        ) : shiftsView === "list" ? (
+          <AssignmentsList openListings={openListings} availPhase={availPhase}/>
+        ) : (
+          <CalendarView/>
+        )}
+      </div>
+    </>);
+  };
+
+  // Per-day list for the Schedule page. No personal-preference overlays — the day frame is neutral
+  // and each slot chip shows the awarded provider or "Open". Marketplace listings (open take/trade
+  // posts) annotate the affected slot chip with a 🔄 badge. In Avail this is mostly all "Open".
+  const AssignmentsList = ({ openListings, availPhase }) => (
+    <div className="space-y-2">{blockDays.map(k=>{
+      const date = parseDk(k);
+      const dayS = shifts[k] || {};
+      const filled = Object.values(dayS).filter(e=>getUid(e)).length;
+      const total = config.shiftSlots.length;
+      const myShift = Object.values(dayS).some(e=>getUid(e)===me.id);
+      const isWk = isWeekend(k), pts = dayPts(date, config), hol = config.holidays[k];
+      const dayHasListing = config.shiftSlots.some(s => openListings[`${k}_${s.id}`]);
+      return(
+        <button key={k} onClick={()=>setEditingDay(k)}
+          className={`w-full border rounded-xl p-3 flex items-center gap-3 active:bg-slate-50 text-left transition ${myShift ? "bg-white border-emerald-400 border-2" : "bg-surface border-slate-200"}`}>
+          <div className="w-12 h-12 rounded-lg bg-slate-50 flex flex-col items-center justify-center flex-shrink-0">
+            <div className="text-[10px] font-semibold text-slate-500 leading-none">{DAYS_SHORT[date.getDay()]}</div>
+            <div className="text-lg font-bold leading-tight">{date.getDate()}</div>
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex flex-wrap items-center gap-1.5 mb-1">
+              <span className="font-medium text-sm">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}</span>
+              {pts>0 && <span className="text-[11px] px-1.5 py-0.5 rounded-full font-semibold tabular-nums bg-slate-100 text-slate-700">+{pts}</span>}
+              {isWk && <span className="text-[10px] bg-amber-50 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded-full font-medium">Weekend</span>}
+              {hol && <span className="text-[10px] bg-emerald-50 text-emerald-800 border border-emerald-200 px-1.5 py-0.5 rounded-full font-medium">{hol}</span>}
+              {myShift && <span className="text-[10px] bg-emerald-100 text-emerald-800 border border-emerald-300 px-1.5 py-0.5 rounded-full font-bold">✓ You're on</span>}
+              {dayHasListing && <span className="text-[10px] bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded-full font-semibold" title="One or more slots posted for take or trade">🔄 On marketplace</span>}
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {config.shiftSlots.map(s=>{
+                const entry = dayS[s.id], winUid = getUid(entry), u = winUid ? users.find(x=>x.id===winUid) : null;
+                const isMe = winUid === me.id, auto = isAuto(entry);
+                const listing = openListings[`${k}_${s.id}`];
+                if (u) return (
+                  <span key={s.id} className={`text-[10px] px-2 py-0.5 rounded-full font-semibold inline-flex items-center gap-1 ${isMe ? "bg-emerald-100 text-emerald-800" : "text-white"}`}
+                    style={!isMe ? { background: s.color } : {}}>
+                    {s.name}: {isMe ? "You" : u.name.split(" ")[0]}{auto ? " ⚙" : ""}
+                    {listing && <span className="text-[10px]" title={`Posted for take/trade · incentive +${listing.incentivePts||0}`}>🔄</span>}
+                  </span>
+                );
+                return (
+                  <span key={s.id} className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-white border-2"
+                    style={{ borderColor: s.color, color: s.color }}>
+                    {s.name}: Open
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+          <div className={`text-xs font-semibold flex-shrink-0 ${filled===total?"text-slate-400":filled===0?"text-blue-600":"text-amber-600"}`}>{filled}/{total}</div>
+        </button>
       );
     })}</div>
   );
@@ -6871,7 +7228,7 @@ function ShiftApp() {
       )}
       {mine.length>0&&pending.length>0&&<div className="text-xs font-medium text-slate-500 mb-2 px-1">AWARDED</div>}
       {!mine.length&&!pending.length?
-        <div className="bg-white rounded-xl border border-slate-200 p-8 text-center"><div className="text-3xl mb-2">📅</div><p className="text-sm text-slate-500">No shifts yet. Set a 🎯 Top Option on the Schedule page.</p></div>
+        <div className="bg-white rounded-xl border border-slate-200 p-8 text-center"><div className="text-3xl mb-2">📅</div><p className="text-sm text-slate-500">No shifts yet. Set a 🎯 Top Option on the Preferences page.</p></div>
         :mine.length>0?<div className="space-y-2">{mine.map((m,i)=>{
           const conf = m.entry?.confirm;
           const flagged = conf === "flagged";
@@ -7611,6 +7968,8 @@ function ShiftApp() {
         </div>
         <div className="flex items-center gap-2">
           <span className="hidden sm:inline text-sm text-slate-700">{me.name}</span>
+          <button onClick={openProfile}
+            className="text-xs sm:text-sm px-3 py-1.5 border border-slate-300 rounded-lg hover:bg-slate-50">Profile</button>
           <button onClick={signOut} className="text-xs sm:text-sm px-3 py-1.5 border border-slate-300 rounded-lg hover:bg-slate-50">Sign out</button>
         </div>
       </nav>
@@ -7809,7 +8168,7 @@ function ShiftApp() {
                   </div>
                 </div>
                 <div className="flex flex-col gap-1.5 flex-shrink-0">
-                  <button onClick={()=>setAccountsEdit({ uid:u.id, name:u.displayName||u.email, email:"", password:"", busy:false, error:"" })}
+                  <button onClick={()=>setAccountsEdit({ uid:u.id, name:u.displayName||u.email, email:"", emailConfirm:"", password:"", passwordConfirm:"", busy:false, error:"" })}
                     className="text-xs font-semibold px-2.5 py-1 border border-slate-200 rounded-lg hover:bg-slate-50">Edit</button>
                   <button onClick={()=>setAccountsDelete({ uid:u.id, name:u.displayName||u.email, memberships:u.memberships||[], busy:false, error:"" })}
                     className="text-xs font-semibold px-2.5 py-1 border border-red-200 text-red-700 rounded-lg hover:bg-red-50">Delete</button>
@@ -7824,6 +8183,7 @@ function ShiftApp() {
       {impersonatePicker && <ImpersonatePickerModal/>}
       {accountsEdit && <AccountsEditModal/>}
       {accountsDelete && <AccountsDeleteModal/>}
+      {profile && <ProfileModal/>}
       {toast&&<Toast msg={toast}/>}
     </div>
     );
@@ -7900,17 +8260,23 @@ function ShiftApp() {
 
   const AccountsEditModal = () => {
     if (!accountsEdit) return null;
-    const { name, email, password, busy, error } = accountsEdit;
+    const { name, email, emailConfirm, password, passwordConfirm, busy, error } = accountsEdit;
     return (
       <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60] p-4" onClick={()=>!busy&&setAccountsEdit(null)}>
-        <div className="bg-white rounded-2xl max-w-md w-full p-5" onClick={e=>e.stopPropagation()}>
+        <div className="bg-white rounded-2xl max-w-md w-full p-5 max-h-[90vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
           <div className="font-semibold text-xl text-slate-900 mb-1">Edit {name}</div>
-          <p className="text-sm text-slate-500 mb-4">Leave a field blank to keep the current value. Either email or password is required.</p>
+          <p className="text-sm text-slate-500 mb-4">Leave a section blank to keep the current value. Confirm any change by re-entering it in the second field — a typo here would lock {name} out.</p>
           <Field label="New email">
             <input type="email" value={email} autoComplete="off" autoCapitalize="none" disabled={busy}
               onChange={e=>setAccountsEdit(s=>({...s, email:e.target.value, error:""}))}
               className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"
               placeholder="(leave blank to keep current)"/>
+          </Field>
+          <Field label="Confirm new email">
+            <input type="email" value={emailConfirm} autoComplete="off" autoCapitalize="none" disabled={busy || !email}
+              onChange={e=>setAccountsEdit(s=>({...s, emailConfirm:e.target.value, error:""}))}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"
+              placeholder={email ? "Re-enter the new email" : "(no change requested)"}/>
           </Field>
           <Field label="New password (8+ chars)">
             <input type="password" value={password} autoComplete="new-password" disabled={busy}
@@ -7918,12 +8284,108 @@ function ShiftApp() {
               className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"
               placeholder="(leave blank to keep current)"/>
           </Field>
+          <Field label="Confirm new password">
+            <input type="password" value={passwordConfirm} autoComplete="new-password" disabled={busy || !password}
+              onChange={e=>setAccountsEdit(s=>({...s, passwordConfirm:e.target.value, error:""}))}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"
+              placeholder={password ? "Re-enter the new password" : "(no change requested)"}/>
+          </Field>
           {error && <div className="text-xs text-red-600 mb-3">{error}</div>}
           <div className="flex gap-2 mt-2">
             <button onClick={()=>setAccountsEdit(null)} disabled={busy}
               className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium disabled:opacity-50">Cancel</button>
             <button onClick={submitAccountsEdit} disabled={busy}
               className="flex-1 py-2.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium disabled:bg-slate-300">{busy?"Saving…":"Save"}</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Self-service profile editor. Three independent sections — each saves on its own button
+  // press, with its own busy/error state, so the user can update one piece without unsaved
+  // entries in another section blocking them.
+  const ProfileModal = () => {
+    if (!profile) return null;
+    const cur = cloudUser?.user;
+    const Section = ({ title, children }) => (
+      <div className="border-t border-slate-200 pt-4 mt-4 first:border-t-0 first:pt-0 first:mt-0">
+        <div className="font-semibold text-sm text-slate-900 mb-2">{title}</div>
+        {children}
+      </div>
+    );
+    const Saved = ({ at }) => at ? <div className="text-xs text-emerald-700 mt-2">✓ Saved</div> : null;
+    return (
+      <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60] p-4" onClick={closeProfile}>
+        <div className="bg-white rounded-2xl max-w-md w-full p-5 max-h-[90vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
+          <div className="flex items-start justify-between mb-1">
+            <div>
+              <div className="font-semibold text-xl text-slate-900">Your profile</div>
+              <div className="text-xs text-slate-500 mt-0.5">Signed in as <span className="font-mono">{cur?.email || ""}</span></div>
+            </div>
+            <button onClick={closeProfile} className="text-ink-400 hover:text-ink-700 text-2xl leading-none px-1 -mt-1">×</button>
+          </div>
+
+          <Section title="Display name">
+            <p className="text-xs text-slate-500 mb-2">This is the name other members see on the schedule, trades, and reports.</p>
+            <input type="text" value={profile.name.value} disabled={profile.name.busy} maxLength={80}
+              onChange={e=>setProfile(p=>({...p, name:{...p.name, value:e.target.value, error:"", savedAt:0}}))}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"
+              placeholder="Your name"/>
+            {profile.name.error && <div className="text-xs text-red-600 mt-2">{profile.name.error}</div>}
+            <Saved at={profile.name.savedAt}/>
+            <button onClick={submitProfileName} disabled={profile.name.busy}
+              className="mt-3 px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium disabled:bg-slate-300">
+              {profile.name.busy ? "Saving…" : "Save name"}
+            </button>
+          </Section>
+
+          <Section title="Email">
+            <p className="text-xs text-slate-500 mb-2">Current: <span className="font-mono">{cur?.email || ""}</span>. We'll send a confirmation link to the new address — the change applies when you click it.</p>
+            <input type="email" value={profile.email.value} disabled={profile.email.busy} autoCapitalize="none" autoComplete="off"
+              onChange={e=>setProfile(p=>({...p, email:{...p.email, value:e.target.value, error:"", sentTo:""}}))}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"
+              placeholder="new@email.com"/>
+            {profile.email.error && <div className="text-xs text-red-600 mt-2">{profile.email.error}</div>}
+            {profile.email.sentTo && (
+              <div className="text-xs text-emerald-700 mt-2">
+                ✓ Confirmation link sent to <span className="font-mono">{profile.email.sentTo}</span>. Check that inbox to finish the change (link expires in 15 minutes).
+              </div>
+            )}
+            <button onClick={submitProfileEmail} disabled={profile.email.busy}
+              className="mt-3 px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium disabled:bg-slate-300">
+              {profile.email.busy ? "Sending…" : "Send confirmation link"}
+            </button>
+          </Section>
+
+          <Section title="Password">
+            <p className="text-xs text-slate-500 mb-2">Enter your current password, then your new password twice.</p>
+            <Field label="Current password">
+              <input type="password" value={profile.password.current} disabled={profile.password.busy} autoComplete="current-password"
+                onChange={e=>setProfile(p=>({...p, password:{...p.password, current:e.target.value, error:"", savedAt:0}}))}
+                className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"/>
+            </Field>
+            <Field label="New password (8+ chars)">
+              <input type="password" value={profile.password.next} disabled={profile.password.busy} autoComplete="new-password"
+                onChange={e=>setProfile(p=>({...p, password:{...p.password, next:e.target.value, error:"", savedAt:0}}))}
+                className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"/>
+            </Field>
+            <Field label="Confirm new password">
+              <input type="password" value={profile.password.confirm} disabled={profile.password.busy} autoComplete="new-password"
+                onChange={e=>setProfile(p=>({...p, password:{...p.password, confirm:e.target.value, error:"", savedAt:0}}))}
+                className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:border-blue-500 disabled:bg-slate-50"/>
+            </Field>
+            {profile.password.error && <div className="text-xs text-red-600 mt-1">{profile.password.error}</div>}
+            <Saved at={profile.password.savedAt}/>
+            <button onClick={submitProfilePassword} disabled={profile.password.busy}
+              className="mt-2 px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium disabled:bg-slate-300">
+              {profile.password.busy ? "Saving…" : "Update password"}
+            </button>
+          </Section>
+
+          <div className="mt-5 pt-4 border-t border-slate-200">
+            <button onClick={closeProfile}
+              className="w-full py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Close</button>
           </div>
         </div>
       </div>
@@ -8026,17 +8488,22 @@ function ShiftApp() {
   // Nav — Trades is shared (open listings live across providers + admin). Badge with count
   // is computed inline below.
   const openTradeCount = marketplace.filter(l => l.status === "open").length;
+  // Items with `onClick` fire that action instead of navigating (used for modal-only destinations
+  // like Provider Report). Mobile bottom nav filters these out to stay compact.
   const navItems = me.role==="admin"
-    ? [{id:"home",icon:"📊",label:"Home"},{id:"shifts",icon:"📅",label:"Calendar"},{id:"market",icon:"🔄",label:"Trades",badge:openTradeCount||null},{id:"setup",icon:"⚙️",label:"Setup"},{id:"people",icon:"👥",label:"People"}]
-    : [{id:"home",icon:"🏠",label:"Home"},{id:"schedule",icon:"📅",label:"Schedule"},{id:"myshifts",icon:"✅",label:"Mine"},{id:"market",icon:"🔄",label:"Trades",badge:openTradeCount||null},{id:"standings",icon:"⭐",label:"Ranks"}];
+    ? [{id:"home",icon:"📊",label:"Home"},{id:"shifts",icon:"📅",label:"Calendar"},{id:"market",icon:"🔄",label:"Trades",badge:openTradeCount||null},{id:"setup",icon:"⚙️",label:"Setup"},{id:"people",icon:"👥",label:"People"},{id:"providerReport",icon:"📈",label:"Provider Report",onClick:()=>setShowProviderReport(true),disabled:!(config.blocks||[]).length}]
+    : [{id:"home",icon:"🏠",label:"Home"},{id:"preferences",icon:"🎯",label:"Preferences"},{id:"schedule",icon:"📅",label:"Schedule"},{id:"myshifts",icon:"✅",label:"Mine"},{id:"market",icon:"🔄",label:"Trades",badge:openTradeCount||null},{id:"standings",icon:"⭐",label:"Ranks"}];
 
   const renderPage = () => {
     if(page==="home") return me.role==="admin"?AdminHome():ProviderHome();
-    // "shifts" is the admin-side calendar page; providers land here too if they came from a pre-merge link.
+    // "shifts" is the admin-side calendar page; providers landing here from a pre-split link
+    // see the new assignments-focused Schedule page.
     if(page==="shifts") return me.role==="admin"?ShiftsPage():SchedulePage();
     if(page==="schedule") return SchedulePage();
-    // Legacy availability route → redirect to the merged schedule page.
-    if(page==="availability") return SchedulePage();
+    if(page==="preferences") return PreferencesPage();
+    // Legacy availability route → redirect to Preferences (the page that was previously called
+    // "Schedule" and held the per-day bid/preferred/blocked editor).
+    if(page==="availability") return PreferencesPage();
     if(page==="myshifts") return MyShiftsPage();
     if(page==="market") return MarketplacePage();
     if(page==="standings") return StandingsPage();
@@ -8095,21 +8562,26 @@ function ShiftApp() {
           </div>
         ); })()}
         <nav className="flex-1 space-y-0.5">{navItems.map(n=>(
-          <button key={n.id} onClick={()=>setPage(n.id)}
-            className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm w-full text-left transition ${page===n.id?"bg-brand-50 text-brand-700 font-semibold":"text-ink-700 hover:bg-slate-100"}`}>
+          <button key={n.id} onClick={n.onClick||(()=>setPage(n.id))} disabled={n.disabled}
+            className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm w-full text-left transition ${page===n.id&&!n.onClick?"bg-brand-50 text-brand-700 font-semibold":"text-ink-700 hover:bg-slate-100"} disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent`}>
             <span className="text-base leading-none">{n.icon}</span>
             <span className="flex-1">{n.label}</span>
             {n.badge && <span className="text-[10px] font-bold bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded-full min-w-[18px] text-center">{n.badge}</span>}
           </button>
         ))}</nav>
         <div className="pt-4 border-t border-slate-200 mt-4">
-          <div className="flex items-center gap-2.5 px-1">
+          {/* User chip → opens self-service profile editor. Disabled during impersonation
+              because `me` is the impersonated user but the cloud session is the owner's —
+              opening would surface the owner's profile under the impersonated name, which
+              is confusing. */}
+          <button onClick={openProfile} disabled={!!me.impersonating} title={me.impersonating ? "Stop impersonating to edit your profile" : "Edit your profile"}
+            className="w-full flex items-center gap-2.5 px-1 py-1 rounded-lg hover:bg-slate-100 disabled:hover:bg-transparent disabled:cursor-not-allowed text-left">
             <span className="w-9 h-9 rounded-full text-white flex items-center justify-center text-xs font-semibold shadow-card flex-shrink-0" style={{background:COLORS[me.id%COLORS.length]}}>{initials(me.name)}</span>
             <div className="flex-1 min-w-0">
               <div className="text-sm font-semibold text-ink-900 truncate">{me.name}</div>
               <div className="text-[10px] text-ink-500 uppercase tracking-wider font-semibold">{me.role}</div>
             </div>
-          </div>
+          </button>
           <button onClick={signOut} className="w-full mt-3 text-xs font-semibold px-3 py-2 border border-slate-200 rounded-lg text-ink-700 hover:bg-slate-50">Sign out</button>
         </div>
       </aside>
@@ -8126,7 +8598,8 @@ function ShiftApp() {
             ); })()}
           </div>
           <div className="flex items-center gap-2">
-            <span className="w-8 h-8 rounded-full text-white flex items-center justify-center text-xs font-semibold shadow-card flex-shrink-0" style={{background:COLORS[me.id%COLORS.length]}}>{initials(me.name)}</span>
+            <button onClick={openProfile} disabled={!!me.impersonating} title={me.impersonating ? "Stop impersonating to edit your profile" : "Edit your profile"}
+              className="w-8 h-8 rounded-full text-white flex items-center justify-center text-xs font-semibold shadow-card flex-shrink-0 disabled:cursor-not-allowed" style={{background:COLORS[me.id%COLORS.length]}}>{initials(me.name)}</button>
             <button onClick={signOut} className="text-[11px] font-semibold px-2.5 py-1.5 border border-slate-200 rounded-lg text-ink-700">Sign out</button>
           </div>
         </header>
@@ -8139,7 +8612,7 @@ function ShiftApp() {
 
       {/* Mobile bottom nav */}
       <nav className="lg:hidden fixed bottom-0 left-0 right-0 bg-surface border-t border-slate-200 flex z-40 pb-[env(safe-area-inset-bottom)]">
-        {navItems.map(n=>(
+        {navItems.filter(n=>!n.onClick).map(n=>(
           <button key={n.id} onClick={()=>setPage(n.id)}
             className={`flex-1 py-2.5 flex flex-col items-center gap-0.5 relative ${page===n.id?"text-brand-700":"text-ink-500"}`}>
             <span className="text-lg leading-none">{n.icon}</span>
@@ -8149,7 +8622,7 @@ function ShiftApp() {
         ))}
       </nav>
 
-      {DaySheet()}{Onboarding()}{AutoAssignModal()}{ReconcileModal()}{ConfirmResetModal()}{ConfirmLockModal()}{ConfirmBlockOverModal()}{BlockReportModal()}{ProviderReportModal()}{AllocationSummaryModal()}{FlagDraftModal()}{ListDraftModal()}{TradeDraftModal()}{AddUserModal()}{NewUserInfoModal()}
+      {DaySheet()}{Onboarding()}{AutoAssignModal()}{ReconcileModal()}{ConfirmResetModal()}{ConfirmLockModal()}{ConfirmBlockOverModal()}{BlockReportModal()}{ProviderReportModal()}{AllocationSummaryModal()}{FlagDraftModal()}{ListDraftModal()}{TradeDraftModal()}{AddUserModal()}{NewUserInfoModal()}{profile && <ProfileModal/>}
       {toast&&<Toast msg={toast}/>}
     </div>
     </>

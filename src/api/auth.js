@@ -249,6 +249,60 @@ export async function me(req, env) {
   return json({ user, memberships });
 }
 
+// GET /api/auth/verify-email-change?token=xxx
+//   Step 2 of self-service email change (step 1 is profile.js → requestEmailChange).
+//   Clicking the magic-link sent to the NEW address confirms intent and flips users.email.
+//   Sessions are NOT regenerated — the user's existing login keeps working with the new
+//   email on next /api/me poll. Login_tokens / password_attempts keyed on the OLD email
+//   are left in place (harmless; new email starts with a fresh budget).
+export async function verifyEmailChange(req, env) {
+  const url = new URL(req.url);
+  const raw = url.searchParams.get("token");
+  if (!raw) return verifyErrorPage("Missing confirmation token.");
+
+  const tokenHash = await sha256Hex(raw, env.SESSION_PEPPER || "");
+  const row = await q1(
+    env,
+    "SELECT token_hash, user_id, new_email, expires_at, used_at FROM email_change_tokens WHERE token_hash = ?",
+    tokenHash,
+  );
+  if (!row) return verifyErrorPage("This confirmation link is invalid.");
+  if (row.used_at) return verifyErrorPage("This confirmation link has already been used.");
+  if (row.expires_at < nowSec()) return verifyErrorPage("This confirmation link has expired. Request a new one from your profile.");
+
+  // Re-check uniqueness at apply-time — another user may have claimed the email between
+  // request and click.
+  const conflict = await q1(env, "SELECT id FROM users WHERE email = ? AND id != ?", row.new_email, row.user_id);
+  if (conflict) return verifyErrorPage("That email is already in use by another account.");
+
+  await exec(env, "UPDATE users SET email = ? WHERE id = ?", row.new_email, row.user_id);
+  await exec(env, "UPDATE email_change_tokens SET used_at = ? WHERE token_hash = ?", nowSec(), tokenHash);
+
+  return html(emailChangeSuccessPage(row.new_email, env.APP_URL || "/"));
+}
+
+function emailChangeSuccessPage(newEmail, appUrl) {
+  const safeEmail = escapeHtml(newEmail);
+  const safeUrl = escapeHtml(appUrl);
+  return `<!doctype html>
+<html><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Email updated</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; padding: 2rem; max-width: 28rem; margin: 0 auto; color: #0f172a; }
+  h1 { font-size: 1.25rem; margin: 0 0 .5rem; }
+  p { color: #475569; line-height: 1.5; }
+  a.btn { display: inline-block; margin-top: 1rem; padding: .65rem 1rem; background: #2563eb; color: #fff; border-radius: .5rem; text-decoration: none; font-weight: 500; }
+</style>
+</head>
+<body>
+  <h1>Email updated</h1>
+  <p>Your SHIFT sign-in email is now <strong>${safeEmail}</strong>. Use this address (or your username) the next time you sign in.</p>
+  <a class="btn" href="${safeUrl}/">Continue to SHIFT</a>
+</body></html>`;
+}
+
 // HTML response for the verify endpoint. Confirmation page rather than auto-redirect
 // so a wrong-browser click is visible.
 function verifyPage(email, appUrl, inviteNote) {

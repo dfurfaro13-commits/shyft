@@ -100,15 +100,16 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | `templates/shyft_tail.v3.html` | Runtime postamble. Just `<ReactDOM>.render()`. Don't touch. |
 | `index.html` | Built artifact. **Never edit by hand** — gets overwritten. Cloudflare serves this at `/`. |
 | `wrangler.jsonc` | Cloudflare Worker config. Binds the API Worker (`_worker.js`), D1 (`DB`), and R2 (`R2`). |
-| `_worker.js` | Worker entrypoint. Routes `/api/*` to the API; everything else falls through to static assets via `env.ASSETS.fetch`. |
-| `src/api/` | API handlers + `router.js`. Modules: `auth`, `signup`, `users`, `groups`, `owner`, `events`, `snapshots`. |
-| `src/lib/` | Backend helpers (`db`, `session`, `cookies`, `email`, `csrf`, `ids`, `ratelimit`, `http`). |
+| `_worker.js` | Worker entrypoint. Routes `/api/*` to the API; everything else falls through to static assets via `env.ASSETS.fetch`. Apex (`shift-scheduling.com`) and www are both bound as custom domains and serve the app directly — no 301 redirect. Cookies share via `Domain=shift-scheduling.com` (see [src/lib/cookies.js](src/lib/cookies.js)) so a session set on one host is honored on the other. |
+| `src/api/` | API handlers + `router.js`. Modules: `auth`, `signup`, `users`, `groups`, `owner`, `profile` (self-service display name / password / change-email-request), `reset` (forgot-password), `events`, `snapshots`. |
+| `src/lib/` | Backend helpers (`db`, `session`, `cookies`, `email`, `csrf`, `ids`, `ratelimit`, `http`, `passwords`). |
 | `migrations/0001_init.sql` | D1 schema for Phase A: `users`, `groups`, `memberships`, `invites`, `login_tokens`, `sessions`. |
 | `migrations/0002_events.sql` | Phase B append-only event log (`events` table). |
 | `migrations/0003_snapshots.sql` | Phase C per-group state snapshot (`snapshots` table). Latest only — full history lives in R2. |
 | `migrations/0004_users_passwords.sql` | Phase D.1: adds `users.password_hash`, `users.kind`, and `password_attempts` rate-limit table. |
 | `migrations/0005_username_owner.sql` | Phase D.3: adds `users.username` (partial unique), `users.can_create_groups`, `groups.group_code`, `groups.admin_code`, plus `signup_attempts`. Backfills owner permission + group/admin codes from snapshots. |
-| `Phases for Shyft and Rules for shift assignment.docx` | The spec. Source of truth for behavior. Re-read when in doubt. |
+| `migrations/0006_email_changes.sql` | Self-service profile: `email_change_tokens` table backing the magic-link email-confirmation step of `POST /api/me/change-email-request`. |
+| `migrations/0007_password_reset_tokens.sql` | Forgot-password: `password_reset_tokens` table backing `POST /api/auth/forgot-password` + the server-rendered `GET /api/auth/reset-password` form. |
 | `legacy/` | Archived v1/v2 source + built HTML, plus v1-era assignment-algorithm simulators. **Do not read or grep into.** |
 | `~/.claude/plans/*.md` | Planning artifacts. Look for the most recent one for context on the latest change. |
 
@@ -222,6 +223,29 @@ All 26 mutation paths in `ShiftApp.v3.jsx` now fire `trackEvent`, so the D1 even
 
 Reducer's `user.delete` extended in the same D.4.E commit to also cascade `topOptions` (was missing — would have left zombie bid entries on cross-device replay).
 
+### Self-service profile + forgot-password (post-D.4.E)
+
+Two small surfaces layered on top of the Phase D foundation; no protocol changes, just new endpoints.
+
+**Profile** ([src/api/profile.js](src/api/profile.js)) — three endpoints, all require a live session, all CSRF-checked:
+- `PATCH /api/me/profile { displayName }` — updates `users.display_name`. Frontend additionally propagates by firing a `user.update` event into the event log of EVERY group the caller is a member of, so per-group `users[gid][i].name` (what the schedule UI actually renders) stays in sync. For the currently-loaded group it routes through `applyAndTrack`; for other groups it hand-edits each group's localStorage `users[]` + posts a standalone `user.update` event so the next loadGroup/poll on those groups sees the new name.
+- `POST /api/me/password { currentPassword, newPassword }` — re-auths via `verifyPassword` then writes a fresh hash. The current-password gate is what stops a hijacked open session from locking the real user out.
+- `POST /api/me/change-email-request { newEmail }` — uniqueness check, mints a token in `email_change_tokens` (migration 0006), emails a confirmation link to the NEW address via `sendEmailChangeLink` (a sibling of `sendMagicLink` sharing the `sendLink` core in [src/lib/email.js](src/lib/email.js)). The change is applied by `GET /api/auth/verify-email-change?token=…` in [src/api/auth.js](src/api/auth.js), which validates + re-checks uniqueness at apply-time (race against concurrent claims) + flips `users.email`. Existing sessions stay valid; the new email shows on the next `/api/me` poll.
+
+Frontend surface: `ProfileModal` opens when the user clicks their name. Sidebar chip (desktop), avatar (mobile topbar), and an explicit "Profile" button next to "Sign out" in the SuperDashboard topbar all open it. Disabled during impersonation (would edit the owner's profile under the impersonated name).
+
+**Forgot password** ([src/api/reset.js](src/api/reset.js)) — three endpoints:
+- `POST /api/auth/forgot-password { emailOrUsername }` — lookup by email OR username, rate-limited 5/hr per user via row count in `password_reset_tokens` (migration 0007), always returns 204 so callers can't enumerate accounts.
+- `GET /api/auth/reset-password?token=…` — server-rendered HTML form (matches the verify-page style), two password fields + confirm-match in inline JS. Tokens are 32-byte random, single-use, 15-min TTL.
+- `POST /api/auth/reset-password { token, newPassword }` — validates token + applies new hash, revokes other live sessions for the user (forgotten password could imply compromise), mints a fresh session via Set-Cookie. CSRF still required — the form's inline JS adds `X-Requested-With`, so an embed on a third-party site can't drive this.
+
+Frontend: "Forgot password?" link below the magic-link button on the Sign in form. Click → inline form with single "Email or username" input → confirmation message uses deliberately-vague phrasing ("If &lt;input&gt; matches an account…") to avoid leaking account existence.
+
+### Account management ergonomics (today)
+
+- Owner can self-edit through the **Profile** button (the Accounts modal still excludes the caller, per the existing server-side filter).
+- `AccountsEditModal` now requires confirm-twice for both email and password. Each "Confirm" input is disabled until its primary field has content. `submitAccountsEdit` rejects with a specific error before sending if either pair doesn't match. Rationale: an owner typo on a password reset would lock the target user out with no recovery path other than another owner edit.
+
 ---
 
 ## Token efficiency rules
@@ -231,7 +255,7 @@ This is a hobby project on a personal token budget. Follow these rules to keep i
 **Never read the wrong files**
 - **`legacy/` is off-limits.** Never Read, never grep. v1/v2 are frozen archives kept only for git history.
 - **Never Read `index.html`** (the built artifact). It's regenerated by the build script and is just `head + JSX + tail` concatenated. To inspect content, Read `ShiftApp.v3.jsx` (or the head/tail templates). The *only* valid use of `index.html` is the brace-count sanity pipe.
-- **Never Read `Phases for Shyft and Rules for shift assignment.docx`, `Test logins.xlsx`, `svg code for logos.docx`, or any image** unless explicitly asked.
+- **Never Read `Test logins.xlsx`, `svg code for logos.docx`, or any image** unless explicitly asked. (The old `Phases for Shyft and Rules for shift assignment.docx` spec doc has been deleted from the repo — don't try to find it.)
 
 **Read large files in slices**
 - `ShiftApp.v3.jsx` is ~6300 lines. **Always grep first** to find line numbers, then Read with `offset` + `limit`.
@@ -414,7 +438,7 @@ A third alert type inside the admin dashboard's existing **Alerts** card, surfac
 - ✅ Take-style marketplace + Trades page + nav badge
 - ✅ Two-sided trades (post-offer / accept / decline)
 - ✅ Admin-added incentive points on open shifts (`openIncentives` slice)
-- ✅ Calendar/ScheduleList read-only mode in Reconciliation+ (hide personal preferred/blocked overlays)
+- ✅ Provider pages split into **Preferences** (📅 the old SchedulePage — editable per-day Top Option / Preferred / Available / Blocked; in Recon+ the overlays + bid summary stay visible but the controls are locked) and **Schedule** (📅 new — assignments-focused calendar/list, mostly empty in Avail, shows winners + a 🔄 per-slot badge for open marketplace listings in Recon+). Calendar view shared via `CalendarView`; per-page list views are `PreferencesList` + `AssignmentsList`.
 - ✅ Lock/Unlock confirm modals
 - ✅ Block report (source-bucketed per-provider counts)
 - ✅ Alerts module on admin dashboard
@@ -434,6 +458,11 @@ A third alert type inside the admin dashboard's existing **Alerts** card, surfac
 - ✅ Provider report: cross-block aggregate of Block Report (Last N / All blocks selector)
 - ✅ Block report enhancements: Wknd, Spend, Proj columns + per-source percentages
 - ✅ Remaining Issues alert: per-open-slot diagnosis + suggestions during RECON/LOCKED
+- ✅ Self-service Profile modal (display name / email-via-magic-link / password-with-current-password) — `src/api/profile.js` + migration 0006. Opens from sidebar chip, mobile avatar, and owner SuperDashboard topbar.
+- ✅ Forgot-password flow on sign-in screen — `src/api/reset.js` + migration 0007. Server-rendered set-new-password form, single-use 15-min tokens, rate-limited.
+- ✅ AccountsEditModal confirm-twice for email + password.
+- ✅ Provider Report linked from the admin sidebar (📈) as a nav item that opens the existing modal.
+- ✅ Apex (`shift-scheduling.com`) + www both serve directly with shared cookies (`Domain=shift-scheduling.com`); no apex→www 301.
 
 ### Pending (deferred by user)
 - ⏳ Schedule snapshot at Lock (frozen "My final schedule" view per user, persisted with the block).
