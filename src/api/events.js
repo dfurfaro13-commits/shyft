@@ -40,6 +40,11 @@ const ALLOWED_TYPES = new Set([
   // incentive credit.
   "shift.clear-flag",
   "shift.admin-assign",
+  // Provider takes an open (unfilled) slot from the Trades page post-Availability.
+  // Distinct from marketplace.take (which requires a seller); also distinct from
+  // shift.admin-assign (admin-initiated, sets source: "admin"). Reducer credits any
+  // outstanding openIncentives entry to the taker.
+  "shift.take-open",
 ]);
 
 // Bumped 16K → 64K in D.4.A to absorb cascade payloads (e.g. user.delete listing

@@ -938,6 +938,44 @@
         return next;
       },
 
+      // Provider takes an open (unfilled) slot from the Trades page. Mirrors marketplace.take
+      // semantics minus the seller-side logic (there's no seller to debit / listing to flip).
+      // Defensive guard: if the slot already has a winner (race with another taker / admin
+      // assign / auto-swap), no-op. Producer captures incentiveCredit from openIncentives
+      // for idempotent replay (same shape as shift.admin-assign).
+      "shift.take-open": (s, e) => {
+        const { dateKey, slotId, incentiveCredit } = e.payload || {};
+        const taker = uidVal(e.localUid);
+        if (!dateKey || slotId == null || taker == null) return s;
+        const day = s.shifts[dateKey];
+        if (day && day[slotId]) return s;
+        let next = {
+          ...s,
+          shifts: {
+            ...s.shifts,
+            [dateKey]: { ...(day || {}), [slotId]: { uid: taker, auto: false, source: "marketplace" } },
+          },
+        };
+        if (incentiveCredit && incentiveCredit.uid != null && (incentiveCredit.points | 0) > 0) {
+          const credUid = incentiveCredit.uid;
+          const pts = incentiveCredit.points | 0;
+          if (next.openIncentives[dateKey]?.[slotId] != null || next.openIncentives[dateKey]?.[String(slotId)] != null) {
+            const dayOI = { ...next.openIncentives[dateKey] };
+            delete dayOI[slotId];
+            delete dayOI[String(slotId)];
+            const nextOI = { ...next.openIncentives };
+            if (Object.keys(dayOI).length) nextOI[dateKey] = dayOI;
+            else delete nextOI[dateKey];
+            next = { ...next, openIncentives: nextOI };
+          }
+          next = {
+            ...next,
+            users: next.users.map(u => eqId(u.id, credUid) ? { ...u, points: (u.points || 0) + pts } : u),
+          };
+        }
+        return next;
+      },
+
       "shift.flag": (s, e) => {
         const { dateKey, slotId, reason, listing } = e.payload || {};
         if (!dateKey || slotId == null) return s;

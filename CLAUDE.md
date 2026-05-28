@@ -128,7 +128,7 @@ The Cloudflare Worker fronts a D1 database + R2 bucket. As of D.4.D2, cloud is t
 
 ### Phase B — append-only event log
 
-Every meaningful state mutation fires `POST /api/events` to D1. The original call surface was a component-local `trackEvent(type, payload, opts?)` helper; D.4.D2 Phase 3 superseded that with `applyAndTrack`, and `trackEvent` itself was removed for being dead code. The Worker rejects unknown types — to add a new event type, append it to `ALLOWED_TYPES` in `src/api/events.js` first. 26 wired types currently — see D.4.A/B subsections below for the full list. R2 archival of the event log is deferred — D1 is queryable directly and we'll dump monthly archives only when the corpus gets large enough to need it.
+Every meaningful state mutation fires `POST /api/events` to D1. The original call surface was a component-local `trackEvent(type, payload, opts?)` helper; D.4.D2 Phase 3 superseded that with `applyAndTrack`, and `trackEvent` itself was removed for being dead code. The Worker rejects unknown types — to add a new event type, append it to `ALLOWED_TYPES` in `src/api/events.js` first. 27 wired types currently (26 from D.4.A/B + `shift.take-open` for provider self-take from Trades). R2 archival of the event log is deferred — D1 is queryable directly and we'll dump monthly archives only when the corpus gets large enough to need it.
 
 ### Phase C — snapshot sync
 
@@ -383,6 +383,8 @@ marketplace[i] = {
 
 Producers: `postForTake`, `takeListing`, `cancelListing`, `offerTrade`, `acceptTradeOffer`, `declineTradeOffer` — all route through `applyAndTrack`; the corresponding reducers (`marketplace.post` / `.take` / `.cancel` / `trade.offer-*`) own the actual state transitions. Listings appear in the **Trades** page (in nav for both providers and admin). Open count badged on nav.
 
+**Open-shift takes (derived, no listing).** Unfilled slots in the current block are surfaced directly in the Trades page during Recon+Locked under an "OPEN SHIFTS" section — derived from `shifts` (no marketplace listing is created), so the data stays single-sourced. Producer `takeOpenShift(dateKey, slotId)` (mirrors `takeListing`'s policy: hard 1-per-day check, blocked/max NOT enforced — the user is actively choosing) captures any `openIncentives[dateKey][slotId]` into the payload and fires `shift.take-open`. The reducer assigns the taker with `source: "marketplace"`, consumes the `openIncentives` entry, and credits the taker — same incentive-credit shape as `shift.admin-assign`. Nav badge includes open-shift count alongside marketplace listings.
+
 ### Lock-time point crediting
 
 Base earnings (day-pts × slot-credit + non-pref bonus) credit at the **Lock** transition, not at reconcile. Reconcile still applies bid debits, availability penalties, and open-shift incentive credits immediately; earnings stay deferred until the admin locks the block.
@@ -463,6 +465,9 @@ A third alert type inside the admin dashboard's existing **Alerts** card, surfac
 - ✅ AccountsEditModal confirm-twice for email + password.
 - ✅ Provider Report linked from the admin sidebar (📈) as a nav item that opens the existing modal.
 - ✅ Apex (`shift-scheduling.com`) + www both serve directly with shared cookies (`Domain=shift-scheduling.com`); no apex→www 301.
+- ✅ Open-shift takes in Trades: `shift.take-open` event + reducer + `takeOpenShift` producer; derived "OPEN SHIFTS" section in Trades during Recon+Locked, with the day's `openIncentives` credit transferred on take.
+- ✅ Recon/Locked calendar shading: filled days use `bg-blue-50` (Recon) / `bg-emerald-50` (Locked) instead of the orange "Available" shading; orange in non-Availability now means "still has an open slot". Phase-aware legend hides Preferred/Top Option/Blocked entries outside Availability.
+- ✅ Hard-to-fill (admin ⚠) now fires on any unfilled slot in-block post-Availability — not just the original "all-auto + nobody preferred + ≥50% blocked" coverage rule. Gated to in-block dates.
 
 ### Pending (deferred by user)
 - ⏳ Schedule snapshot at Lock (frozen "My final schedule" view per user, persisted with the block).

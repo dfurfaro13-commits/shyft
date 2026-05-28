@@ -938,6 +938,44 @@
         return next;
       },
 
+      // Provider takes an open (unfilled) slot from the Trades page. Mirrors marketplace.take
+      // semantics minus the seller-side logic (there's no seller to debit / listing to flip).
+      // Defensive guard: if the slot already has a winner (race with another taker / admin
+      // assign / auto-swap), no-op. Producer captures incentiveCredit from openIncentives
+      // for idempotent replay (same shape as shift.admin-assign).
+      "shift.take-open": (s, e) => {
+        const { dateKey, slotId, incentiveCredit } = e.payload || {};
+        const taker = uidVal(e.localUid);
+        if (!dateKey || slotId == null || taker == null) return s;
+        const day = s.shifts[dateKey];
+        if (day && day[slotId]) return s;
+        let next = {
+          ...s,
+          shifts: {
+            ...s.shifts,
+            [dateKey]: { ...(day || {}), [slotId]: { uid: taker, auto: false, source: "marketplace" } },
+          },
+        };
+        if (incentiveCredit && incentiveCredit.uid != null && (incentiveCredit.points | 0) > 0) {
+          const credUid = incentiveCredit.uid;
+          const pts = incentiveCredit.points | 0;
+          if (next.openIncentives[dateKey]?.[slotId] != null || next.openIncentives[dateKey]?.[String(slotId)] != null) {
+            const dayOI = { ...next.openIncentives[dateKey] };
+            delete dayOI[slotId];
+            delete dayOI[String(slotId)];
+            const nextOI = { ...next.openIncentives };
+            if (Object.keys(dayOI).length) nextOI[dateKey] = dayOI;
+            else delete nextOI[dateKey];
+            next = { ...next, openIncentives: nextOI };
+          }
+          next = {
+            ...next,
+            users: next.users.map(u => eqId(u.id, credUid) ? { ...u, points: (u.points || 0) + pts } : u),
+          };
+        }
+        return next;
+      },
+
       "shift.flag": (s, e) => {
         const { dateKey, slotId, reason, listing } = e.payload || {};
         if (!dateKey || slotId == null) return s;
@@ -3400,20 +3438,24 @@ function ShiftApp() {
   };
   const newLinkId = () => `link_${Math.random().toString(36).slice(2, 8)}`;
 
-  // Post-reconcile admin insight: flag days that were hard to cover.
+  // Post-Availability admin insight: flag days that were hard to cover.
   //   hasAuto     — at least one slot was auto-assigned (nobody volunteered for it)
-  //   challenging — ALL filled slots auto AND nobody preferred AND ≥50% of providers blocked it.
-  //                 These are the dates the admin had to fight for coverage on, and are worth
-  //                 spot-checking when planning the next block.
+  //   challenging — EITHER one or more slots remain open (couldn't be filled at all),
+  //                 OR all filled slots are auto AND nobody preferred AND ≥50% of providers blocked it.
+  //                 These are the dates worth spot-checking when planning the next block.
+  //   challengingReason — short hover string explaining which condition tripped.
+  // Only meaningful post-Availability — during signup assignment hasn't happened yet.
   const dayInsights = k => {
     if(me?.role!=="admin") return null;
+    if(!inBlock(k, config)) return null;
     const day = shifts[k]||{};
     const entries = Object.values(day);
     const filled = entries.filter(e=>getUid(e));
-    if(filled.length===0) return null;
+    const totalSlots = config.shiftSlots.length;
+    const openCount = Math.max(0, totalSlots - filled.length);
     const autoFilled = filled.filter(isAuto).length;
     const hasAuto = autoFilled>0;
-    const allAuto = autoFilled===filled.length;
+    const allAuto = filled.length>0 && autoFilled===filled.length;
     const provs = users.filter(u=>u.role==="provider");
     let blockedCount=0, preferredCount=0;
     for(const p of provs){
@@ -3421,8 +3463,15 @@ function ShiftApp() {
       if(isWanted(p.id,k)) preferredCount++;
     }
     const blockRate = provs.length ? blockedCount/provs.length : 0;
-    const challenging = allAuto && preferredCount===0 && blockRate>=0.5;
-    return { hasAuto, allAuto, challenging, blockedCount, preferredCount, totalProvs:provs.length, blockRate };
+    const postAvail = !isAvailabilityOpen(currentBlock);
+    const hardByOpen = openCount>0;
+    const hardByCoverage = allAuto && preferredCount===0 && blockRate>=0.5;
+    const challenging = postAvail && (hardByOpen || hardByCoverage);
+    // Prefer the open-slot reason when both fire — it's the more pressing problem.
+    const challengingReason = !challenging ? null
+      : hardByOpen ? `${openCount} slot${openCount===1?"":"s"} still open`
+      : `${blockedCount}/${provs.length} blocked · 0 preferred · all slots auto-assigned`;
+    return { hasAuto, allAuto, challenging, challengingReason, blockedCount, preferredCount, totalProvs:provs.length, blockRate, openCount };
   };
 
   // v3.1 Top Option setter — replaces joinPool. Adds/updates the user's per-day commitment.
@@ -4245,6 +4294,26 @@ function ShiftApp() {
       incentivePts: listing.incentivePts,
     });
     flash(`✅ Shift taken${listing.incentivePts>0?` · +${listing.incentivePts} pt${listing.incentivePts===1?"":"s"}`:""}`);
+  };
+
+  // Provider claims an open (unfilled) slot from the Trades page. Mirrors takeListing's
+  // policy: hard 1-per-day rule, but blocked-day / max-shift caps are NOT enforced — the
+  // user is actively choosing this slot. Only available in Recon+Locked (open slots don't
+  // appear in Trades during Availability). If the admin set an openIncentive on the slot,
+  // we capture it into the payload so the reducer can credit + consume it atomically.
+  const takeOpenShift = async (dateKey, slotId) => {
+    if(!me || me.role !== "provider") { flash("⚠️ Only providers can take shifts"); return; }
+    if(!me.seniorityId) { flash("⚠️ Seniority not assigned"); return; }
+    if(isAvailabilityOpen(currentBlock)) { flash("⚠️ Open shifts can be taken once the block closes"); return; }
+    const entry = shifts[dateKey]?.[slotId];
+    if(entry) { flash("⚠️ Slot just filled — refresh"); return; }
+    if(Object.values(shifts[dateKey]||{}).some(e => getUid(e) === me.id)) {
+      flash("⚠️ You already have a shift this day"); return;
+    }
+    const incPts = openIncentives?.[dateKey]?.[slotId] | 0;
+    const incentiveCredit = incPts > 0 ? { uid: String(me.id), points: incPts } : null;
+    await applyAndTrack("shift.take-open", { dateKey, slotId, incentiveCredit });
+    flash(`✅ Shift taken${incPts > 0 ? ` · +${incPts} pt${incPts === 1 ? "" : "s"}` : ""}`);
   };
 
   // Seller (or admin) cancels an open listing. Doesn't unassign the shift.
@@ -6007,10 +6076,21 @@ function ShiftApp() {
             const dimmed=filterUid&&inB&&!filterHit;
             // v3.1: simplified palette — red=blocked, green=preferred/top-option, orange=available.
             // Points are no longer encoded in the cell bg; they appear as a number in the top-right corner.
-            const bg=!inB?"bg-slate-50":myUn?"bg-red-100":(myWant||myTop)?"bg-emerald-100":"bg-orange-100";
+            // Recon/Locked: provider preference states (myUn/myWant/myTop) are already zeroed-out by the
+            // availPhase gate above, so for a fully-filled day we shade blue-50 (recon) or emerald-50
+            // (locked) instead of falling through to orange (which would misleadingly suggest "open").
+            const allFilled = inB && filled === total;
+            const lockedPhase = isLocked(currentBlock);
+            const bg=!inB?"bg-slate-50"
+              :myUn?"bg-red-100"
+              :(myWant||myTop)?"bg-emerald-100"
+              :(!availPhase && allFilled)?(lockedPhase?"bg-emerald-50":"bg-blue-50")
+              :"bg-orange-100";
             const insights = dayInsights(key);
             const adminChallenging = !!insights?.challenging;
             const adminHasAuto = !!insights?.hasAuto;
+            // 🔄 marker for any open marketplace listing on this day (mirrors AssignmentsList behavior).
+            const dayHasListing = marketplace.some(l=>l.status==="open" && l.dateKey===key);
             // Ring: filter match (purple) > my shift (green) > my Top Option (blue) > admin challenge (orange).
             const ring=filterUid?(filterHit?"ring-2 ring-purple-500":""):(myShift?"ring-2 ring-green-500":myTop?"ring-2 ring-blue-400":adminChallenging?"ring-2 ring-orange-500":"");
             return(
@@ -6020,10 +6100,11 @@ function ShiftApp() {
                 onKeyDown={inB?(e)=>{if(e.key==="Enter"||e.key===" "){e.preventDefault(); setEditingDay(key);}}:undefined}>
                 <div className="flex items-center justify-between leading-none gap-0.5">
                   <span className="font-semibold text-slate-700 text-xs flex items-center gap-0.5 min-w-0">
-                    {adminChallenging&&<span className="text-orange-600" title="Hard to fill — nobody preferred, most blocked, all slots auto-assigned">⚠</span>}
+                    {adminChallenging&&<span className="text-orange-600" title={`Hard to fill — ${insights.challengingReason}`}>⚠</span>}
                     <span>{d}</span>
                   </span>
                   <span className="flex items-center gap-0.5 flex-shrink-0">
+                    {dayHasListing&&<span className="text-[9px] text-blue-600" title="One or more slots posted for take or trade">🔄</span>}
                     {adminHasAuto&&!adminChallenging&&<span className="text-[9px] text-amber-600" title="Contains auto-assigned slots">⚙</span>}
                     {availPhase && me.role==="admin" && dayTopCount>0 && <span className="text-[9px] text-blue-600 font-bold" title={`${dayTopCount} Top Option${dayTopCount===1?"":"s"}`}>🎯{dayTopCount}</span>}
                     {pts>0&&<span className="text-xs sm:text-sm font-semibold text-slate-700 tabular-nums">+{pts}</span>}
@@ -6088,13 +6169,19 @@ function ShiftApp() {
           })}
         </div>
         <div className="flex flex-wrap gap-x-3 gap-y-1 mt-3 text-[11px] text-slate-500">
-          <Legend color="bg-orange-100" label="Available"/>
-          {me.role==="provider"&&<Legend color="bg-emerald-100" label="Preferred / Top Option"/>}
-          {me.role==="provider"&&<Legend color="bg-red-100" label="Blocked"/>}
-          {me.role==="provider"&&<span className="flex items-center gap-1"><span className="text-amber-500">★</span>Preferred</span>}
-          {me.role==="provider"&&<span className="flex items-center gap-1"><span className="text-blue-600">🎯</span>Top Option</span>}
-          {me.role==="provider"&&<Legend ring="ring-2 ring-blue-400" label="Your Top Option"/>}
-          <Legend ring="ring-2 ring-green-500" label="Awarded"/>
+          {/* Availability: orange = user-state "Available"; Recon/Locked: orange = day still has an open slot. */}
+          <Legend color="bg-orange-100" label={isAvailabilityOpen(currentBlock) ? "Available" : "Has open slot"}/>
+          {/* New post-Availability shadings: blue=filled (recon, awaiting lock), emerald=filled & locked. */}
+          {isReconciling(currentBlock) && <Legend color="bg-blue-50" label="Filled"/>}
+          {isLocked(currentBlock) && <Legend color="bg-emerald-50" label="Filled & locked"/>}
+          {/* Preferred/Top Option/Blocked legend items only relevant during Availability. */}
+          {isAvailabilityOpen(currentBlock) && me.role==="provider"&&<Legend color="bg-emerald-100" label="Preferred / Top Option"/>}
+          {isAvailabilityOpen(currentBlock) && me.role==="provider"&&<Legend color="bg-red-100" label="Blocked"/>}
+          {isAvailabilityOpen(currentBlock) && me.role==="provider"&&<span className="flex items-center gap-1"><span className="text-amber-500">★</span>Preferred</span>}
+          {isAvailabilityOpen(currentBlock) && me.role==="provider"&&<span className="flex items-center gap-1"><span className="text-blue-600">🎯</span>Top Option</span>}
+          {isAvailabilityOpen(currentBlock) && me.role==="provider"&&<Legend ring="ring-2 ring-blue-400" label="Your Top Option"/>}
+          <Legend ring="ring-2 ring-green-500" label="My Shifts"/>
+          <span className="flex items-center gap-1"><span className="text-blue-600">🔄</span>On marketplace</span>
           {filterUid&&<Legend ring="ring-2 ring-purple-500" label="Filtered user"/>}
           {me.role==="admin"&&<Legend ring="ring-2 ring-orange-500" label="⚠ Hard to fill"/>}
           {me.role==="admin"&&<span className="flex items-center gap-1"><span className="text-amber-600">⚙</span>Auto-filled</span>}
@@ -6141,7 +6228,7 @@ function ShiftApp() {
                   {myUn&&<span className="text-[10px] bg-red-200 text-red-900 px-1.5 py-0.5 rounded-full font-semibold">✕ Blocked</span>}
                   {adminChallenging&&(
                     <span className="text-[10px] bg-orange-100 text-orange-800 border border-orange-300 px-1.5 py-0.5 rounded-full font-semibold"
-                      title={`${insights.blockedCount}/${insights.totalProvs} blocked · 0 preferred · all slots auto-assigned`}>
+                      title={insights.challengingReason}>
                       ⚠ Hard to fill
                     </span>
                   )}
@@ -6886,7 +6973,7 @@ function ShiftApp() {
                   if(u) return(
                     <span key={s.id} className={`text-[10px] px-2 py-0.5 rounded-full font-semibold ${isMe?"bg-emerald-100 text-emerald-800":"text-white"}`}
                       style={!isMe?{background:s.color}:{}}>
-                      {s.name}: {isMe?"You":u.name.split(" ")[0]}{auto?" ⚙":""}
+                      {s.name}: {isMe?"You":u.name}{auto?" ⚙":""}
                     </span>
                   );
                   return <span key={s.id} className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-white border-2"
@@ -7131,7 +7218,7 @@ function ShiftApp() {
                 if (u) return (
                   <span key={s.id} className={`text-[10px] px-2 py-0.5 rounded-full font-semibold inline-flex items-center gap-1 ${isMe ? "bg-emerald-100 text-emerald-800" : "text-white"}`}
                     style={!isMe ? { background: s.color } : {}}>
-                    {s.name}: {isMe ? "You" : u.name.split(" ")[0]}{auto ? " ⚙" : ""}
+                    {s.name}: {isMe ? "You" : u.name}{auto ? " ⚙" : ""}
                     {listing && <span className="text-[10px]" title={`Posted for take/trade · incentive +${listing.incentivePts||0}`}>🔄</span>}
                   </span>
                 );
@@ -7296,6 +7383,28 @@ function ShiftApp() {
     const myOpen = open.filter(l => eqId(l.sellerId, me.id));
     const otherOpen = open.filter(l => String(l.sellerId) !== String(me.id));
     const recentDone = marketplace.filter(l => l.status !== "open").sort((a,b) => (b.takenAt||0) - (a.takenAt||0)).slice(0, 8);
+    // Open (unfilled) slots in the current block, derived directly from `shifts` — no
+    // listing object is created. Only surfaced in Reconciliation+Locked (in Availability
+    // open slots are normal during signup). Sorted by date then slot.
+    const showOpenShifts = phaseOf(currentBlock) !== PHASE.AVAIL;
+    const openShifts = showOpenShifts
+      ? blockDays.flatMap(dateKey =>
+          config.shiftSlots
+            .filter(s => !shifts[dateKey]?.[s.id])
+            .map(s => ({
+              dateKey,
+              slotId: s.id,
+              incentivePts: openIncentives?.[dateKey]?.[s.id] | 0,
+            }))
+        )
+      : [];
+    // Open-shift eligibility — mirrors canTake but with no seller-side checks.
+    const canTakeOpen = (o) => {
+      if(me.role !== "provider") return { ok:false, why:"Admin can't take shifts" };
+      if(!me.seniorityId) return { ok:false, why:"No seniority assigned" };
+      if(Object.values(shifts[o.dateKey]||{}).some(e => getUid(e) === me.id)) return { ok:false, why:"Already on this day" };
+      return { ok:true };
+    };
     // Eligibility precheck for "Take" button — purely cosmetic disable; takeListing also re-checks.
     const canTake = (l) => {
       if(me.role !== "provider") return { ok:false, why:"Admin can't take shifts" };
@@ -7414,18 +7523,50 @@ function ShiftApp() {
         </div>
       );
     };
+    const totalActive = open.length + openShifts.length;
     return(<>
       <h1 className="text-2xl font-semibold mb-1">Trades</h1>
       <p className="text-sm text-slate-500 mb-4">
-        Open listings · {open.length} active.
+        {totalActive} active.
         {phaseOf(currentBlock)===PHASE.AVAIL && <span className="block text-amber-700 mt-1">Trades open once the block enters Reconciliation.</span>}
       </p>
-      {open.length===0
+      {totalActive===0
         ? <div className="bg-white rounded-xl border border-slate-200 p-8 text-center">
             <div className="text-3xl mb-2">🔄</div>
             <p className="text-sm text-slate-500">No open listings right now.</p>
           </div>
         : (<>
+            {openShifts.length>0 && (<div className="mb-4">
+              <div className="text-xs font-medium text-slate-500 mb-2 px-1">OPEN SHIFTS ({openShifts.length})</div>
+              <div className="space-y-2">{openShifts.map(o => {
+                const slot = config.shiftSlots.find(s => s.id === o.slotId);
+                const date = parseDk(o.dateKey);
+                const elig = canTakeOpen(o);
+                return (
+                  <div key={`${o.dateKey}_${o.slotId}`} className="bg-surface rounded-xl border border-slate-200 p-3 flex items-center gap-3">
+                    <div className="w-12 h-12 rounded-lg bg-slate-50 flex flex-col items-center justify-center flex-shrink-0">
+                      <div className="text-[10px] font-bold text-slate-500">{DAYS_SHORT[date.getDay()]}</div>
+                      <div className="text-lg font-bold">{date.getDate()}</div>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-1.5 mb-0.5">
+                        <span className="font-medium text-sm">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}</span>
+                        <span className="font-bold text-xs px-2 py-0.5 rounded text-white" style={{background:slot?.color}}>{slot?.name}</span>
+                        {o.incentivePts>0 && <span className="text-[10px] bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded-full font-bold">+{o.incentivePts} pt incentive</span>}
+                      </div>
+                      <div className="text-xs text-slate-500">Unfilled — open to anyone</div>
+                    </div>
+                    {me.role==="provider" && (
+                      <button onClick={()=>takeOpenShift(o.dateKey, o.slotId)} disabled={!elig.ok}
+                        title={elig?.why || ""}
+                        className="text-xs font-bold px-3 py-1.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed whitespace-nowrap">
+                        {elig.ok ? "Take" : (elig?.why || "Can't take")}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}</div>
+            </div>)}
             {myOpen.length>0 && (<div className="mb-4">
               <div className="text-xs font-medium text-slate-500 mb-2 px-1">YOUR LISTINGS ({myOpen.length})</div>
               <div className="space-y-2">{myOpen.map(renderListing)}</div>
@@ -8487,7 +8628,13 @@ function ShiftApp() {
 
   // Nav — Trades is shared (open listings live across providers + admin). Badge with count
   // is computed inline below.
-  const openTradeCount = marketplace.filter(l => l.status === "open").length;
+  // Nav badge: open marketplace listings + derived open (unfilled) slots in the current
+  // block, post-Availability. Open slots aren't surfaced as takeable during Availability,
+  // so they shouldn't count there.
+  const openShiftCount = phaseOf(currentBlock) !== PHASE.AVAIL
+    ? blockDays.reduce((n, dk) => n + config.shiftSlots.filter(s => !shifts[dk]?.[s.id]).length, 0)
+    : 0;
+  const openTradeCount = marketplace.filter(l => l.status === "open").length + openShiftCount;
   // Items with `onClick` fire that action instead of navigating (used for modal-only destinations
   // like Provider Report). Mobile bottom nav filters these out to stay compact.
   const navItems = me.role==="admin"
