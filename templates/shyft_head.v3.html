@@ -904,18 +904,22 @@
         const { dateKey, slotId, uid, incentiveCredit } = e.payload || {};
         if (!dateKey || slotId == null) return s;
         let nextShifts = { ...s.shifts };
+        let nextMarketplace = s.marketplace;
         if (uid == null) {
           if (!nextShifts[dateKey] || !nextShifts[dateKey][slotId]) return s;
           nextShifts[dateKey] = { ...nextShifts[dateKey] };
           delete nextShifts[dateKey][slotId];
           if (!Object.keys(nextShifts[dateKey]).length) delete nextShifts[dateKey];
+          // Cleared slot can't have an active auto-posted listing (the shift is gone, so the
+          // "for sale" listing is meaningless). closeAutoListingFor is a no-op if none exists.
+          nextMarketplace = closeAutoListingFor(s.marketplace, dateKey, slotId);
         } else {
           nextShifts[dateKey] = {
             ...(nextShifts[dateKey] || {}),
             [slotId]: { uid: uidVal(uid), auto: false, source: "admin" },
           };
         }
-        let next = { ...s, shifts: nextShifts };
+        let next = { ...s, shifts: nextShifts, marketplace: nextMarketplace };
         if (incentiveCredit && incentiveCredit.uid != null && (incentiveCredit.points|0) > 0) {
           const credUid = incentiveCredit.uid;
           const pts = incentiveCredit.points | 0;

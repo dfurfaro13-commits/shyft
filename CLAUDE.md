@@ -405,12 +405,26 @@ At reconcile, the producer captures `targetsAtClose = {uid: {min, ideal, max}}` 
 
 Two admin-only modals reachable from the dashboard's Quick Actions:
 
-- **📊 Block report** (existing) — totals + per-provider breakdown for the active block. Per-provider table columns: Provider | Total | M/I/Mx | Top | Pref | Avail | Adm | Wknd | Spend | Proj. Source-bucket counts carry a `(P%)` suffix relative to the row's total (omitted for zeros). `Spend` is current `users.points`; `Proj` is `points + getPtsEarned − pendingPenalty` (`pendingPenalty` only non-zero in AVAIL). After lock, Proj == Spend by construction.
-- **📈 Provider report** (new) — same layout aggregated over N blocks via a top-of-modal "Last N / All blocks" dropdown. Sums source buckets across selected blocks; M/I/Mx sums per-block via each block's `targetsAtClose` snapshot (falls back to current values for pre-feature blocks with an amber footnote flag). Spend/Proj remain point-in-time. Selecting "Last 1 block" produces output equivalent to Block Report on the current block.
+- **📊 Block report** (existing) — totals + per-provider breakdown for the active block. Per-provider table columns: Provider | Total | M/I/Mx | Top | Pref | Avail | Adm | Wknd | Spend | Proj. Source-bucket counts carry a `(P%)` suffix relative to the row's total (omitted for zeros). `Spend` is current `users.points`; `Proj` is the *not-yet-credited delta* `getPtsEarned − pendingPenalty` (pending earnings minus the AVAIL-only availability penalty). So in AVAIL it's the projected net swing through reconcile + lock; in RECON it's just the pending earnings; in LOCKED it's 0 (earnings already in `users.points`). Spend + Proj equals the projected final balance.
+- **📈 Provider report** (new) — same layout aggregated over N blocks via a top-of-modal "Last N / All blocks" dropdown. Sums source buckets across selected blocks; M/I/Mx sums per-block via each block's `targetsAtClose` snapshot (falls back to current values for pre-feature blocks with an amber footnote flag). Spend (current bank) and Proj (current-block not-yet-credited delta) remain point-in-time, not summed. Selecting "Last 1 block" produces output equivalent to Block Report on the current block.
 
 ### Remaining Issues alert
 
 A third alert type inside the admin dashboard's existing **Alerts** card, surfacing during **Reconciliation + Locked** phases when there are unfilled slots. `diagnoseOpenShifts()` walks every open `(dateKey, slotId)` and classifies each provider's state on that date into one of: `blocked` / `topOptOtherSlot` (Top-Optioned the day but won the other slot) / `preferredAtMax` / `availableAtMax` / `alreadyOnDay` / `eligible`. The per-slot row shows reasons (e.g. "3 preferred this day but are at max (Alice, Bob, Carol)") plus suggestions (manual assign one of N eligible / raise max / unblock outreach / set an incentive), with an "Open day →" button that opens the existing DaySheet for that date. Hidden in AVAIL (open slots are normal during signup).
+
+### Flagged Shifts alert + Make open action
+
+A fourth alert row inside **Alerts**, plus an action on the existing **Flagged shifts** recommendations module below. Both surfaces share one `flaggedAlerts` array (computed once in `AdminHome`) — Alerts shows the count + first 5 rows so the admin notices; the module below renders the full swap / trade / Clear flag / Make open UI per flag.
+
+**Detection signal — union of two paths.** Flagged state desyncs cheaply: `shift.clear-flag` wipes `confirm` but leaves the listing, `marketplace.take` sets `confirm:null`, an admin slot-clear leaves the auto-listing orphaned. So `flaggedAlerts` unions:
+- (a) shift entries with `confirm === "flagged"` and a uid (the still-live flags), and
+- (b) open `marketplace` listings with `autoPosted === true` (the orange "flagged" pill on Trades — catches orphans).
+
+Deduped by `(dateKey, slotId)`, `flagReason` coalesced from either source, `originalUid` from the shift uid when present else `listing.sellerId`. Both gated to `blockDays` so cross-block listings don't bleed in.
+
+**Make open action.** The per-flag card has two action buttons now: "Clear flag" (existing — unflags but leaves the shift assigned) and "Make open" (new — vacates the slot, slot then appears under Trades' Open shifts). Producer `removeFlaggedShift` branches: if the shift entry has a uid, fire `shift.admin-assign` with `uid:null` (the reducer now also calls `closeAutoListingFor` so the listing-close is atomic with the slot-clear); if the entry is empty but an open auto-listing exists, fire `marketplace.cancel` directly.
+
+The `shift.admin-assign` reducer change is the natural cleanup — a cleared slot can't have a meaningful "for sale" listing — so it benefits every admin-clear path, not just the flagged module. `closeAutoListingFor` is a no-op when no open auto-listing exists, so existing callsites are unaffected.
 
 ---
 
@@ -468,6 +482,8 @@ A third alert type inside the admin dashboard's existing **Alerts** card, surfac
 - ✅ Open-shift takes in Trades: `shift.take-open` event + reducer + `takeOpenShift` producer; derived "OPEN SHIFTS" section in Trades during Recon+Locked, with the day's `openIncentives` credit transferred on take.
 - ✅ Recon/Locked calendar shading: filled days use `bg-blue-50` (Recon) / `bg-emerald-50` (Locked) instead of the orange "Available" shading; orange in non-Availability now means "still has an open slot". Phase-aware legend hides Preferred/Top Option/Blocked entries outside Availability.
 - ✅ Hard-to-fill (admin ⚠) now fires on any unfilled slot in-block post-Availability — not just the original "all-auto + nobody preferred + ≥50% blocked" coverage rule. Gated to in-block dates.
+- ✅ Block / Provider Report `Proj` column shows the not-yet-credited delta (`getPtsEarned − pendingPenalty`) instead of bank + delta — so Spend + Proj = projected final balance; Proj goes to 0 once the block is locked.
+- ✅ Flagged Shifts alert on the admin dashboard + "Make open" action on the Flagged shifts module. Detection signal is the union of `entry.confirm === "flagged"` AND open `marketplace.autoPosted` listings (catches orphan listings where the shift was reassigned/cleared but the auto-listing lingered). `shift.admin-assign` reducer with `uid:null` now also calls `closeAutoListingFor` so slot-clear and listing-close are atomic.
 
 ### Pending (deferred by user)
 - ⏳ Schedule snapshot at Lock (frozen "My final schedule" view per user, persisted with the block).

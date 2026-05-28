@@ -904,18 +904,22 @@
         const { dateKey, slotId, uid, incentiveCredit } = e.payload || {};
         if (!dateKey || slotId == null) return s;
         let nextShifts = { ...s.shifts };
+        let nextMarketplace = s.marketplace;
         if (uid == null) {
           if (!nextShifts[dateKey] || !nextShifts[dateKey][slotId]) return s;
           nextShifts[dateKey] = { ...nextShifts[dateKey] };
           delete nextShifts[dateKey][slotId];
           if (!Object.keys(nextShifts[dateKey]).length) delete nextShifts[dateKey];
+          // Cleared slot can't have an active auto-posted listing (the shift is gone, so the
+          // "for sale" listing is meaningless). closeAutoListingFor is a no-op if none exists.
+          nextMarketplace = closeAutoListingFor(s.marketplace, dateKey, slotId);
         } else {
           nextShifts[dateKey] = {
             ...(nextShifts[dateKey] || {}),
             [slotId]: { uid: uidVal(uid), auto: false, source: "admin" },
           };
         }
-        let next = { ...s, shifts: nextShifts };
+        let next = { ...s, shifts: nextShifts, marketplace: nextMarketplace };
         if (incentiveCredit && incentiveCredit.uid != null && (incentiveCredit.points|0) > 0) {
           const credUid = incentiveCredit.uid;
           const pts = incentiveCredit.points | 0;
@@ -3211,14 +3215,15 @@ function ShiftApp() {
       const ideal = p.targets?.ideal || 0;
       const max = p.targets?.max || 0;
       const row = perUser[p.id];
-      // Spendable = current bank (users.points). Projected = bank + pending earnings - any
-      // not-yet-applied availability penalty. getPtsEarned auto-zeroes once the block is locked
-      // (earnings now live in the bank), and pendingPenalty is only non-zero in AVAIL (the
-      // penalty hits the bank at reconcile). So post-lock, projected == spendable.
+      // Spendable = current bank (users.points). Projected = the not-yet-credited delta that
+      // will land by the time this block locks (pending earnings minus pending avail penalty).
+      // getPtsEarned auto-zeroes once the block is locked (earnings now live in the bank), and
+      // pendingPenalty is only non-zero in AVAIL (penalty hits the bank at reconcile). So
+      // post-lock, projected == 0.
       const spendable = p.points || 0;
       const earnedProj = getPtsEarned(p.id);
       const pendingPenalty = inAvail ? (getAvailInfo(p.id).penalty || 0) : 0;
-      const projected = spendable + earnedProj - pendingPenalty;
+      const projected = earnedProj - pendingPenalty;
       return { user:p, ...row, min, ideal, max, spendable, projected };
     }).sort((a,b) => b.total - a.total || a.user.name.localeCompare(b.user.name));
     return { totalSlots, bySource, openSlots, pendingPool, perUserRows };
@@ -3298,7 +3303,7 @@ function ShiftApp() {
       const spendable = p.points || 0;
       const earnedProj = getPtsEarned(p.id);
       const pendingPenalty = inAvailNow ? (getAvailInfo(p.id).penalty || 0) : 0;
-      const projected = spendable + earnedProj - pendingPenalty;
+      const projected = earnedProj - pendingPenalty;
       return { user:p, ...row, spendable, projected };
     }).sort((a,b) => b.total - a.total || a.user.name.localeCompare(b.user.name));
     return { totalSlots, bySource, openSlots, pendingPool, perUserRows, blocks, anyTargetsFallback };
@@ -4220,6 +4225,28 @@ function ShiftApp() {
     if(!entry) return;
     await applyAndTrack("shift.clear-flag", { dateKey, slotId });
     flash("Flag cleared");
+  };
+
+  // Admin removes a flagged shift entirely — vacates the slot and closes the auto-posted
+  // listing, leaving the slot in the same "open shift" state as anything else unfilled in the
+  // block. Two paths because the flagged module also surfaces orphan auto-listings (where the
+  // shift entry is already cleared but the listing lingered):
+  //   - entry has a uid: adminAssign(null) clears the shift; the reducer's shift.admin-assign
+  //     now also closes any matching open auto-listing in the same event.
+  //   - entry is null/empty but an open auto-listing exists: just fire marketplace.cancel.
+  const removeFlaggedShift = async (dateKey, slotId) => {
+    if(!me || me.role !== "admin") return;
+    const entry = shifts[dateKey]?.[slotId];
+    if(entry && getUid(entry) != null){
+      await adminAssign(dateKey, slotId, null);
+      flash("Shift removed · slot now open");
+      return;
+    }
+    const listing = marketplace.find(l => l.dateKey === dateKey && Number(l.slotId) === Number(slotId) && l.status === "open" && l.autoPosted);
+    if(listing){
+      await applyAndTrack("marketplace.cancel", { listingId: listing.id });
+      flash("Listing cleared · slot already open");
+    }
   };
 
   // Provider flags an awarded shift. v3.2: silent auto-swap removed — every flag goes to admin
@@ -5216,7 +5243,7 @@ function ShiftApp() {
                         <th className="text-right py-2 px-1.5" title="Admin manual. Percent is of this provider's total.">Adm</th>
                         <th className="text-right py-2 px-1.5" title="Weekend (Sat/Sun) shifts. Percent is of this provider's total.">Wknd</th>
                         <th className="text-right py-2 px-1.5" title="Spendable points — current bank balance.">Spend</th>
-                        <th className="text-right py-2 px-1.5" title="Projected points — bank plus pending earnings, minus any not-yet-applied availability penalty. Equals Spend once the block is locked.">Proj</th>
+                        <th className="text-right py-2 px-1.5" title="Projected delta — pending earnings minus any not-yet-applied availability penalty. The change Spend will see by the time this block locks. Goes to 0 once locked.">Proj</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -5266,7 +5293,9 @@ function ShiftApp() {
   // Provider Report — same layout as Block Report, but aggregated across N selected blocks.
   // Admin picks "Last N blocks" or "All blocks" via the top dropdown. Source buckets sum across
   // blocks; M/I/Mx targets sum using each block's targetsAtClose snapshot (with fallback to
-  // current values for pre-feature blocks). Spendable/Projected are point-in-time, not summed.
+  // current values for pre-feature blocks). Spendable is point-in-time (current bank). Projected
+  // is the not-yet-credited delta that will land when the current block locks (always 0 if the
+  // current block is already locked) — not summed across the selected blocks.
   const ProviderReportModal = () => {
     if(!showProviderReport) return null;
     const r = getProviderReport(providerReportN);
@@ -5356,7 +5385,7 @@ function ShiftApp() {
                         <th className="text-right py-2 px-1.5" title="Admin manual. Percent is of this provider's total.">Adm</th>
                         <th className="text-right py-2 px-1.5" title="Weekend (Sat/Sun) shifts. Percent is of this provider's total.">Wknd</th>
                         <th className="text-right py-2 px-1.5" title="Spendable points — current bank balance (point-in-time).">Spend</th>
-                        <th className="text-right py-2 px-1.5" title="Projected points — bank plus pending earnings on the current block, minus any not-yet-applied availability penalty. Point-in-time.">Proj</th>
+                        <th className="text-right py-2 px-1.5" title="Projected delta — pending earnings on the current block minus any not-yet-applied availability penalty. The change Spend will see by the time the current block locks. Goes to 0 once locked.">Proj</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -6349,6 +6378,39 @@ function ShiftApp() {
     const failingAvail=provs.filter(u=>!getAvailInfo(u.id).meets);
     // Remaining issues = unfilled slots in RECON/LOCKED phases. AVAIL returns [] so no false alarms.
     const openShiftIssues = diagnoseOpenShifts();
+    // Flagged-shift summary for Alerts. Detects flagged state via the union of two signals so
+    // it survives the desync paths (Clear flag wipes confirm but leaves the listing;
+    // marketplace.take sets confirm:null; admin clear leaves an orphaned auto-listing):
+    //   (a) shift entry with confirm === "flagged"
+    //   (b) open marketplace listing with autoPosted === true (the orange "flagged" pill on Trades)
+    // Dedup by (dateKey, slotId); flagger derives from the shift uid when present, else the
+    // listing's sellerId. Naturally empty in AVAIL (no awards / no listings yet).
+    const blockDaysSet = new Set(blockDays);
+    const flaggedMap = new Map();
+    for(const k of blockDays){
+      const day = shifts[k] || {};
+      for(const slot of config.shiftSlots){
+        const e = day[slot.id];
+        if(e && e.confirm === "flagged" && getUid(e)){
+          flaggedMap.set(`${k}_${slot.id}`, { dateKey: k, slotId: slot.id, slot, entry: e, originalUid: getUid(e), flagReason: e.flagReason || null });
+        }
+      }
+    }
+    marketplace.forEach(l => {
+      if(l.status !== "open" || !l.autoPosted) return;
+      if(!blockDaysSet.has(l.dateKey)) return;
+      const key = `${l.dateKey}_${l.slotId}`;
+      const slot = config.shiftSlots.find(s => s.id === l.slotId);
+      const entry = shifts[l.dateKey]?.[l.slotId] || null;
+      if(flaggedMap.has(key)){
+        // Already covered by the confirm-side check; fill in flagReason from the listing if missing.
+        const prev = flaggedMap.get(key);
+        if(!prev.flagReason && l.flagReason) flaggedMap.set(key, { ...prev, flagReason: l.flagReason });
+        return;
+      }
+      flaggedMap.set(key, { dateKey: l.dateKey, slotId: l.slotId, slot, entry, originalUid: l.sellerId, flagReason: l.flagReason || null });
+    });
+    const flaggedAlerts = Array.from(flaggedMap.values()).sort((a,b) => a.dateKey.localeCompare(b.dateKey));
     return(<>
       <h1 className="text-2xl font-semibold mb-1">Dashboard</h1>
       <p className="text-sm text-slate-500 mb-3">Block overview.</p>
@@ -6448,8 +6510,8 @@ function ShiftApp() {
         )}
       </div>
       {/* Alerts module — surfaces blocking issues that need admin attention. Renders only when at least one alert is active. */}
-      {(unassigned.length>0||failingAvail.length>0||openShiftIssues.length>0)&&(()=>{
-        const issueCount=(unassigned.length>0?1:0)+(failingAvail.length>0?1:0)+(openShiftIssues.length>0?1:0);
+      {(unassigned.length>0||failingAvail.length>0||openShiftIssues.length>0||flaggedAlerts.length>0)&&(()=>{
+        const issueCount=(unassigned.length>0?1:0)+(failingAvail.length>0?1:0)+(openShiftIssues.length>0?1:0)+(flaggedAlerts.length>0?1:0);
         return (
           <div className="bg-surface rounded-2xl shadow-card border border-slate-200/70 p-5 sm:p-6 mb-3">
             <div className="flex items-center justify-between mb-3">
@@ -6474,6 +6536,17 @@ function ShiftApp() {
                     if(!a.blockMeets)parts.push(`blocks ${a.blocked}/${config.maxBlockedDays}`);
                     return <li key={u.id}>{u.name} — {parts.join(" · ")} · −{a.penalty} pts</li>;
                   })}</ul>
+                </div>
+              )}
+              {flaggedAlerts.length>0&&(
+                <div className="bg-red-50 border border-red-200 rounded-xl p-3">
+                  <div className="font-semibold text-red-900 text-sm mb-1">⚠ {flaggedAlerts.length} flagged shift{flaggedAlerts.length===1?"":"s"} need{flaggedAlerts.length===1?"s":""} review</div>
+                  <div className="text-[11px] text-red-700/80 mb-1.5">See the Flagged shifts section below for swap and trade suggestions.</div>
+                  <ul className="text-xs text-red-800 space-y-0.5">{flaggedAlerts.slice(0,5).map(f=>{
+                    const d=parseDk(f.dateKey);
+                    const flagger=users.find(u=>u.id===f.originalUid);
+                    return <li key={`${f.dateKey}_${f.slotId}`}>{DAYS_SHORT[d.getDay()]} {MONTHS_SHORT[d.getMonth()]} {d.getDate()} · {f.slot?.name} — flagged by {flagger?.name||"?"}</li>;
+                  })}{flaggedAlerts.length>5&&<li className="text-red-700/70">+{flaggedAlerts.length-5} more</li>}</ul>
                 </div>
               )}
               {openShiftIssues.length>0&&(
@@ -6506,18 +6579,10 @@ function ShiftApp() {
         );
       })()}
       {/* Flagged shifts module — providers who flagged their assignments. Each card lists ranked
-          swap recommendations (preferred + below-max first) with one-click Accept. */}
+          swap recommendations (preferred + below-max first) with one-click Accept. Reuses the
+          same union list as the Alerts row above so both stay in sync. */}
       {(()=>{
-        const flagged = [];
-        for(const k of blockDays){
-          const day = shifts[k] || {};
-          for(const slot of config.shiftSlots){
-            const e = day[slot.id];
-            if(e && e.confirm === "flagged" && getUid(e)){
-              flagged.push({ dateKey: k, slotId: slot.id, slot, entry: e, originalUid: getUid(e) });
-            }
-          }
-        }
+        const flagged = flaggedAlerts;
         if(!flagged.length) return null;
         return (
           <div className="bg-surface rounded-2xl shadow-card border border-slate-200/70 p-5 sm:p-6 mb-3">
@@ -6525,7 +6590,7 @@ function ShiftApp() {
               <h2 className="text-base sm:text-lg font-bold text-ink-900">⚠ Flagged shifts</h2>
               <span className="text-[10px] font-bold uppercase tracking-[0.12em] text-red-600">{flagged.length} need{flagged.length===1?"s":""} review</span>
             </div>
-            <div className="space-y-3">{flagged.map(({dateKey, slotId, slot, entry, originalUid})=>{
+            <div className="space-y-3">{flagged.map(({dateKey, slotId, slot, entry, originalUid, flagReason})=>{
               const date = parseDk(dateKey);
               const original = users.find(u => u.id === originalUid);
               const trades = findTradeCandidates(dateKey, originalUid).slice(0, 4);
@@ -6540,12 +6605,19 @@ function ShiftApp() {
                         <span className="font-bold text-xs px-2 py-0.5 rounded text-white" style={{background:slot?.color}}>{slot?.name}</span>
                         <span className="text-xs text-slate-700">flagged by <span className="font-semibold">{original?.name||"?"}</span></span>
                       </div>
-                      {entry.flagReason && <div className="text-[11px] text-red-700 italic mt-1">"{entry.flagReason}"</div>}
+                      {flagReason && <div className="text-[11px] text-red-700 italic mt-1">"{flagReason}"</div>}
                     </div>
-                    <button onClick={()=>clearFlag(dateKey, slotId)}
-                      className="text-[11px] font-semibold px-2.5 py-1 border border-slate-300 text-slate-600 rounded-md hover:bg-white whitespace-nowrap">
-                      Clear flag
-                    </button>
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      <button onClick={()=>removeFlaggedShift(dateKey, slotId)}
+                        title="Vacate the slot and close the auto-posted listing. The slot will appear under Open shifts in Trades."
+                        className="text-[11px] font-semibold px-2.5 py-1 border border-red-300 text-red-700 rounded-md hover:bg-red-50 whitespace-nowrap">
+                        Make open
+                      </button>
+                      <button onClick={()=>clearFlag(dateKey, slotId)}
+                        className="text-[11px] font-semibold px-2.5 py-1 border border-slate-300 text-slate-600 rounded-md hover:bg-white whitespace-nowrap">
+                        Clear flag
+                      </button>
+                    </div>
                   </div>
                   {/* Suggested trades — both sides land on a day they wanted. */}
                   {trades.length > 0 && (
