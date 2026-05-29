@@ -1899,6 +1899,22 @@ function ShiftApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me?.id, mySeniority?.minShifts]);
 
+  // When a provider opens the Schedule page, default to Calendar view and jump the calendar
+  // to the first month of the current block. Page-change-only — toggling List/Calendar mid-stay
+  // sticks until they navigate away and back. Preferences page intentionally retains its own
+  // (list) default via its `availView` state.
+  useEffect(() => {
+    if (page !== "schedule") return;
+    if (me?.role !== "provider") return;
+    setShiftsView("calendar");
+    if (currentBlock?.start) {
+      const d = parseDk(currentBlock.start);
+      setCalY(d.getFullYear());
+      setCalM(d.getMonth());
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
+
   /* ── Auth (D.3: cloud-backed) ── */
   // After a cloud sign-in or sign-up, if the user has a non-owner membership in a group, this
   // helper makes sure the local mirror exists (groups[], users[gid][i], and an applied snapshot
@@ -7562,7 +7578,7 @@ function ShiftApp() {
     const confirmedCount = mine.filter(m => m.entry?.confirm === "ok").length;
     const unreviewedCount = reconOrLater ? mine.filter(m => !m.entry?.confirm).length : 0;
     return(<>
-      <h1 className="text-2xl font-semibold mb-1">My shifts</h1>
+      <h1 className="text-2xl font-semibold mb-1">My Shifts</h1>
       <p className="text-sm text-slate-500 mb-2">{mine.length} awarded · {pending.length} Top Option{pending.length===1?"":"s"} pending{isLocked(currentBlock) ? " · pts credited at lock" : ` · ${getPtsEarned(me.id).toFixed(1)} pts pending (credit when block locks)`}</p>
       {/* Phase-specific summary banner */}
       {reconOrLater && mine.length>0 && (
@@ -8962,7 +8978,7 @@ function ShiftApp() {
   // like Provider Report). Mobile bottom nav filters these out to stay compact.
   const navItems = me.role==="admin"
     ? [{id:"home",icon:"📊",label:"Home"},{id:"shifts",icon:"📅",label:"Calendar"},{id:"market",icon:"🔄",label:"Trades",badge:openTradeCount||null},{id:"setup",icon:"⚙️",label:"Setup"},{id:"people",icon:"👥",label:"People"},{id:"providerReport",icon:"📈",label:"Provider Report",onClick:()=>setShowProviderReport(true),disabled:!(config.blocks||[]).length}]
-    : [{id:"home",icon:"🏠",label:"Home"},{id:"preferences",icon:"🎯",label:"Preferences"},{id:"schedule",icon:"📅",label:"Schedule"},{id:"myshifts",icon:"✅",label:"Mine"},{id:"market",icon:"🔄",label:"Trades",badge:openTradeCount||null},{id:"standings",icon:"⭐",label:"Ranks"}];
+    : [{id:"home",icon:"🏠",label:"Home"},{id:"preferences",icon:"🎯",label:"Preferences"},{id:"schedule",icon:"📅",label:"Schedule"},{id:"myshifts",icon:"✅",label:"My Shifts"},{id:"market",icon:"🔄",label:"Trades",badge:openTradeCount||null},{id:"standings",icon:"⭐",label:"Ranks"}];
 
   const renderPage = () => {
     if(page==="home") return me.role==="admin"?AdminHome():ProviderHome();
