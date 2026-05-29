@@ -5899,14 +5899,20 @@ function ShiftApp() {
             {preferredCount>0 ? <> ({preferredCount} provider{preferredCount===1?"":"s"} preferred this date and {preferredCount===1?"is":"are"} below max)</> : candidates.length>0 ? <> ({candidates.length} eligible provider{candidates.length===1?"":"s"} below max)</> : <> (no obvious swap candidates — admin will need to handle manually)</>},
             and your shift is posted to the marketplace so anyone eligible can take it.
           </div>
-          <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider block mb-1.5">Reason (optional)</label>
-          <textarea value={reasonState} onChange={e=>setReasonState(e.target.value)} rows={2}
+          <div className="flex items-center justify-between mb-1.5">
+            <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider">Reason (required)</label>
+            <span className={`text-[10px] tabular-nums ${reasonState.length>=100?"text-red-600 font-semibold":"text-slate-400"}`}>{reasonState.length}/100</span>
+          </div>
+          <textarea value={reasonState} onChange={e=>setReasonState(e.target.value.slice(0,100))} rows={2}
+            maxLength={100}
             placeholder="Conflict, sickness, etc."
             className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white mb-4 resize-none focus:outline-none focus:border-brand-400"/>
           <div className="flex gap-2">
             <button onClick={()=>setFlagDraft(null)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
-            <button onClick={()=>flagShift(dateKey, slotId, reasonState)}
-              className="flex-1 py-2.5 text-sm bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium">
+            <button onClick={()=>flagShift(dateKey, slotId, reasonState.trim())}
+              disabled={!reasonState.trim()}
+              title={!reasonState.trim() ? "Enter a reason to continue" : undefined}
+              className="flex-1 py-2.5 text-sm bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium disabled:bg-slate-300 disabled:cursor-not-allowed">
               Flag &amp; notify admin
             </button>
           </div>
@@ -6771,10 +6777,28 @@ function ShiftApp() {
                 <div className="bg-red-50 border border-red-200 rounded-xl p-3">
                   <div className="font-semibold text-red-900 text-sm mb-1">⚠ {flaggedAlerts.length} flagged shift{flaggedAlerts.length===1?"":"s"} need{flaggedAlerts.length===1?"s":""} review</div>
                   <div className="text-[11px] text-red-700/80 mb-1.5">See the Flagged shifts section below for swap and trade suggestions.</div>
-                  <ul className="text-xs text-red-800 space-y-0.5">{flaggedAlerts.slice(0,5).map(f=>{
+                  <ul className="text-xs text-red-800 space-y-1.5">{flaggedAlerts.slice(0,5).map(f=>{
                     const d=parseDk(f.dateKey);
                     const flagger=users.find(u=>u.id===f.originalUid);
-                    return <li key={`${f.dateKey}_${f.slotId}`}>{DAYS_SHORT[d.getDay()]} {MONTHS_SHORT[d.getMonth()]} {d.getDate()} · {f.slot?.name} — flagged by {flagger?.name||"?"}</li>;
+                    // Derive what the flagger had originally marked this day as. Mutually exclusive
+                    // in the data model (clearing one clears the others), so the first hit wins.
+                    const origPref = inTopOption(f.dateKey, f.originalUid)
+                      ? { label: "Top Option", icon: "🎯", cls: "bg-blue-100 text-blue-700" }
+                      : isWanted(f.originalUid, f.dateKey)
+                        ? { label: "Preferred", icon: "⭐", cls: "bg-amber-100 text-amber-700" }
+                        : isUnavail(f.originalUid, f.dateKey)
+                          ? { label: "Blocked", icon: "🚫", cls: "bg-red-100 text-red-700" }
+                          : { label: "Available", icon: "", cls: "bg-slate-100 text-slate-700" };
+                    return (
+                      <li key={`${f.dateKey}_${f.slotId}`} className="leading-snug">
+                        <div>{DAYS_SHORT[d.getDay()]} {MONTHS_SHORT[d.getMonth()]} {d.getDate()} · {f.slot?.name} — flagged by <span className="font-semibold">{flagger?.name||"?"}</span></div>
+                        <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
+                          <span className="text-[10px] text-red-700/70">Originally:</span>
+                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${origPref.cls}`}>{origPref.icon}{origPref.icon?" ":""}{origPref.label}</span>
+                        </div>
+                        {f.flagReason && <div className="text-[11px] text-red-700 italic mt-0.5">"{f.flagReason}"</div>}
+                      </li>
+                    );
                   })}{flaggedAlerts.length>5&&<li className="text-red-700/70">+{flaggedAlerts.length-5} more</li>}</ul>
                 </div>
               )}
