@@ -90,6 +90,12 @@
       -webkit-appearance: none; margin: 0;
     }
     input[type="number"].v2-num-input { -moz-appearance: textfield; }
+    /* Opt-in "Large text" mode — bumps any sub-12px sizes up to 12px for readability.
+       Scoped to arbitrary-value Tailwind classes since those are the only sizes we use
+       below 12px (`text-xs` is already at the floor). Specificity is (0,2,1) vs
+       Tailwind's (0,1,0), so no !important needed. */
+    html[data-large-text="1"] .text-\[10px\] { font-size: 12px; }
+    html[data-large-text="1"] .text-\[11px\] { font-size: 12px; }
   </style>
 </head>
 <body>
@@ -206,6 +212,26 @@
       } catch { return null; }
     })();
     window.__shyftClientId = SHYFT_CLIENT_ID; // expose for DevTools sanity checks
+
+    // Opt-in "Large text" accessibility toggle. Per-device (localStorage), applied via
+    // `data-large-text="1"` on <html>; CSS in the <style> block above bumps sub-12px
+    // arbitrary-value Tailwind classes. Bootstrap runs before React mounts to avoid a
+    // flash of small text. The ProfileModal's checkbox calls window.__setLargeText.
+    (function(){
+      try {
+        if (localStorage.getItem("shyft3_large_text") === "1") {
+          document.documentElement.setAttribute("data-large-text", "1");
+        }
+      } catch {}
+      window.__getLargeText = function() {
+        try { return localStorage.getItem("shyft3_large_text") === "1"; } catch { return false; }
+      };
+      window.__setLargeText = function(on) {
+        try { localStorage.setItem("shyft3_large_text", on ? "1" : "0"); } catch {}
+        if (on) document.documentElement.setAttribute("data-large-text", "1");
+        else document.documentElement.removeAttribute("data-large-text");
+      };
+    })();
 
     // ─── D.4.D1: event outbox ────────────────────────────────────────────────
     // Failed POST /api/events calls get parked in localStorage and retried on

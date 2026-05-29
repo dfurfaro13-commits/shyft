@@ -220,6 +220,17 @@ export default function ShiftApp() {
   // section sub-states (name / email / password) so saving one doesn't reset the others.
   // Shape: { name:{value,busy,error,savedAt}, email:{value,busy,error,sentTo}, password:{current,next,confirm,busy,error,savedAt} }
   const [profile, setProfile] = useState(null);
+  // Opt-in "Large text" toggle. Per-device — bootstrap in head template applies the
+  // attribute on <html> pre-render; this useState mirrors the value so the ProfileModal
+  // checkbox reflects current state. Setter updates both the DOM attribute (via the
+  // window helper) and React state.
+  const [largeText, setLargeTextState] = useState(() => {
+    try { return typeof window !== "undefined" && window.__getLargeText && window.__getLargeText(); } catch { return false; }
+  });
+  const setLargeText = (on) => {
+    setLargeTextState(!!on);
+    try { window.__setLargeText && window.__setLargeText(!!on); } catch {}
+  };
   const [authMode, setAuthMode] = useState("signin");
   // D.3: cloud-backed auth. `emailOrUsername` accepts either on Sign in; signup uses email,
   // username, displayName, plus optional groupCode/adminCode/ownerCode. Local-only fields
@@ -5415,8 +5426,8 @@ export default function ShiftApp() {
       )}
       <div className={`grid ${currentBlockHasPoints ? "grid-cols-3" : "grid-cols-2"} gap-2 sm:gap-4 mb-5`}>
         {currentBlockHasPoints && <Stat label="Total pts" value={total.toFixed(total%1?1:0)} color={total<0?"text-red-600":"text-amber-600"}/>}
-        <Stat label="Shifts" value={`${count}/${min||"—"}`} color="text-blue-600"/>
-        <Stat label="Available" value={`${avail.availD}/${blockDays.length||"—"}`} color={avail.meets?"text-green-600":"text-red-600"}/>
+        <Stat label="Shifts" value={`${count}/${min||"—"}`} sub="assigned / minimum" color="text-blue-600"/>
+        <Stat label="Available" value={`${avail.availD}/${blockDays.length||"—"}`} sub="days" color={avail.meets?"text-green-600":"text-red-600"}/>
       </div>
       {currentBlock&&(()=>{
         const ph = phaseOf(currentBlock);
@@ -5509,11 +5520,11 @@ export default function ShiftApp() {
       )}
       {(()=>{ const ph=phaseOf(currentBlock); const tone=PHASE_TONE[ph]; return (
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 sm:gap-3 mb-5">
-        <Stat label="Providers" value={provs.length} color="text-blue-600"/>
-        <Stat label="Awarded" value={totalSlots?`${assigned}/${totalSlots}`:"—"} color={assigned===totalSlots?"text-green-600":"text-amber-600"} small/>
+        <Stat label="Providers" value={provs.length} color="text-blue-600" small/>
+        <Stat label="Awarded" value={totalSlots?`${assigned}/${totalSlots}`:"—"} sub="shifts" color={assigned===totalSlots?"text-green-600":"text-amber-600"} small/>
         <Stat label="Top Option dates" value={pendingPool} color={pendingPool>0?"text-blue-600":"text-slate-400"} small/>
         {/* Per the spec, open-shifts-remaining is a first-class dashboard metric. */}
-        <Stat label="Open" value={open} color={open===0?"text-green-600":open>0?"text-red-600":"text-slate-400"}/>
+        <Stat label="Open" value={open} sub="shifts" color={open===0?"text-green-600":open>0?"text-red-600":"text-slate-400"} small/>
         <Stat label="Phase" value={currentBlock?PHASE_LABEL[ph]:"—"} color={currentBlock?tone.text:"text-slate-400"} small/>
       </div>
       ); })()}
@@ -7733,6 +7744,17 @@ export default function ShiftApp() {
             </button>
           </Section>
 
+          <Section title="Appearance">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" checked={largeText} onChange={e=>setLargeText(e.target.checked)}
+                className="w-4 h-4 mt-0.5 flex-shrink-0 accent-blue-600"/>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium text-slate-900">Large text</div>
+                <div className="text-xs text-slate-500 mt-0.5">Bump the smallest labels and chips to a more readable size. Saved on this device.</div>
+              </div>
+            </label>
+          </Section>
+
           <div className="mt-5 pt-4 border-t border-slate-200">
             <button onClick={closeProfile}
               className="w-full py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Close</button>
@@ -7911,9 +7933,15 @@ export default function ShiftApp() {
             <div className="text-[10px] font-semibold text-brand-700 uppercase tracking-wider">Current block</div>
             <div className="text-sm font-semibold text-ink-900 mt-1 truncate">{currentBlock.name||"Block"}</div>
             <div className="text-xs text-ink-500 mt-0.5">{blockRangeLabel}</div>
-            <div className={`text-[10px] font-semibold mt-2 inline-flex items-center gap-1.5 ${st.text}`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${st.dot}`}></span>
-              {PHASE_LABEL[sp]}
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mt-2">
+              <div className={`text-[10px] font-semibold inline-flex items-center gap-1.5 ${st.text}`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${st.dot}`}></span>
+                {PHASE_LABEL[sp]}
+              </div>
+              <div className={`text-[10px] font-semibold inline-flex items-center gap-1.5 ${currentBlockHasPoints?"text-emerald-700":"text-ink-500"}`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${currentBlockHasPoints?"bg-emerald-500":"bg-slate-400"}`}></span>
+                Points {currentBlockHasPoints?"on":"off"}
+              </div>
             </div>
           </div>
         ); })()}
