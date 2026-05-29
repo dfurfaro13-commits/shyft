@@ -245,6 +245,11 @@ export default function ShiftApp() {
   // confirmRevert: admin moving from Reconciliation → Availability (wipes assignments).
   const [confirmLock, setConfirmLock] = useState(false);
   const [confirmRevert, setConfirmRevert] = useState(false);
+  // Block-create wizard: null when closed, else { usePoints: bool } — the admin's pending choice.
+  // Stamped onto config.blocks[].usePoints on confirm. Block-level only — there's no group default.
+  // The "+ New block" trigger pre-fills the modal with the most recently-created block's mode so
+  // a no-points group doesn't have to flip every time.
+  const [newBlockDraft, setNewBlockDraft] = useState(null);
   // { dateKey, penalty, projected } when the user is about to block past the allowed limit
   const [confirmBlockOver, setConfirmBlockOver] = useState(null);
   // Toggles the BlockReportModal (admin "Block report" action). The report itself is computed
@@ -665,6 +670,24 @@ export default function ShiftApp() {
 
   // Active block: drives which dates the UI treats as "in-block" (signup, calendar highlighting, counters).
   const currentBlock = useMemo(() => currentBlockOf(config), [config]);
+  // True when the current block uses the points system. Undefined / true → show points UI.
+  // False → hide day-pts pills, points columns, bid inputs, incentive controls, etc.
+  // Backwards-compat: blocks created before usePoints existed default to true.
+  const currentBlockHasPoints = currentBlock?.usePoints !== false;
+
+  // Per-block rotating tie-break order, used only when block.usePoints === false. Reads the
+  // stored order from the block (seeded at block-create), self-heals to current providers
+  // (drop removed uids, append new ones at the end), and returns a fresh working copy that
+  // producers can mutate as winners are pushed to the back. The final rotated order is sent
+  // in the block.reconcile / shift.swap-admin payloads so the reducer can stamp it on the
+  // block for cross-device replay.
+  const buildTieBreakWorkingOrder = (block) => {
+    const stored = Array.isArray(block?.tieBreakOrder) ? block.tieBreakOrder.map(String) : [];
+    const present = new Set(users.filter(u => u.role === "provider").map(u => String(u.id)));
+    const filtered = stored.filter(uid => present.has(uid));
+    for (const uid of present) if (!filtered.includes(uid)) filtered.push(uid);
+    return filtered;
+  };
 
   const blockDays = useMemo(() => {
     if (!currentBlock) return [];
@@ -1859,6 +1882,10 @@ export default function ShiftApp() {
   // already in the bank.
   const getPtsEarned = uid => {
     if(isLocked(currentBlock)) return 0;
+    // Points-off blocks never credit earnings at lock — short-circuit so every UI surface that
+    // reads getPtsEarned (ProviderHome total, MyShifts pending copy, Block / Provider Report
+    // Proj column) naturally shows 0 / hides the "pending pts" framing.
+    if(!currentBlockHasPoints) return 0;
     let t=0;
     Object.entries(shifts).forEach(([k,day])=>{
       if(!inBlock(k,config)) return;
@@ -1918,11 +1945,15 @@ export default function ShiftApp() {
     const prefWk = pref.filter(isWeekend);
     const prefShort = Math.max(0, (config.minPreferredDays||0) - pref.length);
     const prefWkShort = Math.max(0, (config.minPreferredWeekendDays||0) - prefWk.length);
-    const prefShortPenalty = (prefShort + prefWkShort) * (config.preferredShortfallPenalty||0);
+    const rawPrefShortPenalty = (prefShort + prefWkShort) * (config.preferredShortfallPenalty||0);
     // Block-overage check
     const blockOver = Math.max(0, blocked.length - (config.maxBlockedDays||Infinity));
     const blockWkOver = Math.max(0, blockedWk.length - (config.maxBlockedWeekendDays||Infinity));
-    const blockPenalty = (blockOver + blockWkOver) * (config.blockOverLimitPenalty||0);
+    const rawBlockPenalty = (blockOver + blockWkOver) * (config.blockOverLimitPenalty||0);
+    // Points-off blocks: thresholds still drive `meets` (so providers see alerts), but the
+    // numeric pt penalties are zeroed so all `avail.penalty > 0` UI naturally hides.
+    const prefShortPenalty = currentBlockHasPoints ? rawPrefShortPenalty : 0;
+    const blockPenalty = currentBlockHasPoints ? rawBlockPenalty : 0;
     const penalty = prefShortPenalty + blockPenalty;
     const prefMeets = prefShort===0 && prefWkShort===0;
     const blockMeets = blockOver===0 && blockWkOver===0;
@@ -2314,12 +2345,21 @@ export default function ShiftApp() {
     if(!inBlock(dateKey, config)) { flash("⚠️ Outside block"); return; }
     if(!me.seniorityId) { flash("⚠️ Seniority not assigned yet"); return; }
     if(isUnavail(me.id, dateKey)) { flash("⚠️ You marked this day unavailable"); return; }
-    const cap = Math.max(0, Math.floor(totalPts(me.id)));
-    const bid = Math.max(0, Math.min(cap, parseInt(rawBid)||TOP_OPTION_DEFAULT_BID));
+    // Points-off blocks: Top Option is binary, bid is always 0. Tie-breaks come from the
+    // per-block rotating order, not bids. The UI in points-off mode hides the bid input.
+    let bid = 0;
+    if (currentBlockHasPoints) {
+      const cap = Math.max(0, Math.floor(totalPts(me.id)));
+      bid = Math.max(0, Math.min(cap, parseInt(rawBid)||TOP_OPTION_DEFAULT_BID));
+    }
     const sp = (slotPref==null) ? null : parseInt(slotPref);
     const wasIn = inTopOption(dateKey, me.id);
     await applyAndTrack("topOption.set", { dateKey, slotPref: sp, bid });
-    flash(wasIn ? `Top Option updated · bid ${bid}` : `🎯 Top Option set · bid ${bid} pt${bid===1?"":"s"}`);
+    if (currentBlockHasPoints) {
+      flash(wasIn ? `Top Option updated · bid ${bid}` : `🎯 Top Option set · bid ${bid} pt${bid===1?"":"s"}`);
+    } else {
+      flash(wasIn ? "Top Option updated" : "🎯 Top Option set");
+    }
   };
 
   // Walks the user away from a Top Option commitment for a day. Doesn't touch preference state.
@@ -2355,6 +2395,8 @@ export default function ShiftApp() {
     if(!me || me.role !== "provider") return;
     if(!isAvailabilityOpen(currentBlock)) { flash("⚠️ Availability is closed for this block"); return; }
     if(!inTopOption(dateKey, me.id)) return;
+    // No-op in points-off blocks — the bid input is hidden and bid is locked at 0.
+    if (!currentBlockHasPoints) return;
     const cap = Math.max(0, Math.floor(totalPts(me.id)));
     const bid = Math.max(0, Math.min(cap, parseInt(rawAmount)||0));
     const cur = topOptions[dateKey][me.id];
@@ -2501,11 +2543,22 @@ export default function ShiftApp() {
      Each new award is tagged `source: "preferred-auto" | "available-auto"`. */
   // `startingShifts` lets the caller pass a not-yet-persisted shifts object (e.g. the post-reconcile
   // result) so we can compute auto-assignment on top of it without waiting for state to update.
-  const computeAutoAssign = (startingShifts) => {
+  const computeAutoAssign = (startingShifts, workingOrder) => {
     const result=JSON.parse(JSON.stringify(startingShifts || shifts));
     const provs=users.filter(u=>u.role==="provider"&&u.seniorityId);
     const liveCount={}, liveDates={};
     provs.forEach(p=>{liveCount[p.id]=0; liveDates[p.id]=new Set();});
+    // Points-off mode rotating tie-break, chained from computeReconcile so the queue keeps
+    // advancing through the auto-assign pass.
+    const rotOrder = workingOrder || buildTieBreakWorkingOrder(currentBlock);
+    const orderIdx = uid => {
+      const i = rotOrder.indexOf(String(uid));
+      return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+    };
+    const rotateWinner = uid => {
+      const i = rotOrder.indexOf(String(uid));
+      if (i >= 0) { rotOrder.splice(i, 1); rotOrder.push(String(uid)); }
+    };
     Object.entries(result).forEach(([k,day])=>Object.values(day).forEach(e=>{
       const uid=getUid(e);
       if(liveCount[uid]!==undefined){ liveCount[uid]++; liveDates[uid].add(k); }
@@ -2563,6 +2616,8 @@ export default function ShiftApp() {
         if(aBi!==bBi) return aBi?-1:1;
         // 4) Fairness fallback.
         if(liveCount[a.id]!==liveCount[b.id]) return liveCount[a.id]-liveCount[b.id];
+        // Points-off blocks: final tie-break via the rotating queue (lower idx = next).
+        if (!currentBlockHasPoints) return orderIdx(a.id) - orderIdx(b.id);
         return totalPts(a.id)-totalPts(b.id);
       });
       return elig;
@@ -2580,6 +2635,8 @@ export default function ShiftApp() {
           result[dateKey][slot.id] = {...(prev||{}), uid:winner.id, auto:true, source};
           liveCount[winner.id]++;
           liveDates[winner.id].add(dateKey);
+          // Winner moves to the back of the rotating queue (points-off mode).
+          if (!currentBlockHasPoints) rotateWinner(winner.id);
           newA.push({dateKey,slot,user:winner,source});
         }
       }
@@ -2595,7 +2652,7 @@ export default function ShiftApp() {
         if(!getUid(result[dateKey]?.[slot.id])) unfilled.push({dateKey, slot});
       }
     }
-    return {result,newAssignments:newA,unfilled};
+    return {result,newAssignments:newA,unfilled,tieBreakOrder:rotOrder};
   };
 
   const applyAutoAssign = async () => {
@@ -2621,11 +2678,23 @@ export default function ShiftApp() {
   // For each day with Top-Optioners: sort by (bid desc, snapshot pts desc, uid asc). Place each
   // in their preferred slot if open, else cascade to the other open slot. Skip if at-max.
   // Hard max cap is enforced (not just rank-deprioritized).
-  const computeReconcile = () => {
+  const computeReconcile = (workingOrder) => {
     const result = JSON.parse(JSON.stringify(shifts));
     const awarded = [];
     const deltas = {};
     const baseCache = {};
+    // Rotating tie-break queue, points-off mode only. Lower index = next to win a tie.
+    // We mutate this in place as winners commit; applyReconcile reads the final order
+    // out of the returned payload and chains it into computeAutoAssign.
+    const rotOrder = workingOrder || buildTieBreakWorkingOrder(currentBlock);
+    const orderIdx = uid => {
+      const i = rotOrder.indexOf(String(uid));
+      return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+    };
+    const rotateWinner = uid => {
+      const i = rotOrder.indexOf(String(uid));
+      if (i >= 0) { rotOrder.splice(i, 1); rotOrder.push(String(uid)); }
+    };
     const effPts = uid => {
       if(baseCache[uid]===undefined) baseCache[uid] = snapshotPtsForReconcile(uid);
       return baseCache[uid] + (deltas[uid]||0);
@@ -2668,6 +2737,8 @@ export default function ShiftApp() {
       if(!openSlots.length) return;
       const candidates = cleaned.filter(c => !isAtMax(c.uid)).sort((a,b) => {
         if(a.bid !== b.bid) return b.bid - a.bid;
+        // Points-off blocks: tie-break via the rotating queue. Lower index = ahead in line.
+        if (!currentBlockHasPoints) return orderIdx(a.uid) - orderIdx(b.uid);
         const ap = effPts(a.uid), bp = effPts(b.uid);
         if(ap !== bp) return bp - ap;
         return a.uid - b.uid;
@@ -2698,6 +2769,8 @@ export default function ShiftApp() {
           ...(charge > 0 ? { bid: charge } : {}),
         };
         if(charge > 0) deltas[c.uid] = (deltas[c.uid]||0) - charge;
+        // Winner moves to the back of the rotating queue (points-off mode).
+        if (!currentBlockHasPoints) rotateWinner(c.uid);
         perUserShifts[c.uid] = (perUserShifts[c.uid]||0) + 1;
         awarded.push({
           dateKey, slot: target, winner: c.uid,
@@ -2772,7 +2845,7 @@ export default function ShiftApp() {
     for(const dateKey of Object.keys(result)){
       if(!Object.keys(result[dateKey]).length) delete result[dateKey];
     }
-    return { result, awarded, deltas };
+    return { result, awarded, deltas, tieBreakOrder: rotOrder };
   };
 
   // v3 "Close & assign" — runs reconcile + two-pass auto-assign as one atomic transition.
@@ -2789,23 +2862,31 @@ export default function ShiftApp() {
   //   2. `a.auto` must be carried through so auto-assign cells keep their flag on replay.
   const applyReconcile = async () => {
     if(!reconcilePreview) return;
-    const { result: reconResult, awarded, deltas } = reconcilePreview;
-    // Chain auto-assign on top of the reconcile result.
-    const auto = computeAutoAssign(reconResult);
+    const { result: reconResult, awarded, deltas, tieBreakOrder: preTieBreak } = reconcilePreview;
+    // Chain auto-assign on top of the reconcile result, threading the rotated tie-break order
+    // through so the queue keeps advancing across both phases. preTieBreak comes from the
+    // preview (computeReconcile rotated it once already); computeAutoAssign mutates it further.
+    const auto = computeAutoAssign(reconResult, preTieBreak ? [...preTieBreak] : undefined);
     const finalShifts = auto.result;
     const autoCount = auto.newAssignments.length;
     // Snapshot availability penalty BEFORE topOptions is touched — getAvailInfo unions topOptions
     // into the preferred-day count, so we need the pending penalty while it's still set.
+    // Points-off blocks skip this — no penalty math, just alerts.
     const availPenalties = {};
-    users.forEach(u => {
-      if(u.role!=="provider") return;
-      const p = getAvailInfo(u.id).penalty || 0;
-      if(p > 0) availPenalties[u.id] = p;
-    });
+    if (currentBlockHasPoints) {
+      users.forEach(u => {
+        if(u.role!=="provider") return;
+        const p = getAvailInfo(u.id).penalty || 0;
+        if(p > 0) availPenalties[u.id] = p;
+      });
+    }
     // Snapshot pointsAtClose BEFORE bid deductions, so future re-reconciles tiebreak against
-    // the same entering-block balance.
+    // the same entering-block balance. Points-off blocks: skipped (no balance changes during
+    // reconcile, nothing to snapshot).
     const pointsAtClose = {};
-    users.forEach(u => { if(u.role==="provider") pointsAtClose[u.id] = u.points || 0; });
+    if (currentBlockHasPoints) {
+      users.forEach(u => { if(u.role==="provider") pointsAtClose[u.id] = u.points || 0; });
+    }
     // Snapshot per-provider targets (min/ideal/max) at close. Powers Provider Report's
     // cross-block target summation — without this, retargeting a provider mid-history would
     // retroactively rewrite past blocks. Targets stamped here are immutable for this block.
@@ -2858,6 +2939,10 @@ export default function ShiftApp() {
       pointsAtClose,
       targetsAtClose,
       openIncentivesPatch: { credits: incCredits, consumed: consumedIncentives },
+      // Points-off blocks: send the rotated tie-break order so the reducer stamps it on the
+      // block. Cross-device replay then picks up where this device left off. Omitted in
+      // points-on blocks — the field is irrelevant there.
+      ...(!currentBlockHasPoints ? { tieBreakOrder: auto.tieBreakOrder } : {}),
     });
     flash(`✅ ${awarded.length} Top Option ${awarded.length===1?"award":"awards"} · ${autoCount} auto-filled · block now in Reconciliation`);
     setReconcilePreview(null);
@@ -2939,9 +3024,20 @@ export default function ShiftApp() {
         maxTarget: max,
       };
     });
+    // Points-off blocks: tie-break via the per-block rotating queue (read fresh each call —
+    // mutates only on admin commit via acceptSwapCandidate, so reading here just reflects
+    // the current state).
+    const rotOrder = !currentBlockHasPoints ? buildTieBreakWorkingOrder(currentBlock) : null;
+    const orderIdx = uid => {
+      if (!rotOrder) return 0;
+      const i = rotOrder.indexOf(String(uid));
+      return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+    };
     candidates.sort((a,b) => {
       // Preferred providers ranked above non-preferred.
       if(a.preferred !== b.preferred) return a.preferred ? -1 : 1;
+      // Points-off: rotating queue position.
+      if (!currentBlockHasPoints) return orderIdx(a.user.id) - orderIdx(b.user.id);
       // Then highest snapshot points wins.
       if(a.snapshotPts !== b.snapshotPts) return b.snapshotPts - a.snapshotPts;
       return a.user.id - b.user.id;
@@ -3004,12 +3100,23 @@ export default function ShiftApp() {
     const originalUid = getUid(entry);
     if(originalUid === candidateUid) { flash("⚠️ Same provider"); return; }
     const newUser = users.find(u => u.id === candidateUid);
+    // Points-off blocks: the new assignee was picked from the rotating queue, so they move
+    // to the back. We rotate here and include the updated order in the payload so cross-device
+    // replay stays consistent. Points-on blocks omit the field — reducer leaves the slot alone.
+    let tieBreakOrderPatch;
+    if (!currentBlockHasPoints) {
+      const order = buildTieBreakWorkingOrder(currentBlock);
+      const i = order.indexOf(String(candidateUid));
+      if (i >= 0) { order.splice(i, 1); order.push(String(candidateUid)); }
+      tieBreakOrderPatch = order;
+    }
     await applyAndTrack("shift.swap-admin", {
       fromUid: String(originalUid),
       toUid: String(candidateUid),
       dateKey,
       slotId,
       source: "admin-swap",
+      ...(tieBreakOrderPatch ? { tieBreakOrder: tieBreakOrderPatch, blockId: currentBlock?.id != null ? String(currentBlock.id) : null } : {}),
     });
     flash(`✅ Reassigned to ${newUser?.name?.split(" ")[0] || "provider"}`);
   };
@@ -3100,12 +3207,16 @@ export default function ShiftApp() {
   };
 
   // Provider posts their own awarded shift for take, with optional incentive points.
+  // In points-off blocks the incentive is forced to 0 — listings become straight swaps.
   const postForTake = async (dateKey, slotId, incentivePts) => {
     if(!me || me.role !== "provider") return;
     const entry = shifts[dateKey]?.[slotId];
     if(!entry || getUid(entry) !== me.id) { flash("⚠️ You don't own this shift"); return; }
-    const cap = Math.max(0, Math.floor(me.points || 0));
-    const inc = Math.max(0, Math.min(cap, parseInt(incentivePts)||0));
+    let inc = 0;
+    if (currentBlockHasPoints) {
+      const cap = Math.max(0, Math.floor(me.points || 0));
+      inc = Math.max(0, Math.min(cap, parseInt(incentivePts)||0));
+    }
     // Reuse an open listing's id if one already exists for this slot, so the reducer's
     // (listingId-keyed) dedup no-ops the append instead of creating a duplicate.
     const existing = marketplace.find(l => l.dateKey === dateKey && l.slotId === slotId && l.status === "open");
@@ -3159,7 +3270,9 @@ export default function ShiftApp() {
     if(Object.values(shifts[dateKey]||{}).some(e => getUid(e) === me.id)) {
       flash("⚠️ You already have a shift this day"); return;
     }
-    const incPts = openIncentives?.[dateKey]?.[slotId] | 0;
+    // openIncentives are only set in points-on blocks (the admin control is hidden in points-off).
+    // Belt-and-suspenders: force null when current block is points-off.
+    const incPts = currentBlockHasPoints ? (openIncentives?.[dateKey]?.[slotId] | 0) : 0;
     const incentiveCredit = incPts > 0 ? { uid: String(me.id), points: incPts } : null;
     await applyAndTrack("shift.take-open", { dateKey, slotId, incentiveCredit });
     flash(`✅ Shift taken${incPts > 0 ? ` · +${incPts} pt${incPts === 1 ? "" : "s"}` : ""}`);
@@ -3226,8 +3339,12 @@ export default function ShiftApp() {
     if((listing.tradeOffers||[]).some(o => o.status==="pending" && eqId(o.offererId, me.id) && o.offererDateKey===offererDateKey && o.offererSlotId===offererSlotId)){
       flash("⚠️ You already offered that shift"); return;
     }
-    const cap = Math.max(0, Math.floor(me.points || 0));
-    const inc = Math.max(0, Math.min(cap, parseInt(incentivePts)||0));
+    // Points-off blocks: trade sweeteners are disabled — offers are pure swaps.
+    let inc = 0;
+    if (currentBlockHasPoints) {
+      const cap = Math.max(0, Math.floor(me.points || 0));
+      inc = Math.max(0, Math.min(cap, parseInt(incentivePts)||0));
+    }
     const offerId = newClientUuid();
     await applyAndTrack("trade.offer-post", {
       offerId,
@@ -3654,7 +3771,7 @@ export default function ShiftApp() {
             <div>
               <div className="font-semibold text-lg">{DAYS_LONG[date.getDay()]}</div>
               <div className="text-sm text-slate-500">
-                {MONTHS[date.getMonth()]} {date.getDate()}, {date.getFullYear()} · +{base} pts
+                {MONTHS[date.getMonth()]} {date.getDate()}, {date.getFullYear()}{currentBlockHasPoints ? ` · +${base} pts` : ""}
                 {config.holidays[editingDay]&&<span className="text-red-600"> · {config.holidays[editingDay]}</span>}
               </div>
             </div>
@@ -3714,21 +3831,23 @@ export default function ShiftApp() {
                       </div>
                       <div className="text-[10px] text-ink-500 mt-1">Soft preference — if your slot is taken, you cascade to the other open slot.</div>
                     </div>
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="min-w-0">
-                        <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-brand-700">Bid</div>
-                        <div className="text-[10px] text-ink-500 mt-0.5">Max you'd spend if contested · solo days cost 0 · actual contested cost = next-highest bid + 1 (cap <span className="font-bold tabular-nums">{cap}</span> pt{cap===1?"":"s"})</div>
+                    {currentBlockHasPoints && (
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-brand-700">Bid</div>
+                          <div className="text-[10px] text-ink-500 mt-0.5">Max you'd spend if contested · solo days cost 0 · actual contested cost = next-highest bid + 1 (cap <span className="font-bold tabular-nums">{cap}</span> pt{cap===1?"":"s"})</div>
+                        </div>
+                        <div className="flex items-center gap-1 flex-shrink-0">
+                          <button type="button" onClick={()=>setBid(editingDay, myBid-1)} disabled={myBid<=0}
+                            className="w-7 h-7 rounded-lg bg-white border border-brand-200 hover:bg-brand-100 text-brand-700 flex items-center justify-center font-bold text-base leading-none disabled:opacity-30">−</button>
+                          <input type="number" min="0" max={cap} value={myBid}
+                            onChange={e=>{ const n=parseInt(e.target.value); if(!isNaN(n)) setBid(editingDay, n); }}
+                            className="v2-num-input w-14 px-1 py-0.5 text-2xl font-extrabold tabular-nums text-center bg-white outline-none border border-brand-200 focus:border-brand-400 rounded-lg text-brand-700"/>
+                          <button type="button" onClick={()=>setBid(editingDay, myBid+1)} disabled={myBid>=cap}
+                            className="w-7 h-7 rounded-lg bg-white border border-brand-200 hover:bg-brand-100 text-brand-700 flex items-center justify-center font-bold text-base leading-none disabled:opacity-30">+</button>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-1 flex-shrink-0">
-                        <button type="button" onClick={()=>setBid(editingDay, myBid-1)} disabled={myBid<=0}
-                          className="w-7 h-7 rounded-lg bg-white border border-brand-200 hover:bg-brand-100 text-brand-700 flex items-center justify-center font-bold text-base leading-none disabled:opacity-30">−</button>
-                        <input type="number" min="0" max={cap} value={myBid}
-                          onChange={e=>{ const n=parseInt(e.target.value); if(!isNaN(n)) setBid(editingDay, n); }}
-                          className="v2-num-input w-14 px-1 py-0.5 text-2xl font-extrabold tabular-nums text-center bg-white outline-none border border-brand-200 focus:border-brand-400 rounded-lg text-brand-700"/>
-                        <button type="button" onClick={()=>setBid(editingDay, myBid+1)} disabled={myBid>=cap}
-                          className="w-7 h-7 rounded-lg bg-white border border-brand-200 hover:bg-brand-100 text-brand-700 flex items-center justify-center font-bold text-base leading-none disabled:opacity-30">+</button>
-                      </div>
-                    </div>
+                    )}
                     {dayTopOptCount > 1 && (
                       <div className="text-[11px] text-brand-900 italic">
                         {dayTopOptCount-1} other provider{dayTopOptCount===2?"":"s"} also Top-Optioned this day.
@@ -3825,9 +3944,11 @@ export default function ShiftApp() {
                       );
                     })()}
                   </div>
-                  {/* Admin incentive stepper — visible only when slot is open. Bonus pts are minted
-                      by the system on award; awardee gets them added to their points balance. */}
-                  {me.role==="admin"&&!winner&&(()=>{
+                  {/* Admin incentive stepper — visible only when slot is open AND the current block
+                      uses points. Bonus pts are minted by the system on award; awardee gets them
+                      added to their points balance. Points-off blocks have no notion of incentive
+                      currency, so the stepper hides entirely. */}
+                  {me.role==="admin"&&!winner&&currentBlockHasPoints&&(()=>{
                     const inc = openIncentives[editingDay]?.[slot.id] || 0;
                     return (
                       <div className="bg-amber-50 border border-amber-200 rounded-xl p-2.5 mb-2 flex items-center justify-between gap-2">
@@ -3885,7 +4006,7 @@ export default function ShiftApp() {
             {(()=>{
               const totalBid = contested.reduce((s,a)=>s+(a.bid||0),0);
               return (<>
-                <p className="text-sm text-slate-500 mt-1">{awarded.length} Top Option {awarded.length===1?"award":"awards"} · {contested.length} contested · {cascaded.length} cascaded · {totalBid} bid pt{totalBid===1?"":"s"} spent</p>
+                <p className="text-sm text-slate-500 mt-1">{awarded.length} Top Option {awarded.length===1?"award":"awards"} · {contested.length} contested · {cascaded.length} cascaded{currentBlockHasPoints ? ` · ${totalBid} bid pt${totalBid===1?"":"s"} spent` : ""}</p>
                 <p className="text-[11px] text-slate-500 mt-1 italic">Auto-fill (preferred → available) runs after Top Options settle. Block then enters Reconciliation.</p>
               </>);
             })()}
@@ -3893,7 +4014,7 @@ export default function ShiftApp() {
           <div className="overflow-y-auto p-5 flex-1 space-y-4">
             {contested.length>0&&(
               <div>
-                <div className="text-sm font-medium text-slate-700 mb-2">Contested (2+ Top-Optioners) — winner charged next-highest bid + 1</div>
+                <div className="text-sm font-medium text-slate-700 mb-2">Contested (2+ Top-Optioners){currentBlockHasPoints ? " — winner charged next-highest bid + 1" : " — tie-break via rotating queue"}</div>
                 <div className="space-y-1.5">{contested.map((a,i)=>{
                   const d=parseDk(a.dateKey), w=users.find(u=>u.id===a.winner);
                   const bid=a.bid||0;
@@ -3902,9 +4023,9 @@ export default function ShiftApp() {
                       <span className="text-slate-500 w-20 flex-shrink-0">{MONTHS_SHORT[d.getMonth()]} {d.getDate()} {DAYS_SHORT[d.getDay()]}</span>
                       <span className="font-medium text-xs px-2 py-0.5 rounded" style={{background:a.slot.color+"20",color:a.slot.color}}>{a.slot.name}</span>
                       <span className="text-xs text-slate-500">{a.pool.length} Top Option{a.pool.length===1?"":"s"}</span>
-                      <span className="font-medium ml-auto">→ {w?.name} {bid>0
+                      <span className="font-medium ml-auto">→ {w?.name} {currentBlockHasPoints && (bid>0
                         ? <span className="text-amber-600 text-xs">−{bid} pt{bid===1?"":"s"}</span>
-                        : <span className="text-slate-400 text-xs">no bid</span>}</span>
+                        : <span className="text-slate-400 text-xs">no bid</span>)}</span>
                     </div>
                   );
                 })}</div>
@@ -3970,12 +4091,14 @@ export default function ShiftApp() {
           <p className="text-sm text-ink-700 mb-3 leading-relaxed">
             Blocking <span className="font-semibold">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}</span> will exceed your {limitLabel} limit of <span className="font-semibold">{limitVal}</span> day{limitVal===1?"":"s"}.
           </p>
-          <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-4">
-            <div className="text-xs font-bold uppercase tracking-wider text-amber-800 mb-1">Will deduct at close</div>
-            <div className="text-sm text-amber-900">
-              <span className="font-bold">−{penalty}</span> point{penalty===1?"":"s"} when admin runs Close &amp; assign · your total would land at <span className="font-bold tabular-nums">{projected.toFixed(1)}</span>
+          {currentBlockHasPoints && (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-4">
+              <div className="text-xs font-bold uppercase tracking-wider text-amber-800 mb-1">Will deduct at close</div>
+              <div className="text-sm text-amber-900">
+                <span className="font-bold">−{penalty}</span> point{penalty===1?"":"s"} when admin runs Close &amp; assign · your total would land at <span className="font-bold tabular-nums">{projected.toFixed(1)}</span>
+              </div>
             </div>
-          </div>
+          )}
           <div className="flex gap-2">
             <button onClick={()=>setConfirmBlockOver(null)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-semibold text-ink-700">Cancel</button>
             <button onClick={async ()=>{ const k = confirmBlockOver.dateKey; setConfirmBlockOver(null); await _applyToggleUnavail(k); }} className="flex-1 py-2.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-semibold">Continue, accept cost</button>
@@ -4064,8 +4187,8 @@ export default function ShiftApp() {
                         <th className="text-right py-2 px-1.5" title="Available-day auto. Percent is of this provider's total.">Avail</th>
                         <th className="text-right py-2 px-1.5" title="Admin manual. Percent is of this provider's total.">Adm</th>
                         <th className="text-right py-2 px-1.5" title="Weekend (Sat/Sun) shifts. Percent is of this provider's total.">Wknd</th>
-                        <th className="text-right py-2 px-1.5" title="Spendable points — current bank balance.">Spend</th>
-                        <th className="text-right py-2 px-1.5" title="Projected delta — pending earnings minus any not-yet-applied availability penalty. The change Spend will see by the time this block locks. Goes to 0 once locked.">Proj</th>
+                        {currentBlockHasPoints && <th className="text-right py-2 px-1.5" title="Spendable points — current bank balance.">Spend</th>}
+                        {currentBlockHasPoints && <th className="text-right py-2 px-1.5" title="Projected delta — pending earnings minus any not-yet-applied availability penalty. The change Spend will see by the time this block locks. Goes to 0 once locked.">Proj</th>}
                       </tr>
                     </thead>
                     <tbody>
@@ -4090,8 +4213,8 @@ export default function ShiftApp() {
                             <td className="py-2 px-1.5 text-right tabular-nums text-amber-700">{availCount}{pct(availCount, row.total)}</td>
                             <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{admCount}{pct(admCount, row.total)}</td>
                             <td className="py-2 px-1.5 text-right tabular-nums text-purple-700">{wkndCount}{pct(wkndCount, row.total)}</td>
-                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-900 font-semibold">{row.spendable.toFixed(1)}</td>
-                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{row.projected.toFixed(1)}</td>
+                            {currentBlockHasPoints && <td className="py-2 px-1.5 text-right tabular-nums text-ink-900 font-semibold">{row.spendable.toFixed(1)}</td>}
+                            {currentBlockHasPoints && <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{row.projected.toFixed(1)}</td>}
                           </tr>
                         );
                       })}
@@ -4206,8 +4329,8 @@ export default function ShiftApp() {
                         <th className="text-right py-2 px-1.5" title="Available-day auto. Percent is of this provider's total.">Avail</th>
                         <th className="text-right py-2 px-1.5" title="Admin manual. Percent is of this provider's total.">Adm</th>
                         <th className="text-right py-2 px-1.5" title="Weekend (Sat/Sun) shifts. Percent is of this provider's total.">Wknd</th>
-                        <th className="text-right py-2 px-1.5" title="Spendable points — current bank balance (point-in-time).">Spend</th>
-                        <th className="text-right py-2 px-1.5" title="Projected delta — pending earnings on the current block minus any not-yet-applied availability penalty. The change Spend will see by the time the current block locks. Goes to 0 once locked.">Proj</th>
+                        {currentBlockHasPoints && <th className="text-right py-2 px-1.5" title="Spendable points — current bank balance (point-in-time).">Spend</th>}
+                        {currentBlockHasPoints && <th className="text-right py-2 px-1.5" title="Projected delta — pending earnings on the current block minus any not-yet-applied availability penalty. The change Spend will see by the time the current block locks. Goes to 0 once locked.">Proj</th>}
                       </tr>
                     </thead>
                     <tbody>
@@ -4232,8 +4355,8 @@ export default function ShiftApp() {
                             <td className="py-2 px-1.5 text-right tabular-nums text-amber-700">{availCount}{pct(availCount, row.total)}</td>
                             <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{admCount}{pct(admCount, row.total)}</td>
                             <td className="py-2 px-1.5 text-right tabular-nums text-purple-700">{wkndCount}{pct(wkndCount, row.total)}</td>
-                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-900 font-semibold">{row.spendable.toFixed(1)}</td>
-                            <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{row.projected.toFixed(1)}</td>
+                            {currentBlockHasPoints && <td className="py-2 px-1.5 text-right tabular-nums text-ink-900 font-semibold">{row.spendable.toFixed(1)}</td>}
+                            {currentBlockHasPoints && <td className="py-2 px-1.5 text-right tabular-nums text-ink-700">{row.projected.toFixed(1)}</td>}
                           </tr>
                         );
                       })}
@@ -4375,10 +4498,10 @@ export default function ShiftApp() {
                           let outcome, outcomeCls;
                           if(b.won){
                             if(b.won.source === "cascade"){
-                              outcome = `↪ Cascaded to ${b.won.slot.name}${b.won.charge>0?` · charged ${b.won.charge}`:""}`;
+                              outcome = `↪ Cascaded to ${b.won.slot.name}${currentBlockHasPoints && b.won.charge>0?` · charged ${b.won.charge}`:""}`;
                               outcomeCls = "text-amber-700";
                             } else {
-                              outcome = `✓ Won ${b.won.slot.name}${b.won.charge>0?` · charged ${b.won.charge}`:" · no charge"}`;
+                              outcome = `✓ Won ${b.won.slot.name}${currentBlockHasPoints ? (b.won.charge>0?` · charged ${b.won.charge}`:" · no charge") : ""}`;
                               outcomeCls = "text-emerald-700";
                             }
                           } else {
@@ -4388,7 +4511,7 @@ export default function ShiftApp() {
                           return (
                             <div key={b.uid} className="flex items-center gap-2 text-xs">
                               <span className="text-ink-700 w-32 truncate flex-shrink-0">{b.name}</span>
-                              <span className="text-ink-500 tabular-nums">bid {b.bid}</span>
+                              {currentBlockHasPoints && <span className="text-ink-500 tabular-nums">bid {b.bid}</span>}
                               <span className="text-ink-400">· pref {b.prefSlotName || "Either"}</span>
                               <span className={`ml-auto font-medium ${outcomeCls}`}>{outcome}</span>
                             </div>
@@ -4447,6 +4570,10 @@ export default function ShiftApp() {
   // exact map is stamped on the block as `pointsCreditedAtLock` so unlock/reset can reverse it
   // without recomputation drift.
   const buildBlockEarnings = () => {
+    // Points-off blocks credit nothing at lock — empty map flows through block.lock reducer
+    // as a no-op, and pointsCreditedAtLock gets stamped as null so block.unlock / block.reset
+    // have nothing to reverse later.
+    if (!currentBlockHasPoints) return {};
     const out = {};
     for(const u of users){
       if(u.role !== "provider") continue;
@@ -4455,6 +4582,67 @@ export default function ShiftApp() {
     }
     return out;
   };
+  // Admin creates a new block. Mode (points-on / points-off) is set here and stamped onto the
+  // block as block.usePoints — read by every reducer that touches points so existing blocks stay
+  // in whatever mode they were created in. When points-off, we also shuffle current provider uids
+  // into block.tieBreakOrder so reconcile + auto-swap have a deterministic rotation to consume.
+  const NewBlockModal = () => {
+    if(!newBlockDraft) return null;
+    const draftUsePoints = !!newBlockDraft.usePoints;
+    const createBlock = () => {
+      const id = Date.now();
+      const n = (config.blocks?.length||0) + 1;
+      const nb = { id, name:`Block ${n}`, start:"", end:"", phase: PHASE.AVAIL, usePoints: draftUsePoints };
+      if(!draftUsePoints){
+        // Fisher–Yates over current providers. Producer-side randomness is fine — the result lands
+        // in the config.update payload and the reducer just stores it.
+        const uids = users.filter(u => u.role === "provider").map(u => String(u.id));
+        for(let i = uids.length - 1; i > 0; i--){
+          const j = Math.floor(Math.random() * (i + 1));
+          [uids[i], uids[j]] = [uids[j], uids[i]];
+        }
+        nb.tieBreakOrder = uids;
+      }
+      updateConfig({blocks:[...(config.blocks||[]), nb], currentBlockId:id});
+      setNewBlockDraft(null);
+    };
+    return(
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={()=>setNewBlockDraft(null)}>
+        <div className="bg-white rounded-2xl max-w-md w-full p-5" onClick={e=>e.stopPropagation()}>
+          <div className="text-2xl mb-2">🗓</div>
+          <div className="font-semibold text-xl mb-2">New block</div>
+          <p className="text-sm text-slate-600 mb-4">Choose how this block runs. Locks for the lifetime of the block — you can change the group default any time, but it only affects blocks created after.</p>
+          <div className="space-y-2 mb-4">
+            <button
+              onClick={()=>setNewBlockDraft({usePoints: true})}
+              className={`w-full text-left p-3.5 rounded-xl border-2 transition ${draftUsePoints ? "border-emerald-500 bg-emerald-50" : "border-slate-200 bg-white hover:bg-slate-50"}`}>
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-base">⚖️</span>
+                <span className="font-semibold text-sm">Use points</span>
+                {draftUsePoints && <span className="ml-auto text-xs font-bold text-emerald-700">SELECTED</span>}
+              </div>
+              <p className="text-[11px] text-ink-500 leading-relaxed">Bids on Top Options, point values for day types, availability penalties, trade incentives, lock-time earnings.</p>
+            </button>
+            <button
+              onClick={()=>setNewBlockDraft({usePoints: false})}
+              className={`w-full text-left p-3.5 rounded-xl border-2 transition ${!draftUsePoints ? "border-emerald-500 bg-emerald-50" : "border-slate-200 bg-white hover:bg-slate-50"}`}>
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-base">📋</span>
+                <span className="font-semibold text-sm">Don't use points</span>
+                {!draftUsePoints && <span className="ml-auto text-xs font-bold text-emerald-700">SELECTED</span>}
+              </div>
+              <p className="text-[11px] text-ink-500 leading-relaxed">Schedule-only mode. Top Options are binary, tie-breaks rotate per block, trades are free swaps. Min preferred / max blocked surface as alerts.</p>
+            </button>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={()=>setNewBlockDraft(null)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
+            <button onClick={createBlock} className="flex-1 py-2.5 text-sm bg-brand-600 hover:bg-brand-700 text-white rounded-lg font-medium">Create block</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const ConfirmLockModal = () => {
     if(!confirmLock) return null;
     let assigned=0; for(const k of blockDays){ const day=shifts[k]; if(!day) continue; for(const s of config.shiftSlots){ if(getUid(day[s.id])) assigned++; } }
@@ -4469,7 +4657,7 @@ export default function ShiftApp() {
           <p className="text-sm text-slate-600 mb-3">Moves the block to the <span className="font-semibold">Locked</span> phase. Trades and admin adjustments are still allowed; availability/pool changes are not.</p>
           <ul className="text-sm text-slate-700 space-y-1 mb-4 list-disc list-inside">
             <li><span className="font-medium">{assigned}</span> awarded slot{assigned===1?"":"s"} will be locked in.</li>
-            <li>{totalCredit>0?<><span className="font-medium">{totalCredit.toFixed(1)}</span> pts credited to <span className="font-medium">{creditedCount}</span> provider{creditedCount===1?"":"s"}.</>:"No pending earnings to credit."}</li>
+            {currentBlockHasPoints && <li>{totalCredit>0?<><span className="font-medium">{totalCredit.toFixed(1)}</span> pts credited to <span className="font-medium">{creditedCount}</span> provider{creditedCount===1?"":"s"}.</>:"No pending earnings to credit."}</li>}
             <li>Phase becomes <span className="font-semibold text-slate-700">Locked</span>.</li>
             <li>Use 🔓 Unlock on the dashboard to revert if needed.</li>
           </ul>
@@ -4544,22 +4732,28 @@ export default function ShiftApp() {
             <span className="font-medium" style={{color:slot?.color}}>{slot?.name}</span>
           </div>
           <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-xs text-amber-900">
-            Anyone eligible can claim this shift. The shift's earned points still go to whoever ends up working it. Add an <span className="font-bold">incentive</span> below if you want to spend some of your own points to make the offer more attractive.
+            {currentBlockHasPoints
+              ? <>Anyone eligible can claim this shift. The shift's earned points still go to whoever ends up working it. Add an <span className="font-bold">incentive</span> below if you want to spend some of your own points to make the offer more attractive.</>
+              : <>Anyone eligible can claim this shift. This block doesn't use points — the listing is a straight handoff.</>}
           </div>
-          <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider block mb-2">Incentive points (max {cap})</label>
-          <div className="flex items-center gap-2 mb-4">
-            <button type="button" onClick={()=>setInc(inc-1)} disabled={inc<=0}
-              className="w-9 h-9 rounded-lg bg-white border border-amber-200 hover:bg-amber-50 text-amber-700 flex items-center justify-center font-bold text-base disabled:opacity-30">−</button>
-            <input type="number" min="0" max={cap} value={inc} onChange={e=>setInc(e.target.value)}
-              className="v2-num-input flex-1 px-2 py-2 text-2xl font-extrabold tabular-nums text-center bg-white border border-amber-200 focus:border-amber-400 outline-none rounded-lg text-amber-700"/>
-            <button type="button" onClick={()=>setInc(inc+1)} disabled={inc>=cap}
-              className="w-9 h-9 rounded-lg bg-white border border-amber-200 hover:bg-amber-50 text-amber-700 flex items-center justify-center font-bold text-base disabled:opacity-30">+</button>
-          </div>
+          {currentBlockHasPoints && (<>
+            <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider block mb-2">Incentive points (max {cap})</label>
+            <div className="flex items-center gap-2 mb-4">
+              <button type="button" onClick={()=>setInc(inc-1)} disabled={inc<=0}
+                className="w-9 h-9 rounded-lg bg-white border border-amber-200 hover:bg-amber-50 text-amber-700 flex items-center justify-center font-bold text-base disabled:opacity-30">−</button>
+              <input type="number" min="0" max={cap} value={inc} onChange={e=>setInc(e.target.value)}
+                className="v2-num-input flex-1 px-2 py-2 text-2xl font-extrabold tabular-nums text-center bg-white border border-amber-200 focus:border-amber-400 outline-none rounded-lg text-amber-700"/>
+              <button type="button" onClick={()=>setInc(inc+1)} disabled={inc>=cap}
+                className="w-9 h-9 rounded-lg bg-white border border-amber-200 hover:bg-amber-50 text-amber-700 flex items-center justify-center font-bold text-base disabled:opacity-30">+</button>
+            </div>
+          </>)}
           <div className="flex gap-2">
             <button onClick={()=>setListDraft(null)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
             <button onClick={()=>postForTake(dateKey, slotId, inc)}
               className="flex-1 py-2.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium">
-              Post {inc>0?`with +${inc} pt${inc===1?"":"s"}`:"(no incentive)"}
+              {currentBlockHasPoints
+                ? <>Post {inc>0?`with +${inc} pt${inc===1?"":"s"}`:"(no incentive)"}</>
+                : "Post"}
             </button>
           </div>
         </div>
@@ -4625,16 +4819,22 @@ export default function ShiftApp() {
                 );
               })}</div>
           }
-          <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider block mb-2">Sweetener points (optional, max {cap})</label>
-          <div className="flex items-center gap-2 mb-1">
-            <button type="button" onClick={()=>setInc(inc-1)} disabled={inc<=0}
-              className="w-9 h-9 rounded-lg bg-white border border-blue-200 hover:bg-blue-50 text-blue-700 flex items-center justify-center font-bold text-base disabled:opacity-30">−</button>
-            <input type="number" min="0" max={cap} value={inc} onChange={e=>setInc(e.target.value)}
-              className="v2-num-input flex-1 px-2 py-2 text-2xl font-extrabold tabular-nums text-center bg-white border border-blue-200 focus:border-blue-400 outline-none rounded-lg text-blue-700"/>
-            <button type="button" onClick={()=>setInc(inc+1)} disabled={inc>=cap}
-              className="w-9 h-9 rounded-lg bg-white border border-blue-200 hover:bg-blue-50 text-blue-700 flex items-center justify-center font-bold text-base disabled:opacity-30">+</button>
-          </div>
-          <p className="text-[11px] text-slate-500 mb-4">{listing.incentivePts>0 ? <>You'll receive <span className="font-bold">+{listing.incentivePts}</span> pt{listing.incentivePts===1?"":"s"} from {seller?.name?.split(" ")[0]||"the lister"} on accept. </> : null}{inc>0 ? `You give them +${inc} pt${inc===1?"":"s"}.` : "No sweetener — pure shift swap."}</p>
+          {currentBlockHasPoints && (<>
+            <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider block mb-2">Sweetener points (optional, max {cap})</label>
+            <div className="flex items-center gap-2 mb-1">
+              <button type="button" onClick={()=>setInc(inc-1)} disabled={inc<=0}
+                className="w-9 h-9 rounded-lg bg-white border border-blue-200 hover:bg-blue-50 text-blue-700 flex items-center justify-center font-bold text-base disabled:opacity-30">−</button>
+              <input type="number" min="0" max={cap} value={inc} onChange={e=>setInc(e.target.value)}
+                className="v2-num-input flex-1 px-2 py-2 text-2xl font-extrabold tabular-nums text-center bg-white border border-blue-200 focus:border-blue-400 outline-none rounded-lg text-blue-700"/>
+              <button type="button" onClick={()=>setInc(inc+1)} disabled={inc>=cap}
+                className="w-9 h-9 rounded-lg bg-white border border-blue-200 hover:bg-blue-50 text-blue-700 flex items-center justify-center font-bold text-base disabled:opacity-30">+</button>
+            </div>
+          </>)}
+          <p className="text-[11px] text-slate-500 mb-4">
+            {currentBlockHasPoints
+              ? <>{listing.incentivePts>0 ? <>You'll receive <span className="font-bold">+{listing.incentivePts}</span> pt{listing.incentivePts===1?"":"s"} from {seller?.name?.split(" ")[0]||"the lister"} on accept. </> : null}{inc>0 ? `You give them +${inc} pt${inc===1?"":"s"}.` : "No sweetener — pure shift swap."}</>
+              : "Pure shift swap — this block doesn't use points."}
+          </p>
           <div className="flex gap-2">
             <button onClick={()=>setTradeDraft(null)} className="flex-1 py-2.5 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Cancel</button>
             <button onClick={()=>sel && offerTrade(tradeDraft.listingId, sel.k, sel.sid, inc)} disabled={!sel}
@@ -4958,7 +5158,7 @@ export default function ShiftApp() {
                     {dayHasListing&&<span className="text-[9px] text-blue-600" title="One or more slots posted for take or trade">🔄</span>}
                     {adminHasAuto&&!adminChallenging&&<span className="text-[9px] text-amber-600" title="Contains auto-assigned slots">⚙</span>}
                     {availPhase && me.role==="admin" && dayTopCount>0 && <span className="text-[9px] text-blue-600 font-bold" title={`${dayTopCount} Top Option${dayTopCount===1?"":"s"}`}>🎯{dayTopCount}</span>}
-                    {pts>0&&<span className="text-xs sm:text-sm font-semibold text-slate-700 tabular-nums">+{pts}</span>}
+                    {pts>0&&currentBlockHasPoints&&<span className="text-xs sm:text-sm font-semibold text-slate-700 tabular-nums">+{pts}</span>}
                   </span>
                 </div>
                 {hol&&<div className="text-[8px] text-green-800 truncate leading-tight mt-0.5">{hol}</div>}
@@ -5074,7 +5274,7 @@ export default function ShiftApp() {
               <div className="flex-1 min-w-0">
                 <div className="flex flex-wrap items-center gap-1.5 mb-0.5">
                   <span className="font-medium text-sm">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}{myWant?<span className="text-emerald-500 ml-0.5">⭐</span>:""}</span>
-                  {base>0&&<span className={`text-[11px] px-1.5 py-0.5 rounded-full font-semibold tabular-nums ${pillBg}`}>+{base}</span>}
+                  {base>0&&currentBlockHasPoints&&<span className={`text-[11px] px-1.5 py-0.5 rounded-full font-semibold tabular-nums ${pillBg}`}>+{base}</span>}
                   {hol&&<span className="text-[10px] bg-green-100 text-green-800 px-1.5 py-0.5 rounded-full truncate">{hol}</span>}
                   {myUn&&<span className="text-[10px] bg-red-200 text-red-900 px-1.5 py-0.5 rounded-full font-semibold">✕ Blocked</span>}
                   {adminChallenging&&(
@@ -5135,29 +5335,31 @@ export default function ShiftApp() {
       {autoC>0&&(()=>{ const npc=getAutoNonPrefCount(me.id); const npBonus=npc*(config.nonPreferredBonus||0); return (
         <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 mb-3 text-sm">
           <span className="font-medium text-blue-900">⚙ {autoC} auto-assigned shift{autoC>1?"s":""}</span>
-          {npBonus>0&&<span className="text-blue-700"> (+{npBonus} non-pref bonus pts)</span>}
+          {currentBlockHasPoints && npBonus>0 && <span className="text-blue-700"> (+{npBonus} non-pref bonus pts)</span>}
         </div>
       );})()}
-      {/* Provider alert: preferred-day shortfall. The penalty is a forecast while the block is
-          still in Availability — admin's Close & assign is what realizes it. After that we keep
-          the alert visible but reframe it as historical info. */}
+      {/* Provider alert: availability requirements not met. Fires on either preferred-day shortfall
+          OR block-overage — both surface here so the user sees every violation in one place. The
+          penalty footer is points-only (gated) and reframed historically in Recon+. */}
       {!avail.meets&&currentBlock&&(
         <div className="bg-surface rounded-2xl shadow-card border border-slate-200/70 p-5 sm:p-6 mb-3">
           <div className="flex items-start gap-3">
             <div className="w-10 h-10 rounded-lg bg-red-100 text-red-700 flex items-center justify-center flex-shrink-0 text-xl leading-none">⚠️</div>
             <div className="flex-1 min-w-0">
-              <h2 className="text-base sm:text-lg font-bold text-ink-900">Alert: Preferred shift shortfall</h2>
+              <h2 className="text-base sm:text-lg font-bold text-ink-900">Alert: Availability requirements not met</h2>
               <div className="mt-2 bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-900 space-y-1">
                 {avail.dayShort>0&&<div>Need <span className="font-bold tabular-nums">{avail.dayShort}</span> more Top Option{avail.dayShort===1?"":"s"} or preferred day{avail.dayShort===1?"":"s"}.</div>}
-                {avail.wkShort>0&&<div>Need <span className="font-bold tabular-nums">{avail.wkShort}</span> more weekend day{avail.wkShort===1?"":"s"}.</div>}
-                <div className="pt-1 font-bold">{isAvailabilityOpen(currentBlock)?"Will deduct at close":"Deducted at close"}: −{avail.penalty} pt{avail.penalty===1?"":"s"}</div>
+                {avail.wkShort>0&&<div>Need <span className="font-bold tabular-nums">{avail.wkShort}</span> more preferred weekend day{avail.wkShort===1?"":"s"}.</div>}
+                {avail.blockOver>0&&<div>Blocking <span className="font-bold tabular-nums">{avail.blockOver}</span> more day{avail.blockOver===1?"":"s"} than the limit.</div>}
+                {avail.blockWkOver>0&&<div>Blocking <span className="font-bold tabular-nums">{avail.blockWkOver}</span> more weekend day{avail.blockWkOver===1?"":"s"} than the limit.</div>}
+                {currentBlockHasPoints && <div className="pt-1 font-bold">{isAvailabilityOpen(currentBlock)?"Will deduct at close":"Deducted at close"}: −{avail.penalty} pt{avail.penalty===1?"":"s"}</div>}
               </div>
             </div>
           </div>
         </div>
       )}
-      <div className="grid grid-cols-3 gap-2 sm:gap-4 mb-5">
-        <Stat label="Total pts" value={total.toFixed(total%1?1:0)} color={total<0?"text-red-600":"text-amber-600"}/>
+      <div className={`grid ${currentBlockHasPoints ? "grid-cols-3" : "grid-cols-2"} gap-2 sm:gap-4 mb-5`}>
+        {currentBlockHasPoints && <Stat label="Total pts" value={total.toFixed(total%1?1:0)} color={total<0?"text-red-600":"text-amber-600"}/>}
         <Stat label="Shifts" value={`${count}/${min||"—"}`} color="text-blue-600"/>
         <Stat label="Available" value={`${avail.availD}/${blockDays.length||"—"}`} color={avail.meets?"text-green-600":"text-red-600"}/>
       </div>
@@ -5350,13 +5552,15 @@ export default function ShiftApp() {
               {failingAvail.length>0&&(
                 <div className="bg-red-50 border border-red-200 rounded-xl p-3">
                   <div className="font-semibold text-red-900 text-sm mb-1">{failingAvail.length} not meeting availability requirements</div>
-                  <div className="text-[11px] text-red-700/80 mb-1">{isAvailabilityOpen(currentBlock)?"Penalties below will be deducted at Close & assign.":"Penalties below were deducted at Close & assign."}</div>
+                  <div className="text-[11px] text-red-700/80 mb-1">{currentBlockHasPoints
+                    ? (isAvailabilityOpen(currentBlock)?"Penalties below will be deducted at Close & assign.":"Penalties below were deducted at Close & assign.")
+                    : "Providers below are below the min preferred / above the max blocked thresholds."}</div>
                   <ul className="text-xs text-red-800 space-y-0.5">{failingAvail.map(u=>{
                     const a=getAvailInfo(u.id);
                     const parts=[];
                     if(!a.prefMeets)parts.push(`pref ${a.pref}/${config.minPreferredDays}`);
                     if(!a.blockMeets)parts.push(`blocks ${a.blocked}/${config.maxBlockedDays}`);
-                    return <li key={u.id}>{u.name} — {parts.join(" · ")} · −{a.penalty} pts</li>;
+                    return <li key={u.id}>{u.name} — {parts.join(" · ")}{currentBlockHasPoints ? ` · −${a.penalty} pts` : ""}</li>;
                   })}</ul>
                 </div>
               )}
@@ -5637,8 +5841,10 @@ export default function ShiftApp() {
             )}
           </div>
         </div>
-        {/* Points + Pool count — quick at-a-glance running totals */}
-        <div className="mt-4 pt-4 border-t border-slate-200 grid grid-cols-2 gap-3">
+        {/* Points + Pool count — quick at-a-glance running totals. Spendable tile hides in
+            points-off blocks (no bids, no spending — the bank value would be misleading). */}
+        <div className={`mt-4 pt-4 border-t border-slate-200 grid ${currentBlockHasPoints ? "grid-cols-2" : "grid-cols-1"} gap-3`}>
+          {currentBlockHasPoints && (
           <div className="bg-slate-50 rounded-xl px-4 py-3 border border-slate-200/70">
             <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-500">Spendable points</div>
             <div className={`text-2xl sm:text-3xl font-extrabold tabular-nums mt-0.5 leading-none ${myPoints<0?"text-red-600":"text-brand-700"}`}>{myPoints.toFixed(1)}</div>
@@ -5647,6 +5853,7 @@ export default function ShiftApp() {
             ) : null}
             <div className="text-[10px] text-ink-400 mt-1 leading-tight">Cap on your bids. Shifts you win this block don't credit pts until the block locks.</div>
           </div>
+          )}
           <div className="bg-slate-50 rounded-xl px-4 py-3 border border-slate-200/70">
             <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-500">Top Option dates</div>
             <div className="flex items-baseline gap-1.5 mt-0.5 leading-none">
@@ -5851,7 +6058,7 @@ export default function ShiftApp() {
                   <span className="text-blue-600 text-xs leading-none" title="Linked with adjacent day(s) — all or nothing">🔗</span>
                 )}
                 {wanted && !meTopOpt && <span className="text-emerald-500 text-sm leading-none" title="Preferred">⭐</span>}
-                {pts>0 && <span className={`text-[11px] px-2 py-0.5 rounded-full font-semibold tabular-nums ${pillBg}`}>+{pts} pt{pts>1?"s":""}</span>}
+                {pts>0 && currentBlockHasPoints && <span className={`text-[11px] px-2 py-0.5 rounded-full font-semibold tabular-nums ${pillBg}`}>+{pts} pt{pts>1?"s":""}</span>}
                 {isWk && <span className="text-[10px] bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded-full font-medium">Weekend</span>}
                 {hol && <span className="text-[10px] bg-emerald-50 text-emerald-800 border border-emerald-200 px-2 py-0.5 rounded-full font-medium">{hol}</span>}
                 {blocked && <span className="text-[10px] bg-red-100 text-red-800 border border-red-200 px-2 py-0.5 rounded-full font-bold">✕ Blocked{reason?` · ${reason}`:""}</span>}
@@ -6098,7 +6305,7 @@ export default function ShiftApp() {
           <div className="flex-1 min-w-0">
             <div className="flex flex-wrap items-center gap-1.5 mb-1">
               <span className="font-medium text-sm">{MONTHS_SHORT[date.getMonth()]} {date.getDate()}</span>
-              {pts>0 && <span className="text-[11px] px-1.5 py-0.5 rounded-full font-semibold tabular-nums bg-slate-100 text-slate-700">+{pts}</span>}
+              {pts>0 && currentBlockHasPoints && <span className="text-[11px] px-1.5 py-0.5 rounded-full font-semibold tabular-nums bg-slate-100 text-slate-700">+{pts}</span>}
               {isWk && <span className="text-[10px] bg-amber-50 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded-full font-medium">Weekend</span>}
               {hol && <span className="text-[10px] bg-emerald-50 text-emerald-800 border border-emerald-200 px-1.5 py-0.5 rounded-full font-medium">{hol}</span>}
               {myShift && <span className="text-[10px] bg-emerald-100 text-emerald-800 border border-emerald-300 px-1.5 py-0.5 rounded-full font-bold">✓ You're on</span>}
@@ -6113,7 +6320,7 @@ export default function ShiftApp() {
                   <span key={s.id} className={`text-[10px] px-2 py-0.5 rounded-full font-semibold inline-flex items-center gap-1 ${isMe ? "bg-emerald-100 text-emerald-800" : "text-white"}`}
                     style={!isMe ? { background: s.color } : {}}>
                     {s.name}: {isMe ? "You" : u.name}{auto ? " ⚙" : ""}
-                    {listing && <span className="text-[10px]" title={`Posted for take/trade · incentive +${listing.incentivePts||0}`}>🔄</span>}
+                    {listing && <span className="text-[10px]" title={currentBlockHasPoints ? `Posted for take/trade · incentive +${listing.incentivePts||0}` : "Posted for take/trade"}>🔄</span>}
                   </span>
                 );
                 return (
@@ -6244,7 +6451,7 @@ export default function ShiftApp() {
                     return r ? <div className="text-[11px] text-red-700 italic mt-1 truncate">"{r}"</div> : null;
                   })()}
                 </div>
-                <span className="bg-green-100 text-green-700 text-xs px-2 py-1 rounded-full font-medium flex-shrink-0">+{earnedPts.toFixed(m.pts%1?2:0)}</span>
+                {currentBlockHasPoints && <span className="bg-green-100 text-green-700 text-xs px-2 py-1 rounded-full font-medium flex-shrink-0">+{earnedPts.toFixed(m.pts%1?2:0)}</span>}
               </button>
               {/* Action row — only in Recon+ phases. Three buttons styled like the segmented control on the Schedule list. */}
               {reconOrLater && (
@@ -6540,6 +6747,9 @@ export default function ShiftApp() {
   // an icon tile + bold heading + brief description. Top Action card surfaces the phase-aware CTA.
   const SetupPage = () => {
     const holidayList = Object.entries(config.holidays);
+    // Hide / grey points-related Setup surfaces when the currently-selected block is points-off.
+    // No current block (fresh group) → show everything so admin can pre-configure.
+    const blockUsesPoints = !currentBlock || currentBlock.usePoints !== false;
     // Top action state — phase-aware. AVAIL: Close & assign. RECON: Lock. LOCKED: Unlock.
     const canAct = !!currentBlock && !!currentBlock.start && !!currentBlock.end;
     const phase = phaseOf(currentBlock);
@@ -6618,10 +6828,12 @@ export default function ShiftApp() {
         subtitle="Create a new block when the current one wraps. Old blocks stay available — switch between them to review history."
         action={
           <button onClick={()=>{
-            const id = Date.now();
-            const n = (config.blocks?.length||0) + 1;
-            const nb = { id, name:`Block ${n}`, start:"", end:"", phase: PHASE.AVAIL };
-            updateConfig({blocks:[...(config.blocks||[]), nb], currentBlockId:id});
+            // Default to the most recently-created block's mode so admins running a no-points
+            // group don't have to flip every time. Falls back to true for fresh groups.
+            const blocks = config.blocks || [];
+            const last = blocks.length ? blocks.slice().sort((a,b)=>(b.id||0)-(a.id||0))[0] : null;
+            const defaultUsePoints = last ? (last.usePoints !== false) : true;
+            setNewBlockDraft({usePoints: defaultUsePoints});
           }}
             className="text-xs font-bold px-3 py-1.5 rounded-lg bg-brand-50 text-brand-700 hover:bg-brand-100 flex-shrink-0">
             + New block
@@ -6671,12 +6883,20 @@ export default function ShiftApp() {
                     </div>
                   </div>
                   <div className="mt-2 flex items-center justify-between text-[11px]">
-                    {(()=>{ const bp=phaseOf(b); const bt=PHASE_TONE[bp]; return (
-                      <span className={`inline-flex items-center gap-1 font-semibold ${bt.text}`}>
-                        <span className={`w-1.5 h-1.5 rounded-full ${bt.dot}`}></span>
-                        {PHASE_LABEL[bp]}
-                      </span>
-                    ); })()}
+                    <div className="flex items-center gap-2">
+                      {(()=>{ const bp=phaseOf(b); const bt=PHASE_TONE[bp]; return (
+                        <span className={`inline-flex items-center gap-1 font-semibold ${bt.text}`}>
+                          <span className={`w-1.5 h-1.5 rounded-full ${bt.dot}`}></span>
+                          {PHASE_LABEL[bp]}
+                        </span>
+                      ); })()}
+                      {/* Per-block points mode badge. Block-level flag, frozen at create. */}
+                      {b.usePoints === false ? (
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-slate-100 text-ink-600 font-semibold">📋 No points</span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 font-semibold">⚖️ Points</span>
+                      )}
+                    </div>
                     {isCur&&<span className="text-ink-400 italic">Phase changes via the action button above</span>}
                   </div>
                 </div>
@@ -6723,7 +6943,8 @@ export default function ShiftApp() {
         </SetupCard>
       </div>
 
-      {/* Point values — full-width (5 day types fit side-by-side) */}
+      {/* Point values — hidden when current block is points-off (irrelevant in that mode). */}
+      {blockUsesPoints && (
       <div className="mt-4">
         <SetupCard
           icon="⭐"
@@ -6748,55 +6969,63 @@ export default function ShiftApp() {
           {config.pointValuesLocked&&<p className="text-[11px] text-ink-500 mt-3 italic">Using default point values. Tap <span className="font-semibold">🔒 Unlock</span> to edit.</p>}
         </SetupCard>
       </div>
+      )}
 
-      {/* 2-col: Availability requirements + Scoring bonuses */}
-      <div className="grid md:grid-cols-2 gap-4 mt-4">
-        <SetupCard icon="📋" title="Availability requirements" subtitle="How many days each provider must prefer, and how many days they can block. Points deducted for violation of either requirement.">
+      {/* Availability requirements (thresholds stay live in both modes — they drive alerts).
+          Scoring bonuses is points-only, so it disappears entirely in points-off mode and
+          Availability requirements stretches full-width. */}
+      <div className={`grid ${blockUsesPoints ? "md:grid-cols-2" : ""} gap-4 mt-4`}>
+        <SetupCard icon="📋" title="Availability requirements" subtitle={blockUsesPoints
+          ? "How many days each provider must prefer, and how many days they can block. Points deducted for violation of either requirement."
+          : "How many days each provider must prefer, and how many days they can block. Violations surface as alerts (no point penalties in this block)."}>
           <div className="space-y-4">
-            {/* Row 1 — Preferred days required */}
+            {/* Row 1 — Preferred days required. "Pts deducted" greys in points-off mode. */}
             <div>
               <div className="text-xs font-bold text-emerald-700 uppercase tracking-[0.1em] mb-2 flex items-center gap-1.5">
                 <span>⭐</span> Preferred days required
               </div>
               <div className="grid grid-cols-3 gap-3">
                 {[
-                  ["Min days", config.minPreferredDays, v=>updateConfig({minPreferredDays:parseInt(v)||0}), "0", "1"],
-                  ["Min weekends", config.minPreferredWeekendDays, v=>updateConfig({minPreferredWeekendDays:parseInt(v)||0}), "0", "1"],
-                  ["Pts deducted", config.preferredShortfallPenalty, v=>updateConfig({preferredShortfallPenalty:parseFloat(v)||0}), "0", "0.5"],
-                ].map(([l,v,set,min,step])=>(
-                  <div key={l}>
+                  ["Min days", config.minPreferredDays, v=>updateConfig({minPreferredDays:parseInt(v)||0}), "0", "1", false],
+                  ["Min weekends", config.minPreferredWeekendDays, v=>updateConfig({minPreferredWeekendDays:parseInt(v)||0}), "0", "1", false],
+                  ["Pts deducted", config.preferredShortfallPenalty, v=>updateConfig({preferredShortfallPenalty:parseFloat(v)||0}), "0", "0.5", !blockUsesPoints],
+                ].map(([l,v,set,min,step,disabled])=>(
+                  <div key={l} className={disabled ? "opacity-50" : ""}>
                     <div className="text-[10px] font-bold text-ink-500 uppercase tracking-[0.1em] mb-1.5">{l}</div>
-                    <input type="number" min={min} step={step} value={v} onChange={e=>set(e.target.value)}
-                      className="w-full px-3 py-2 border border-slate-200 rounded-lg text-lg font-bold tabular-nums text-center bg-white text-ink-900"/>
+                    <input type="number" min={min} step={step} value={v} disabled={disabled} onChange={e=>set(e.target.value)}
+                      className={`w-full px-3 py-2 border border-slate-200 rounded-lg text-lg font-bold tabular-nums text-center ${disabled?"bg-slate-50 text-ink-500 cursor-not-allowed":"bg-white text-ink-900"}`}/>
                   </div>
                 ))}
               </div>
             </div>
-            {/* Row 2 — Blocked days allowed */}
+            {/* Row 2 — Blocked days allowed. "Pts / extra" greys in points-off mode. */}
             <div className="pt-3 border-t border-slate-200">
               <div className="text-xs font-bold text-red-600 uppercase tracking-[0.1em] mb-2 flex items-center gap-1.5">
                 <span>✕</span> Blocked days allowed
               </div>
               <div className="grid grid-cols-3 gap-3">
                 {[
-                  ["Max days", config.maxBlockedDays, v=>updateConfig({maxBlockedDays:parseInt(v)||0}), "0", "1"],
-                  ["Max weekends", config.maxBlockedWeekendDays, v=>updateConfig({maxBlockedWeekendDays:parseInt(v)||0}), "0", "1"],
-                  ["Pts / extra", config.blockOverLimitPenalty, v=>updateConfig({blockOverLimitPenalty:parseFloat(v)||0}), "0", "0.5"],
-                ].map(([l,v,set,min,step])=>(
-                  <div key={l}>
+                  ["Max days", config.maxBlockedDays, v=>updateConfig({maxBlockedDays:parseInt(v)||0}), "0", "1", false],
+                  ["Max weekends", config.maxBlockedWeekendDays, v=>updateConfig({maxBlockedWeekendDays:parseInt(v)||0}), "0", "1", false],
+                  ["Pts / extra", config.blockOverLimitPenalty, v=>updateConfig({blockOverLimitPenalty:parseFloat(v)||0}), "0", "0.5", !blockUsesPoints],
+                ].map(([l,v,set,min,step,disabled])=>(
+                  <div key={l} className={disabled ? "opacity-50" : ""}>
                     <div className="text-[10px] font-bold text-ink-500 uppercase tracking-[0.1em] mb-1.5">{l}</div>
-                    <input type="number" min={min} step={step} value={v} onChange={e=>set(e.target.value)}
-                      className="w-full px-3 py-2 border border-slate-200 rounded-lg text-lg font-bold tabular-nums text-center bg-white text-ink-900"/>
+                    <input type="number" min={min} step={step} value={v} disabled={disabled} onChange={e=>set(e.target.value)}
+                      className={`w-full px-3 py-2 border border-slate-200 rounded-lg text-lg font-bold tabular-nums text-center ${disabled?"bg-slate-50 text-ink-500 cursor-not-allowed":"bg-white text-ink-900"}`}/>
                   </div>
                 ))}
               </div>
               <p className="text-[11px] text-ink-500 mt-2 italic leading-relaxed">
-                Providers are warned and can opt to over-block at the listed cost per extra day. The deduction is applied when you run Close &amp; assign, so it doesn't gate bidding.
+                {blockUsesPoints
+                  ? <>Providers are warned and can opt to over-block at the listed cost per extra day. The deduction is applied when you run Close &amp; assign, so it doesn't gate bidding.</>
+                  : <>Providers see an alert when they exceed the limit. No point deduction is applied in this block.</>}
               </p>
             </div>
           </div>
         </SetupCard>
 
+        {blockUsesPoints && (
         <SetupCard icon="🎁" title="Scoring bonuses" subtitle="Extra points when a provider gets auto-assigned to a date they didn't star. Contested slots are settled by user-set bids.">
           <div className="space-y-3">
             <div>
@@ -6810,6 +7039,7 @@ export default function ShiftApp() {
             </p>
           </div>
         </SetupCard>
+        )}
       </div>
 
       {/* Holidays — full-width */}
@@ -7663,7 +7893,7 @@ export default function ShiftApp() {
         ))}
       </nav>
 
-      {DaySheet()}{Onboarding()}{AutoAssignModal()}{ReconcileModal()}{ConfirmResetModal()}{ConfirmLockModal()}{ConfirmBlockOverModal()}{BlockReportModal()}{ProviderReportModal()}{AllocationSummaryModal()}{FlagDraftModal()}{ListDraftModal()}{TradeDraftModal()}{AddUserModal()}{NewUserInfoModal()}{profile && <ProfileModal/>}
+      {DaySheet()}{Onboarding()}{AutoAssignModal()}{ReconcileModal()}{ConfirmResetModal()}{ConfirmLockModal()}{NewBlockModal()}{ConfirmBlockOverModal()}{BlockReportModal()}{ProviderReportModal()}{AllocationSummaryModal()}{FlagDraftModal()}{ListDraftModal()}{TradeDraftModal()}{AddUserModal()}{NewUserInfoModal()}{profile && <ProfileModal/>}
       {toast&&<Toast msg={toast}/>}
     </div>
     </>

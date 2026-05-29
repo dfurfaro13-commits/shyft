@@ -752,16 +752,18 @@
           openIncentives: applyOpenIncentivesPatch(next.openIncentives, p.openIncentivesPatch),
         };
         if (p.blockId) {
-          next = {
-            ...next,
-            config: patchBlockInConfig(next.config, p.blockId, {
-              phase: "reconciliation",
-              lastReconcileDeltas: p.deltas || {},
-              pointsAtClose: p.pointsAtClose || null,
-              availPenalties: p.availPenalties || {},
-              targetsAtClose: p.targetsAtClose || null,
-            }),
+          // tieBreakOrder is only present when the block is points-off — the producer rotates
+          // the queue through reconcile + auto-assign and stamps the final state here. Omitted
+          // payload → no stomp (points-on blocks don't carry this field at all).
+          const blockPatch = {
+            phase: "reconciliation",
+            lastReconcileDeltas: p.deltas || {},
+            pointsAtClose: p.pointsAtClose || null,
+            availPenalties: p.availPenalties || {},
+            targetsAtClose: p.targetsAtClose || null,
           };
+          if (Array.isArray(p.tieBreakOrder)) blockPatch.tieBreakOrder = p.tieBreakOrder;
+          next = { ...next, config: patchBlockInConfig(next.config, p.blockId, blockPatch) };
         }
         return next;
       },
@@ -1002,12 +1004,12 @@
       },
 
       "shift.swap-admin": (s, e) => {
-        const { fromUid, toUid, dateKey, slotId } = e.payload || {};
+        const { fromUid, toUid, dateKey, slotId, blockId, tieBreakOrder } = e.payload || {};
         if (!dateKey || slotId == null) return s;
         const day = s.shifts[dateKey];
         const entry = day?.[slotId];
         if (!entry) return s;
-        return {
+        let next = {
           ...s,
           shifts: {
             ...s.shifts,
@@ -1018,6 +1020,13 @@
           },
           marketplace: closeAutoListingFor(s.marketplace, dateKey, slotId),
         };
+        // Points-off blocks: the producer rotated the tie-break queue when picking the new
+        // assignee — stamp the updated order on the block. Payload field is omitted in
+        // points-on mode, so this is a no-op for normal flows.
+        if (blockId && Array.isArray(tieBreakOrder)) {
+          next = { ...next, config: patchBlockInConfig(next.config, blockId, { tieBreakOrder }) };
+        }
+        return next;
       },
 
       "shift.trade-admin": (s, e) => {
