@@ -6746,7 +6746,14 @@ export default function ShiftApp() {
   // Each settings group lives in its own bg-surface rounded-2xl shadow-card panel with
   // an icon tile + bold heading + brief description. Top Action card surfaces the phase-aware CTA.
   const SetupPage = () => {
-    const holidayList = Object.entries(config.holidays);
+    // Holidays live at the config (group) level but only the ones inside the current block are
+    // relevant to the admin's current view — old holidays from prior blocks just clutter. Filter
+    // them out when a block is active; show all when no current block (fresh group setup).
+    const allHolidays = Object.entries(config.holidays);
+    const holidayList = currentBlock
+      ? allHolidays.filter(([d]) => inBlock(d, config))
+      : allHolidays;
+    const hiddenHolidayCount = allHolidays.length - holidayList.length;
     // Hide / grey points-related Setup surfaces when the currently-selected block is points-off.
     // No current block (fresh group) → show everything so admin can pre-configure.
     const blockUsesPoints = !currentBlock || currentBlock.usePoints !== false;
@@ -7055,6 +7062,11 @@ export default function ShiftApp() {
                 </div>
               ))}
             </div>
+          )}
+          {hiddenHolidayCount > 0 && (
+            <p className="text-[11px] text-ink-500 italic mb-3">
+              {hiddenHolidayCount} holiday{hiddenHolidayCount===1?"":"s"} outside this block hidden. Switch to the relevant block to view or edit.
+            </p>
           )}
           <div className="pt-3 border-t border-slate-200">
             <div className="text-[10px] font-bold text-ink-500 uppercase tracking-[0.12em] mb-2">Add holiday</div>
