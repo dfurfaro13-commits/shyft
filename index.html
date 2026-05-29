@@ -3766,6 +3766,19 @@ function ShiftApp() {
       const uid=getUid(e);
       if(liveCount[uid]!==undefined){ liveCount[uid]++; liveDates[uid].add(k); }
     }));
+    // Cumulative weekend count per provider, seeded from result[]. Includes all historical
+    // weekend awards across blocks AND any Top Option weekends just reconciled this pass — so
+    // a heavy-Top-Option provider naturally drops in the preferred/available weekend ranking.
+    // Used as an in-sort tier in rankFor; applies in both points and points-off modes.
+    const liveWeekend = {};
+    provs.forEach(p => { liveWeekend[p.id] = 0; });
+    Object.entries(result).forEach(([k, day]) => {
+      if(!isWeekend(k)) return;
+      Object.values(day).forEach(e => {
+        const uid = getUid(e);
+        if(liveWeekend[uid] !== undefined) liveWeekend[uid]++;
+      });
+    });
     const MS_DAY = 86400000;
     const isAtMax = p => { const m=p.targets?.max||0; return m>0 && liveCount[p.id]>=m; };
     const spacingScore = (p, dateKey) => {
@@ -3798,6 +3811,7 @@ function ShiftApp() {
     // Common per-pass ranking. `wantedFilter` decides which providers are eligible at all
     // for this pass (preferred-only in pass 1, non-preferred in pass 2).
     const rankFor = (dateKey, wantedFilter) => {
+      const dateIsWeekend = isWeekend(dateKey);
       const elig = provs.filter(p => {
         if(isAtMax(p)) return false;                                      // hard max cap
         if(isUnavail(p.id, dateKey)) return false;                        // not on blocked days
@@ -3817,6 +3831,12 @@ function ShiftApp() {
         const aId=a.targets?.ideal||0, bId=b.targets?.ideal||0;
         const aBi=aId>0&&liveCount[a.id]<aId, bBi=bId>0&&liveCount[b.id]<bId;
         if(aBi!==bBi) return aBi?-1:1;
+        // 3.5) Weekend balance — on weekend dates, prefer providers with fewer cumulative
+        //      weekends so far. Cumulative across blocks (liveWeekend seeded from full shifts
+        //      state), includes Top Option awards from this same reconcile. Applies in both
+        //      points and points-off modes; sits above the generic liveCount fairness so it
+        //      actually steers weekend picks without being overridden by general shift-count.
+        if(dateIsWeekend && liveWeekend[a.id]!==liveWeekend[b.id]) return liveWeekend[a.id]-liveWeekend[b.id];
         // 4) Fairness fallback.
         if(liveCount[a.id]!==liveCount[b.id]) return liveCount[a.id]-liveCount[b.id];
         // Points-off blocks: final tie-break via the rotating queue (lower idx = next).
@@ -3838,6 +3858,7 @@ function ShiftApp() {
           result[dateKey][slot.id] = {...(prev||{}), uid:winner.id, auto:true, source};
           liveCount[winner.id]++;
           liveDates[winner.id].add(dateKey);
+          if(isWeekend(dateKey)) liveWeekend[winner.id]++;
           // Winner moves to the back of the rotating queue (points-off mode).
           if (!currentBlockHasPoints) rotateWinner(winner.id);
           newA.push({dateKey,slot,user:winner,source});
@@ -4203,12 +4224,19 @@ function ShiftApp() {
   // flag so the admin can see them (especially preferred-day candidates) and override when
   // appropriate. Used by the admin Flagged-shifts panel for one-click reassignment.
   const findSwapCandidates = (dateKey, originalUid) => {
-    const liveCount = {};
-    users.forEach(u => { if(u.role==="provider") liveCount[u.id] = 0; });
-    Object.values(shifts).forEach(day => Object.values(day).forEach(e => {
-      const uid = getUid(e);
-      if(uid != null && liveCount[uid] !== undefined) liveCount[uid]++;
-    }));
+    const dateIsWeekend = isWeekend(dateKey);
+    const liveCount = {}, liveWeekend = {};
+    users.forEach(u => { if(u.role==="provider") { liveCount[u.id] = 0; liveWeekend[u.id] = 0; } });
+    Object.entries(shifts).forEach(([k, day]) => {
+      const wk = isWeekend(k);
+      Object.values(day).forEach(e => {
+        const uid = getUid(e);
+        if(uid != null && liveCount[uid] !== undefined){
+          liveCount[uid]++;
+          if(wk) liveWeekend[uid]++;
+        }
+      });
+    });
     const candidates = users.filter(u => {
       if(u.role !== "provider" || !u.seniorityId) return false;
       if(u.id === originalUid) return false;
@@ -4222,6 +4250,7 @@ function ShiftApp() {
         user: u,
         preferred: isWanted(u.id, dateKey),
         currentCount,
+        weekendCount: liveWeekend[u.id] || 0,
         snapshotPts: snapshotPtsForReconcile(u.id),
         atMax: max > 0 && currentCount >= max,
         maxTarget: max,
@@ -4239,6 +4268,10 @@ function ShiftApp() {
     candidates.sort((a,b) => {
       // Preferred providers ranked above non-preferred.
       if(a.preferred !== b.preferred) return a.preferred ? -1 : 1;
+      // Weekend balance on weekend dates — prefer candidates with fewer cumulative weekend
+      // shifts so swap suggestions don't pile weekends on someone already carrying their share.
+      // Applies in both points and points-off modes.
+      if(dateIsWeekend && a.weekendCount !== b.weekendCount) return a.weekendCount - b.weekendCount;
       // Points-off: rotating queue position.
       if (!currentBlockHasPoints) return orderIdx(a.user.id) - orderIdx(b.user.id);
       // Then highest snapshot points wins.
