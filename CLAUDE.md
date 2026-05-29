@@ -111,140 +111,74 @@ Component-local helpers (anything inside `function ShiftApp(...)`) only need upd
 | `migrations/0006_email_changes.sql` | Self-service profile: `email_change_tokens` table backing the magic-link email-confirmation step of `POST /api/me/change-email-request`. |
 | `migrations/0007_password_reset_tokens.sql` | Forgot-password: `password_reset_tokens` table backing `POST /api/auth/forgot-password` + the server-rendered `GET /api/auth/reset-password` form. |
 | `legacy/` | Archived v1/v2 source + built HTML, plus v1-era assignment-algorithm simulators. **Do not read or grep into.** |
-| `~/.claude/plans/*.md` | Planning artifacts. Look for the most recent one for context on the latest change. |
 
 ---
 
-## Backend (Phase A → D.4.D2, all shipped)
+## Backend (Cloudflare Worker + D1 + R2)
 
-The Cloudflare Worker fronts a D1 database + R2 bucket. As of D.4.D2, cloud is the source of truth: `loadGroup` rehydrates from snapshot + event-tail replay, mutations go through `applyAndTrack` → reducer → POST event, a 15s poll syncs cross-device. localStorage still holds the per-group cache (so the UI reads it directly) but it's downstream of the reducer, not the source.
+Cloud is the source of truth. Mutations flow `applyAndTrack` → reducer (pure) → `setX + persist` + `POST /api/events`. A 15s periodic poll syncs cross-device; the snapshot uploader is a 30s-debounced compaction job. localStorage is a per-group cache, downstream of the reducer.
 
-- **Deploy:** `npx wrangler deploy` (after `wrangler login`, `d1 create shift-db`, paste id into `wrangler.jsonc`, run each `migrations/000*.sql` file via `d1 execute shift-db --remote --file=…`, `r2 bucket create shift-events`, and `wrangler secret put RESEND_API_KEY`, `SESSION_PEPPER`, `OWNER_BOOTSTRAP_CODE`).
-- **Local dev:** `npx wrangler dev`. Create `.dev.vars` (gitignored) with `RESEND_API_KEY=...` and `DEV_EMAIL=console` to log magic links instead of sending.
-- **Email sender:** custom domain is live (`shift-scheduling.com` via Resend, sender `noreply@shift-scheduling.com`). `EMAIL_FROM` is configured; magic links deliver to any address.
-- **CSRF:** every state-changing API call must send `X-Requested-With: shift`. The `window.api.fetchJSON` shim in `templates/shyft_head.v3.html` adds it automatically.
-- **Sessions:** opaque `shift_sid` cookie. Server stores `SHA-256(SESSION_PEPPER + raw)`; raw value never persisted.
-- **Deploy hygiene.** The Worker's `assets.directory` is `./` (worktree root), so anything not excluded by `.assetsignore` ships as a public asset. Current `.assetsignore` excludes `*.sql`, `*.sqlite*`, `.git`, `.git/`, `.dev.vars`, `src/`, `migrations/`, etc. Before any deploy, sanity-check what `wrangler deploy` reports as new uploads.
+**Deploy / local dev:**
+- Deploy: `npx wrangler deploy`. First-time setup: `wrangler login`; `d1 create shift-db` (paste id into `wrangler.jsonc`); run each `migrations/000*.sql` via `d1 execute shift-db --remote --file=…`; `r2 bucket create shift-events`; `wrangler secret put RESEND_API_KEY`, `SESSION_PEPPER`, `OWNER_BOOTSTRAP_CODE`.
+- Local: `npx wrangler dev --remote` runs the Worker at `localhost:8787` against deployed D1 / R2. Create `.dev.vars` (gitignored) with `RESEND_API_KEY=…` and `DEV_EMAIL=console` to log magic links to stdout.
+- Email: Resend on `shift-scheduling.com`, sender `noreply@shift-scheduling.com`.
+- Deploy hygiene: `assets.directory` is `./` (worktree root), so `.assetsignore` is the gate. Sanity-check what `wrangler deploy` reports as new uploads before pushing.
 
-### Phase B — append-only event log
+**CSRF / sessions:** every state-changing API call needs `X-Requested-With: shift` (the `window.api.fetchJSON` shim adds it). Sessions: opaque `shift_sid` cookie; server stores `SHA-256(SESSION_PEPPER + raw)`. Cookies share via `Domain=shift-scheduling.com` so apex + www are interchangeable.
 
-Every meaningful state mutation fires `POST /api/events` to D1. The original call surface was a component-local `trackEvent(type, payload, opts?)` helper; D.4.D2 Phase 3 superseded that with `applyAndTrack`, and `trackEvent` itself was removed for being dead code. The Worker rejects unknown types — to add a new event type, append it to `ALLOWED_TYPES` in `src/api/events.js` first. 27 wired types currently (26 from D.4.A/B + `shift.take-open` for provider self-take from Trades). R2 archival of the event log is deferred — D1 is queryable directly and we'll dump monthly archives only when the corpus gets large enough to need it.
+### Event log (`POST /api/events`)
 
-### Phase C — snapshot sync
+- Allowed types whitelisted in `ALLOWED_TYPES` ([src/api/events.js](src/api/events.js)). To add a new event type, append there first or the Worker rejects with 400.
+- Response: `{ id, serverTs }`. **Consumers MUST dedupe by event `id`** — `server_ts` is second-granular and events can share a tick.
+- Tail: `GET /api/events?gid=&since=&limit=&type=`. Default 500, max 2000, soft 512 KB cap. `nextCursor` = last returned `serverTs` (inclusive).
+- **Outbox:** `localStorage.shyft3_evt_outbox` parks bodies on transport failure (cap 500). Flushes on `visibilitychange→visible`, `online`, and microtask on load. 4xx drops. UI surfaces queue depth via an amber "📭 N queued · syncing…" badge top-right; toasts on first-queued ("📭 Saved locally"), full-flush ("✅ Synced"), and server reject ("⚠ Server rejected"). Server still mints event ids, so transport-failure retries can theoretically create duplicates — fine because the outbox only fires when the request never reached the server. Client UUIDs + `INSERT OR IGNORE` are deferred.
+- **Per-tab client id:** `SHYFT_CLIENT_ID` (sessionStorage UUID; module-scope constant in head template + mirrored stub in JSX preamble). Stamped into every event payload by `buildEventBody`; cross-device poll filters on `evt.payload.clientId === SHYFT_CLIENT_ID` to skip own-tab events. Legacy events without `clientId` fall back to the old `localUid` filter.
+- **Local event id stamp:** `applyAndTrack` stamps `local_${Date.now()}_${rand}` on each event before running the reducer, so `applyEvent`'s `if (!evt.id) return state` guard doesn't bail. The local id is NOT in the body POSTed to the server (server still mints the canonical id).
+- R2 archival of the event log is deferred — D1 is queryable directly, monthly dumps wait until the corpus grows.
 
-After every per-group `persist()`, a debounced uploader fires `POST /api/snapshots` with the entire per-group state plus the local-only group metadata (`groupCode`, `adminCode`, `name`, `createdAt`). D1 stores the latest (one row per group, last-write-wins); R2 stores history at `snapshots/<groupId>/<server_ts>-<client_ts>.json`. D.4.D2 Phase 4 demoted the uploader: **2s → 30s debounce + dirty gate** (only uploads when `persist` has run since the last successful upload).
+### Reducer (`applyEvent` in head template)
 
-**The manual Sync banner (`checkCloudSyncOffer` / `acceptCloudSync` / amber JSX) was removed in D.4.D2 Phase 5** — the 15s periodic poll handles cross-device sync continuously now. `applySnapshot` survives because the first-device-claim Restore card on the auth screen and the owner-auto-restore useEffect both still need it: any cloud membership not matched to a local `groups[]` entry renders a "Restore" card; clicking pulls the latest snapshot and creates the local group from `payload.meta`.
+- Pure: no `Date.now()`, no `Math.random()`, no clock reads. Non-deterministic inputs must travel in payload — see D.4.B-era enrichments: `block.reconcile.awards` (flat `{dateKey, slotId, uid, source, auto, bid?}`), `topOption.clear.chainRepair`, `shift.flag.listing`, etc.
+- Idempotent via a FIFO `appliedEventIds` ring (cap 200). Unknown event types are forward-compat no-ops.
+- **Validator:** `await window.__shiftValidator.run()` (cloud-owner only) replays events through `applyEvent` and deep-diffs against live state. Expect `✅ 0 divergences`. The historical shadow-diff inside `trackEvent` was removed; the validator is the only divergence detector now.
+- **`applyAndTrack` flow:** producer captures non-determinism into payload → `applyAndTrack` stamps local id → runs reducer → object-identity diffs each slice → `setX + persist`s only the changed slices → POSTs the body. Shadow-diff is intentionally bypassed because predicted == actual by construction.
 
-`buildSnapshotPayload` reads from a `snapshotStateRef` updated render-time (not via useEffect). This fixes a stale-closure bug where the 2s debounced upload was uploading pre-mutation state — caught by D.4.C's validator.
+### Snapshots (`POST /api/snapshots`)
 
-**Concurrency control.** `POST /api/snapshots` accepts `If-Match: <serverTs>` and returns 409 with the current serverTs when stale. The frontend doesn't yet send `If-Match` — backwards-compatible last-write-wins is preserved. Making it mandatory remains deferred.
+- Debounced 30s, gated by a `snapshotDirty` ref set by `persist()`. D1 stores latest (one row per group); R2 stores history at `snapshots/<groupId>/<server_ts>-<client_ts>.json`. Snapshot is a compaction optimization + rehydration baseline — event log + poll are authoritative for realtime sync.
+- `buildSnapshotPayload` reads from `snapshotStateRef` (updated render-time, NOT useEffect) to avoid stale-closure uploads of pre-mutation state.
+- Concurrency: `If-Match: <serverTs>` accepted, returns 409 with current serverTs when stale. Frontend doesn't yet send it — last-write-wins preserved. Mandatory `If-Match` is deferred.
+- `applySnapshot` survives because the first-device-claim **Restore card** + owner-auto-restore useEffect still need it: any cloud membership not matched to a local `groups[]` entry renders a "Restore" card → clicking pulls latest snapshot and creates the local group from `payload.meta`. The historical "Sync banner" was removed in D.4.D2 — polling supersedes it.
 
-### Phase D — backend-as-truth (D.1 + D.2 + D.2.5 + D.3 + D.4.A + D.4.B + D.4.C + D.4.D1 + D.4.D2 shipped)
+### Auth surface
 
-**D.1 (password auth + cloud user creation).** PBKDF2 password hashes on `users` (310k iters, SHA-256, 16-byte salt; format `pbkdf2$310000$<salt>$<hash>`) and a `kind ∈ ('real','test')` designator. `POST /api/auth/password` issues a session for email+password, rate-limited 10/hr per (email, ip) via `password_attempts`. `POST /api/users` is the admin create-cloud-user surface: `kind='test'` mints a synthetic `<localId>@<cloudGroupId>.test.invalid` email + temp password; `kind='real'` pre-issues a magic link via Resend. The "+ Add user" modal in PeoplePage wires both flows; `NewUserInfoModal` surfaces local + cloud credentials in separate panels.
+2-tab Sign in / Sign up. Old Owner / Cloud tabs are gone.
+- **`POST /api/auth/signup`** ([src/api/signup.js](src/api/signup.js)): self-serve. With group code → `provider`; matching admin code elevates to `admin`; matching `OWNER_BOOTSTRAP_CODE` Worker secret → `can_create_groups = 1` AND group code becomes optional (cold-start owner). Rate-limited 10/hr per IP.
+- **`POST /api/auth/password`** looks up by email OR username (`emailOrUsername` field). Rate-limited 10/hr per (email, ip) via `password_attempts`. Passwords are PBKDF2 (310k iters, SHA-256, 16-byte salt; format `pbkdf2$310000$<salt>$<hash>`).
+- **`POST /api/groups`** and **`/api/groups/:gid/migrate`** gated on `can_create_groups`. Migrate creates a cloud group + one `kind='test'` user per local user; result modal shows email + temp-password once.
+- **`POST /api/users`** is the admin create-cloud-user surface. `kind='test'` mints synthetic `<localId>@<cloudGroupId>.test.invalid`; `kind='real'` pre-issues a magic link via Resend.
+- **Magic link** is the fallback under "Or email me a sign-in link" (only fires when input contains `@`).
+- **Forgot password** ([src/api/reset.js](src/api/reset.js)): `POST /api/auth/forgot-password` (rate-limited 5/hr per user via row count in `password_reset_tokens`; always returns 204 to prevent enumeration) → server-rendered `GET /api/auth/reset-password?token=…` form (32-byte tokens, single-use, 15-min TTL) → `POST /api/auth/reset-password` revokes other live sessions on success.
+- **Self-service profile** ([src/api/profile.js](src/api/profile.js)): `PATCH /api/me/profile` (display name; frontend additionally fires `user.update` into EVERY group the caller is a member of so the per-group `users[gid][i].name` stays in sync), `POST /api/me/password` (current-password gated), `POST /api/me/change-email-request` (magic link to new address, applied via `GET /api/auth/verify-email-change` with apply-time uniqueness re-check). ProfileModal opens from sidebar chip / mobile avatar / SuperDashboard topbar. Disabled during impersonation.
 
-**D.2 (one-shot migration).** `POST /api/groups/:gid/migrate` creates a cloud group, marks the caller `owner`, creates one `kind='test'` user per local user, and uploads the supplied snapshot to D1 + R2. SuperDashboard renders a "Migrate to cloud" button on local-only groups; the result modal shows the email+temp-password for each migrated user (only once).
+### Cloud-owner bridge + impersonation
 
-**D.2.5 (cloud-owner bridge + owner impersonation).**
+`me.role === "super"` is derived from `cloudUser.memberships.some(m => m.role === "owner") || cloudUser.user.canCreateGroups` when no local session is present. Precedence: **impersonation > local session > cloud-owner bridge** — local sign-in wins so test-user switching works mid-cloud-session. SuperDashboard's "👁 View as" → `ImpersonatePickerModal` → `startImpersonate(gid, localUid)`; state persists in `sessionStorage` under `shyft3_impersonate`. **Caveat:** events during impersonation attribute to the impersonated `localUid`.
 
-- **Cloud-owner bridge.** The `me` useMemo derives `me.role === "super"` from `cloudUser.memberships.some(m => m.role === "owner") || cloudUser.user.canCreateGroups` when no local session is present. Precedence: impersonation > local session > cloud-owner bridge — local sign-in always wins so test-user switching works mid-cloud-session.
-- **Owner impersonation.** SuperDashboard's "👁 View as" button → `ImpersonatePickerModal` lists admins+providers for that group (read directly from localStorage via `readGroupKey`, no group-load required) → `startImpersonate(gid, localUid)` awaits `loadGroup` then sets the `impersonate` state. State `{groupId, localUid}` persists in `sessionStorage` under `shyft3_impersonate`. An amber sticky banner shows "👤 Impersonating <name> · Stop" while active. **Caveat:** events during impersonation attribute to the impersonated `localUid`. Acceptable for test groups; revisit when real providers are using the app.
+### Accounts management
 
-**D.3 (cloud-backed auth).** Local Sign in / Sign up are gone; their replacements are cloud-backed on a 2-tab auth screen. Migration `0005_username_owner.sql` adds `users.username` (nullable, unique-when-not-null partial index), `users.can_create_groups`, `groups.group_code`, `groups.admin_code`, plus `signup_attempts`. Grandfathers existing owners (`can_create_groups = 1` for everyone with an `owner` membership), backfills `groups.group_code` / `admin_code` from the latest snapshot's `payload.meta`.
+Owner-only `GET/PATCH/DELETE /api/owner/users[/:uid]` ([src/api/owner.js](src/api/owner.js)). Owner self-edits go through ProfileModal (Accounts excludes self by server-side filter). `AccountsEditModal` requires confirm-twice for email + password (typos on a password reset would otherwise lock the target user out with no recovery path).
 
-- **`POST /api/auth/signup`** ([src/api/signup.js](src/api/signup.js)): self-serve. `{ displayName, email, username, password, groupCode?, adminCode?, ownerCode? }`. Owner code matched against `OWNER_BOOTSTRAP_CODE` Worker secret; valid → `can_create_groups = 1` AND group code becomes optional (cold-start owner). With a group code → `provider`; matching admin code elevates to `admin`. Rate-limited 10/hr per IP.
-- **`POST /api/auth/password`** looks up by `email OR username` (single `emailOrUsername` field; legacy `email` alias still accepted). Response includes `username` and `canCreateGroups`.
-- **`POST /api/groups`** and **`POST /api/groups/:gid/migrate`** are gated on `can_create_groups`; both persist `group_code` and `admin_code` on the row.
-- **`OWNER_BOOTSTRAP_CODE`** secret currently `Shyft-Kai-Dave`. Set via `wrangler secret put` and in `.dev.vars` for local dev.
+**Delete cascades at three layers:**
+- Client, currently-loaded group: `applyAndTrack("user.delete", { uid, cascadeShifts })`.
+- Client, non-loaded affected groups: hand-edit localStorage so the next open sees correct state.
+- Server: `patchSnapshotRemoveUser` rewrites the D1 snapshot for each affected `(group_id, local_uid)` pair (filters user out of `payload.users`, cascade-cleans `shifts` / `unavail` / `prefs` / `topOptions`) and writes a fresh R2 history entry stamped `patchedBy: "deleteOwnerUser"`. Refuses to delete a user who owns any group.
 
-Frontend changes:
+### Load-bearing quirks
 
-- Auth screen has 2 tabs (Sign in / Sign up); the old Owner and Cloud tabs are gone.
-- Sign in: single "Email or username" + password + "Or email me a sign-in link instead" (magic-link fallback only fires when the input contains `@`).
-- Sign up: name + email + username + password + group code + admin code + owner code. Group code required unless owner code is present.
-- **`enterGroupAsCloudMember`** is the post-auth navigation helper for non-owner roles: pulls the latest snapshot, inserts local `groups[]` + `users[gid][i]` entries tagged with `cloudUserId`, and sets `session` so `me` resolves. Owners are a no-op (cloud bridge handles them).
-- The unified `signOut` revokes the cloud session AND clears local + impersonation state.
-- Pre-D.3 `shyft3_supers` localStorage key is pruned on first load via a one-shot block in `templates/shyft_head.v3.html` (marker `shyft3_migrate_prune_supers`).
-
-**Accounts management.** Owner-only surface in SuperDashboard (top-right "Accounts" button). [src/api/owner.js](src/api/owner.js) exposes:
-- `GET /api/owner/users` — lists users in caller's owned groups (self excluded, memberships rolled up).
-- `PATCH /api/owner/users/:uid` — change email and/or password (rejects self-edit, email collisions, short passwords).
-- `DELETE /api/owner/users/:uid` — drops memberships in caller's owned groups; if no memberships remain anywhere, fully tombstones (anonymizes email/display_name, NULLs username + password_hash, deletes sessions + login_tokens + password_attempts). Refuses to delete a user who owns any group.
-
-Frontend: `AccountsModal` lists users with kind/magic-link badges + (group, role) chips; `AccountsEditModal` and `AccountsDeleteModal` are the action surfaces.
-
-**D.4.A (backend foundation).** Allow-listed 13 event types in [src/api/events.js](src/api/events.js): the 12 wired in D.4.B (`user.create`, `user.update`, `user.delete`, `block.reset`, `shift.swap-admin`, `shift.trade-admin`, `trade.offer-post`, `trade.offer-accept`, `trade.offer-decline`, `incentive.open-set`, `config.update`, `unavail.reason`) plus a `snapshot.bootstrap` placeholder. `POST /api/events` now returns `{ id, serverTs }` (via `INSERT … RETURNING server_ts`). `MAX_PAYLOAD_BYTES` 16K → 64K to absorb cascade payloads. New `GET /api/events?gid=&since=&limit=&type=` paginated event tail (default 500, max 2000, soft 512 KB cap), ordered `(server_ts ASC, id ASC)`. **Consumers MUST dedupe by event `id`** because `server_ts` is second-granularity and several events can share a tick. `nextCursor` is the last returned `serverTs` (inclusive).
-
-**D.4.B (event payload wiring).** Wires the 12 new event types into the frontend and enriches several payloads:
-- `block.reconcile` carries `awarded` / `cleared` / `pointsDeltas` / `availPenalties` / `pointsAtClose` / `openIncentivesPatch` so the reducer doesn't have to re-derive the cascade.
-- `topOption.clear` and `topOption.unlink` carry `chainRepair` so the reducer can replay a chain split without `Math.random`.
-- `shift.flag` carries the auto-posted `listing` (created or pre-existing) so the reducer can replay the marketplace side effect.
-
-All 26 mutation paths in `ShiftApp.v3.jsx` now fire `trackEvent`, so the D1 event log is a complete record of state changes.
-
-**D.4.C (applyEvent reducer + offline validator).** Pure-function reducer (`applyEvent(state, evt)` in `templates/shyft_head.v3.html`; the JSX preamble holds signature-only stubs for IDE awareness) maps each of the 26 event types onto a state transition. Deterministic: no `Date.now()`, no `Math.random()`, no clock reads — all stamping data either lives in payload (D.4.B's enrichments) or is derived from existing state. Idempotency via a FIFO `appliedEventIds` ring (cap 200). Unknown event types are forward-compat no-ops. Validator: `window.__shiftValidator.run()` (cloud-owner only) pulls the latest snapshot, replays every newer event through `applyEvent`, and deep-diffs the result against live state. Soak passed `✅ 0 divergences` across all event types.
-
-**D.4.D1 (dual-write shadow diff + event outbox).** Two additive pieces — localStorage still authoritative.
-
-- **Shadow diff.** `trackEvent` is now a dispatcher: snapshots live state synchronously (via `validatorLiveRef`, updated render-time so the deferred compare sees post-mutation state), schedules a `setTimeout(0)` to replay the event through `applyEvent` against that snapshot, and diffs against the now-updated live state. Mismatches log a grouped `[shadow-diff] ❌` console error. Runs unconditionally for cloud-signed-in users on cloud-mirrored groups. Cost ≈ sub-ms per event. Every divergence = a real reducer bug.
-- **Event outbox.** `window.api.postEvent(body)` wraps the `/api/events` POST; on transport failure or 5xx/408/429 the body is parked in `localStorage.shyft3_evt_outbox` (cap 500). Flushed in order on `visibilitychange→visible`, `online`, and once on load via `queueMicrotask`. 4xx errors are dropped. Idempotency caveat: server still mints event ids, so a retry that already committed creates a duplicate row — fine here because the outbox only fires on genuine transport failures (request never reached the server). Client UUIDs + `INSERT OR IGNORE` are deferred to D.4.E.
-
-**D.4.D2 (cloud-authoritative cutover).** Six sub-phases, all shipped. localStorage is now downstream of the reducer.
-
-- **Phase 1 — `loadGroup` cloud-first.** `loadGroupFromCloud(gid, cloudGid)` pulls `/api/snapshots/:gid/latest`, replays events since `snap.serverTs` through `applyEvent`, stamps a per-group `shyft3_g<gid>_lastSeenServerTs` cursor, and writes through to localStorage via `writeGroupStateToStorage` (8 per-group keys). Conservative reverse-sync guard: if local has data AND the cloud snapshot has no payload, push local up first to protect the D.4.B → D.4.D2 danger window. `loadGroup` falls back to local-only on any cloud failure.
-
-- **Phase 2 — periodic poll.** New `useEffect` gated on `(groupId, cloudUser, currentGroup.cloudGroupId, me.id)`. While the document is visible, polls `GET /api/events?gid=&since=<lastSeenServerTs>` every 15s. Each batch is filtered (skip events stamped with this tab's `SHYFT_CLIENT_ID`), replayed through `applyEvent` via `validatorLiveRef`, and changed slices are dispatched via `setX + persist`. Visibility-aware (start on visible, clear on hidden, immediate poll on each transition); inflight guard prevents overlap.
-
-- **Phase 2.1 — per-tab `SHYFT_CLIENT_ID`.** Random UUID held in `sessionStorage` (survives reload, unique per tab); module-scope constant in head template, mirrored in JSX preamble. Stamped into every event payload by `buildEventBody` (via `applyAndTrack`). Cross-device poll filters on `evt.payload.clientId === SHYFT_CLIENT_ID` (skip own-tab events). Fixes the two-windows-of-the-same-user sync gap that the old `localUid == me.id` filter created. Pre-2.1 events without `clientId` fall back to the legacy `localUid` filter.
-
-- **Phase 3 — mutation flow refactor.** All 26 imperative `trackEvent` callsites are gone. Each mutation now flows through `applyAndTrack(type, payload, opts)`:
-  1. `buildEventBody(type, payload, opts)` builds the wire body (extracted from `trackEvent` so `applyAndTrack` and `trackEvent` share one canonical body + one `clientTs` — the reducer reads `e.clientTs` for `postedAt`/`takenAt` fields and any drift between the two would surface as shadow-diff).
-  2. Stamps a local `id` (`local_${Date.now()}_${rand}`) onto the event so `applyEvent`'s `if (!evt.id) return state` guard doesn't bail. The local id is NOT in the body POSTed to the server (server still mints).
-  3. Runs `applyEvent(cleanBefore, evt)` against `validatorLiveRef.current`.
-  4. Object-identity diffs each slice — only `setX + persist`s the slices that actually changed (reducer returns the same reference for untouched slices).
-  5. POSTs the same body the reducer consumed. Shadow-diff is intentionally bypassed because predicted == actual by construction now.
-  Producer side stays responsible for eligibility checks + capturing non-deterministic inputs into payload (e.g. `chainRepair`, listing ids, `pointsTransferred`). Two helper deletions fell out: `_postListing` (callers inline the "find existing or mint id" branch) and `updateCurrentBlock` (every block transition fires its own event whose reducer patches `config.blocks` via `patchBlockInConfig`).
-
-- **Phase 4 — snapshot uploader demotion.** Debounce `2s → 30s`; `snapshotDirty` ref gates `uploadSnapshot` (set true by `persist()` on any write, cleared on successful POST). Snapshot is now a compaction optimization + rehydration baseline, not the primary persistence path. Event log + poll are authoritative for realtime sync.
-
-- **Phase 5 — manual Sync banner removed.** Polling supersedes it. Deleted `cloudSyncOffer` state, `checkCloudSyncOffer`, the dependent `useEffect`, `acceptCloudSync`, and the amber banner JSX.
-
-**Two latent bugs surfaced + fixed during Phase 3 soak:**
-- Wire-format string vs local numeric uid mismatch in the marketplace flow (`offer.offererId` stored as string by `trade.offer-post` reducer, compared with strict-equality against numeric `me.id` in `acceptTradeOffer`). Fix: `uidVal(fromUid)` in the reducer + `String(a) === String(b)` defensive comparisons across the affected handlers (commits `73919da` for the swap-admin equivalent, `a09bf4f` for offer/accept).
-- `applyEvent`'s `if (!evt.id) return state` guard caused `applyAndTrack` to no-op silently when first written (server mints id on POST; applyAndTrack had no local id). Symptom: A's tab didn't update on its own actions even though B saw them via poll. Fix: stamp `local_${ts}_${rand}` on the evt (commit `c645e29`).
-
-**`block.reconcile` payload contract had three latent shape bugs** that the pre-Phase-3 imperative `applyReconcile` masked (post-mutation awaits made `validatorLiveRef` stale at shadow-diff time, turning the diff vacuous for shifts/openIncentives and only-real for the users cascade). Surfaced + fixed in commit `8e2cd63`: payload `awards` shape was `{winner, slot: target, ...}` but reducer reads `{uid, slotId, ...}` (silently skipped all entries); payload only carried reconcile awards, not auto-assign cells (replaying devices missed auto-assigns); `applyAwardsToShifts` hardcoded `auto: false`. All three fixed: rebuild a flat awards array from diffing `finalShifts` vs pre-reconcile `shifts`, in reducer-expected shape, with `auto` carried through.
-
-**Accounts delete cascade** (commit `af62dbf` + D.4.E follow-up): owner-level `DELETE /api/owner/users/:uid` now triggers cleanup at three layers:
-- Client, currently-loaded group: `applyAndTrack("user.delete", { uid, cascadeShifts })` — reducer handles the four-slice cascade + cross-device event propagation via the event log.
-- Client, non-loaded affected groups: hand-edit localStorage (so the next time the deleter opens those groups they don't see the user).
-- Server (D.4.E): for each affected (group_id, local_uid) pair, `patchSnapshotRemoveUser` in `src/api/owner.js` rewrites the D1 snapshot — filter user out of `payload.users`, cascade-clean `shifts` / `unavail` / `prefs` / `topOptions` — and writes a fresh R2 history entry stamped `patchedBy: "deleteOwnerUser"`. Ensures any other device opening the group later via `loadGroupFromCloud` pulls correct state, not stale.
-
-Reducer's `user.delete` extended in the same D.4.E commit to also cascade `topOptions` (was missing — would have left zombie bid entries on cross-device replay).
-
-### Self-service profile + forgot-password (post-D.4.E)
-
-Two small surfaces layered on top of the Phase D foundation; no protocol changes, just new endpoints.
-
-**Profile** ([src/api/profile.js](src/api/profile.js)) — three endpoints, all require a live session, all CSRF-checked:
-- `PATCH /api/me/profile { displayName }` — updates `users.display_name`. Frontend additionally propagates by firing a `user.update` event into the event log of EVERY group the caller is a member of, so per-group `users[gid][i].name` (what the schedule UI actually renders) stays in sync. For the currently-loaded group it routes through `applyAndTrack`; for other groups it hand-edits each group's localStorage `users[]` + posts a standalone `user.update` event so the next loadGroup/poll on those groups sees the new name.
-- `POST /api/me/password { currentPassword, newPassword }` — re-auths via `verifyPassword` then writes a fresh hash. The current-password gate is what stops a hijacked open session from locking the real user out.
-- `POST /api/me/change-email-request { newEmail }` — uniqueness check, mints a token in `email_change_tokens` (migration 0006), emails a confirmation link to the NEW address via `sendEmailChangeLink` (a sibling of `sendMagicLink` sharing the `sendLink` core in [src/lib/email.js](src/lib/email.js)). The change is applied by `GET /api/auth/verify-email-change?token=…` in [src/api/auth.js](src/api/auth.js), which validates + re-checks uniqueness at apply-time (race against concurrent claims) + flips `users.email`. Existing sessions stay valid; the new email shows on the next `/api/me` poll.
-
-Frontend surface: `ProfileModal` opens when the user clicks their name. Sidebar chip (desktop), avatar (mobile topbar), and an explicit "Profile" button next to "Sign out" in the SuperDashboard topbar all open it. Disabled during impersonation (would edit the owner's profile under the impersonated name).
-
-**Forgot password** ([src/api/reset.js](src/api/reset.js)) — three endpoints:
-- `POST /api/auth/forgot-password { emailOrUsername }` — lookup by email OR username, rate-limited 5/hr per user via row count in `password_reset_tokens` (migration 0007), always returns 204 so callers can't enumerate accounts.
-- `GET /api/auth/reset-password?token=…` — server-rendered HTML form (matches the verify-page style), two password fields + confirm-match in inline JS. Tokens are 32-byte random, single-use, 15-min TTL.
-- `POST /api/auth/reset-password { token, newPassword }` — validates token + applies new hash, revokes other live sessions for the user (forgotten password could imply compromise), mints a fresh session via Set-Cookie. CSRF still required — the form's inline JS adds `X-Requested-With`, so an embed on a third-party site can't drive this.
-
-Frontend: "Forgot password?" link below the magic-link button on the Sign in form. Click → inline form with single "Email or username" input → confirmation message uses deliberately-vague phrasing ("If &lt;input&gt; matches an account…") to avoid leaking account existence.
-
-### Account management ergonomics (today)
-
-- Owner can self-edit through the **Profile** button (the Accounts modal still excludes the caller, per the existing server-side filter).
-- `AccountsEditModal` now requires confirm-twice for both email and password. Each "Confirm" input is disabled until its primary field has content. `submitAccountsEdit` rejects with a specific error before sending if either pair doesn't match. Rationale: an owner typo on a password reset would lock the target user out with no recovery path other than another owner edit.
+- **Uid form** — see [Coding conventions](#coding-conventions) for the full rule. Strict-equality between numeric local + wire-string forms has bitten us twice (`73919da`, `a09bf4f`).
+- **`block.reconcile` payload shape** — `awards` MUST be a flat array `{dateKey, slotId, uid, source, auto, bid?}`. MUST include both reconcile AND auto-assign cells (replaying devices miss auto-assigns otherwise). `auto` must be carried through per-entry — don't hardcode false. Three latent shape bugs around this were fixed in `8e2cd63`.
+- **Pre-D.3 cleanup** — `shyft3_supers` localStorage key is pruned on first load via a one-shot block in `templates/shyft_head.v3.html` (marker `shyft3_migrate_prune_supers`).
 
 ---
 
@@ -292,7 +226,7 @@ availability  →  reconciliation  →  locked
 ```
 
 - **availability**: providers edit availability/preferences/Top Options/bids. Pools (Top Options) accept signups.
-- **reconciliation**: assignments computed and frozen. Providers confirm/flag awarded shifts. Marketplace open. Auto-swap engine fires on flag.
+- **reconciliation**: assignments computed and frozen. Providers confirm/flag awarded shifts. Marketplace open. Flags auto-post to the marketplace at zero incentive and surface in the admin's Flagged Shifts module for one-click swap / trade.
 - **locked**: points are committed (Step 2 of build, deferred). Marketplace stays open for take-style trades. Admin adjustments allowed.
 
 Phase constants:
@@ -364,11 +298,11 @@ Three things added on top of the phase machine:
 
 Each entry can carry `confirm: "ok"|"flagged"` and `flagReason: string`. Provider sees Confirm/Flag buttons on each of their awarded shifts in the **My shifts** page during Reconciliation+.
 
-`flagShift(dateKey, slotId, reason)` runs `computeAutoSwap` first. If a candidate is found (someone preferring this date, below max, not blocked, has seniority), the shift reassigns silently. If not, the entry is marked flagged AND auto-posted to the marketplace at zero incentive.
+`flagShift(dateKey, slotId, reason)` marks the entry flagged + auto-posts it to the marketplace at zero incentive (so anyone can take it), then surfaces it in the admin's Flagged Shifts module. v3.2 removed the silent auto-reassign path — every flag now goes to admin review.
 
-### Auto-swap engine
+### Swap candidates (admin-driven)
 
-`computeAutoSwap(dateKey, slotId, originalUid)` returns the best swap candidate or `null`. Filters: prefers the date, below max, not blocked, has seniority, not already on this day. Tiebreak: highest `snapshotPtsForReconcile()` then lowest uid.
+`findSwapCandidates(dateKey, originalUid)` returns the full ranked list of eligible alternatives for the admin. Filters: not the current assignee, not blocked, not already on this day, has seniority. Ranking: preferred-date first, then `snapshotPtsForReconcile()` desc (or rotating tie-break index when the block is points-off), then lowest uid. Admin commits via `acceptSwapCandidate` → `shift.swap-admin` event. Max-cap is NOT a hard filter — at-max candidates are surfaced with an `atMax` flag so the admin can knowingly override.
 
 ### Marketplace (take + two-sided trades)
 
@@ -439,6 +373,9 @@ The `shift.admin-assign` reducer change is the natural cleanup — a cleared slo
 - **Determinism for `applyEvent`.** Anything inside an `EVENT_HANDLERS` branch must be pure — no `Date.now()`, no `Math.random()`, no clock reads. If a handler needs entropy or a timestamp, the producer in `ShiftApp.v3.jsx` must capture it into the event payload (see D.4.B's `chainRepair`, `listing`, `awarded` enrichments).
 - **New mutations go through `applyAndTrack`.** Every state mutation flows `applyAndTrack(type, payload, opts)` → reducer → `setX + persist + POST`. Add a handler to `EVENT_HANDLERS` in the head template (mirror a reference stub `(s, e) => s` in the JSX preamble's `EVENT_HANDLERS` block — the whole reducer family in the preamble is stubs-only, see [head-template sync](#-critical-gotcha-head-template-sync)). Capture non-deterministic inputs into payload; the producer just does eligibility checks + `await applyAndTrack(...)`. No direct `setX + persist` in handlers. For cascades that touch multiple slices, design the reducer to do all of them; `applyAndTrack`'s object-identity diff dispatches only the slices that actually changed.
 - **Uid form: numeric local, stringified on the wire.** Local `users[i].id` is numeric; `me.id` and `entry.uid` in `shifts` are numeric. The wire format stringifies uids (`fromUid: String(me.id)`, etc.) for forward-compat with cloud-uuid uids someday. The reducer normalizes via `uidVal(...)` when writing into numeric-keyed fields (shifts[].uid, marketplace .offererId, .takenBy). For cross-source comparisons, always use the `eqId(a, b)` helper (canonical copy in head template near `uidVal`, mirror in JSX preamble) — strict-equality between numeric local and wire-string forms has bitten us twice already (`73919da`, `a09bf4f`). `eqId` also returns false for null/null, so it doubles as a "set & equal" check.
+- **Per-block points-mode gating.** `block.usePoints` is the per-block flag (no group-level setting — that was added then explicitly removed during design as too friction-y). `currentBlockHasPoints` derives the boolean. Most UI gating cascades automatically through source helpers: `getPtsEarned` and `getAvailInfo.penalty` short-circuit to 0 in points-off mode, so any render that gates on `> 0` naturally hides. Reach for direct render gating on `currentBlockHasPoints` only when a control is a points-only concept (bid inputs, incentive steppers, Spend/Proj columns).
+- **Producer-driven payloads with zero/empty defaults.** For toggle-able behaviors (the points-off mode is the worked example), default the producer to emit zeros / empties (`bid: 0`, `incentivePts: 0`, `availPenalties: {}`, `earnings: {}`); existing reducers naturally no-op the `+=` / no-op the cascade. Only touch reducers when storing a new state shape — e.g., `block.reconcile` stamping `tieBreakOrder` on the block via `patchBlockInConfig` when the payload includes it (omitted in points-on mode, so it's a no-op there).
+- **Rotating tie-break: producer-side mutation, reducer-passive stamping.** `buildTieBreakWorkingOrder(block)` builds a fresh working copy (self-heals: drops removed uids, appends new ones at end). Producers mutate it in place as winners commit (rotation = remove + push to end) and emit the final order in the event payload. `computeReconcile` and `computeAutoAssign` thread a shared `workingOrder` through both phases of "Close & assign" so the queue advances continuously across reconcile + auto-assign. Reducer just stamps via `patchBlockInConfig` — no `Math.random` inside.
 - **No emojis in code unless they're already part of the UX vocabulary** (🎯 ⭐ ✕ ⚙ 📣). User explicitly favors emoji UI for state markers.
 
 ---
@@ -490,6 +427,7 @@ The `shift.admin-assign` reducer change is the natural cleanup — a cleared slo
   - **Backwards compat.** Missing `block.usePoints` → `true`. Missing `block.tieBreakOrder` → empty / built fresh on demand. Pre-feature events replay cleanly.
   - **Per-block flag, not group.** The mode is locked at block-create; flipping later would require creating a new block. No `config.usePoints` group setting (was added then removed during design — friction was too high; defaulting to the most-recently-created block's mode covers the "remember my preference" use case).
   - **"Alerts not penalties" UX rule.** Threshold checks (`prefMeets` / `blockMeets`) still drive the ProviderHome "Availability requirements not met" banner, the Preferences Status Report card, and the admin Dashboard `failingAvail` row in BOTH modes — the only thing that changes is the point-cost copy.
+- ✅ Setup Holidays list filters to dates inside the current block (with an italic hint showing the hidden count). Old holidays from prior blocks stop cluttering. Filter no-ops when no current block exists (fresh group can still pre-configure).
 
 ### Pending (deferred by user)
 - ⏳ Schedule snapshot at Lock (frozen "My final schedule" view per user, persisted with the block).
@@ -550,5 +488,5 @@ D.4 verification (cloud-signed-in owner only):
 - Builds incrementally. Each step should produce a working artifact.
 - Wants the UI to remain simple for end users. Prefers consolidating duplicate concepts over adding more controls.
 - Single-file React + Tailwind + babel-standalone is non-negotiable. Don't introduce a build tool.
-- TodoWrite is welcome for multi-step features. Skip it for trivial changes.
+- Task tracking (`TaskCreate` / `TaskUpdate`) is welcome for multi-step features. Skip it for trivial changes.
 - Plan mode is welcome for significant architectural changes — user often initiates with "go in to plan mode."
