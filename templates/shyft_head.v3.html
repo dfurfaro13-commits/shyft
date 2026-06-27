@@ -13,7 +13,11 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Pin Babel to 7.x: unpinned URL now resolves to @babel/standalone@8 which emits
+       ES module syntax incompatible with <script type="text/babel"> (the transformed
+       output contains `import`/`export`, browser rejects it as "Cannot use import
+       statement outside a module"). -->
+  <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     // Tailwind extension: Inter as default sans, semantic brand palette, softer card shadows.
