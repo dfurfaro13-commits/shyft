@@ -2109,6 +2109,32 @@ export default function ShiftApp() {
     return { totalSlots, bySource, openSlots, pendingPool, perUserRows };
   };
 
+  // CSV export of a block's assigned schedule. One row per date; columns are Date, Day, then one
+  // column per shift slot using the admin-defined slot name. Empty cell = open slot. RFC 4180
+  // quoting; UTF-8 BOM so Excel auto-detects encoding for non-ASCII provider names.
+  const exportScheduleCsv = (block) => {
+    if(!block || !block.start || !block.end) return;
+    const esc = v => { const s = String(v ?? ""); return /[",\n\r]/.test(s) ? `"${s.replace(/"/g,'""')}"` : s; };
+    const nameFor = uid => users.find(u => u.id === uid)?.name || "";
+    const slots = config.shiftSlots;
+    const header = ["Date","Day",...slots.map(s=>s.name)].map(esc).join(",");
+    const lines = [header];
+    for(let d = parseDk(block.start); d <= parseDk(block.end); d.setDate(d.getDate()+1)){
+      const k = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+      const dayS = shifts[k] || {};
+      const cells = [k, DAYS_LONG[d.getDay()], ...slots.map(s => nameFor(getUid(dayS[s.id])))];
+      lines.push(cells.map(esc).join(","));
+    }
+    const slug = (block.name || "block").trim().toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"") || "block";
+    // ﻿ = UTF-8 BOM so Excel auto-detects encoding for non-ASCII names.
+    const blob = new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `shift-schedule-${slug}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+
   // Provider Report — cross-block aggregate of the per-block source breakdown. Selection is
   // "last N blocks" (sorted by start date, newest first) or "all". Targets sum across selected
   // blocks using each block's targetsAtClose snapshot when available; falls back to current
@@ -5808,9 +5834,17 @@ export default function ShiftApp() {
     return(<>
       <div className="flex items-center justify-between mb-3">
         <h1 className="text-2xl font-semibold">{me.role==="admin"?"Calendar":"Pick shifts"}</h1>
-        <div className="flex bg-slate-100 rounded-lg p-0.5">
-          <button onClick={()=>setShiftsView("list")} className={`px-3 py-1.5 text-xs font-medium rounded-md ${shiftsView==="list"?"bg-white shadow text-slate-900":"text-slate-500"}`}>List</button>
-          <button onClick={()=>setShiftsView("cal")} className={`px-3 py-1.5 text-xs font-medium rounded-md ${shiftsView==="cal"?"bg-white shadow text-slate-900":"text-slate-500"}`}>Calendar</button>
+        <div className="flex items-center gap-2">
+          {isLocked(currentBlock) && (
+            <button onClick={()=>exportScheduleCsv(currentBlock)} title="Download this block's schedule as a .csv"
+              className="text-xs font-semibold px-2.5 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+              ⬇ .csv
+            </button>
+          )}
+          <div className="flex bg-slate-100 rounded-lg p-0.5">
+            <button onClick={()=>setShiftsView("list")} className={`px-3 py-1.5 text-xs font-medium rounded-md ${shiftsView==="list"?"bg-white shadow text-slate-900":"text-slate-500"}`}>List</button>
+            <button onClick={()=>setShiftsView("cal")} className={`px-3 py-1.5 text-xs font-medium rounded-md ${shiftsView==="cal"?"bg-white shadow text-slate-900":"text-slate-500"}`}>Calendar</button>
+          </div>
         </div>
       </div>
       <p className="text-sm text-slate-500 mb-3">
@@ -6346,6 +6380,12 @@ export default function ShiftApp() {
             <span className="text-[11px] text-ink-500 hidden sm:inline">
               {blockDays.length} day{blockDays.length===1?"":"s"} · phase <span className={`font-semibold ${PHASE_TONE[phase].text}`}>{PHASE_LABEL[phase].toLowerCase()}</span>
             </span>
+            {phase === PHASE.LOCKED && (
+              <button onClick={()=>exportScheduleCsv(currentBlock)} title="Download this block's schedule as a .csv"
+                className="text-xs font-semibold px-2.5 py-1.5 rounded-md border border-slate-300 bg-white text-ink-700 hover:bg-slate-50">
+                ⬇ .csv
+              </button>
+            )}
             <div className="flex bg-slate-100 rounded-lg p-0.5">
               {[["list","List"],["calendar","Calendar"]].map(([v,l])=>(
                 <button key={v} onClick={()=>setShiftsView(v)}
